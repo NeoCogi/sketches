@@ -3,5 +3,8 @@ name = "sketches"
 version = "0.1.0"
 edition = "2024"
 autobins = false
+description = "Probabilistic data structures for scalable approximate analytics"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
