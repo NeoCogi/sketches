@@ -1,0 +1,42 @@
+// MIT License
+//
+// Copyright (c) 2026 Raja Lehtihet & Wael El Oraiby
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+use sketches::tdigest::TDigest;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build a t-digest with moderate compression.
+    let mut digest = TDigest::new(100.0)?;
+
+    // Feed a synthetic response-time stream in milliseconds.
+    for latency_ms in 1_u64..=20_000 {
+        digest.add(latency_ms as f64);
+    }
+
+    // t-digest is especially useful for tail quantiles.
+    let p95 = digest.quantile(0.95)?;
+    let p99 = digest.quantile(0.99)?;
+
+    println!("Estimated p95: {:.2} ms", p95);
+    println!("Estimated p99: {:.2} ms", p99);
+
+    Ok(())
+}
