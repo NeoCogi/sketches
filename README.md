@@ -37,6 +37,7 @@ sketches = { path = "../sketches" }
 | KLL Sketch | `kll` | You need general quantiles (median, p90, p99) | Good default quantile sketch |
 | t-digest | `tdigest` | You care most about tail quantiles (p95/p99/p999) | Typically stronger tail behavior |
 | MinHash | `minhash` | You need Jaccard similarity between sets | Best default for similarity tasks |
+| MinHash LSH | `lsh_minhash` | You need fast near-duplicate/candidate lookup before reranking | Uses banding over MinHash signatures |
 | Reservoir Sampling | `reservoir_sampling` | You need a uniform sample from an unbounded stream | Fixed-size unbiased sample |
 | Jaccard trait/helpers | `jacard` | You want a shared Jaccard API across sketches | Provides `JacardIndex` trait |
 
@@ -46,6 +47,7 @@ If your primary goal is:
 
 - Distinct counting: use `HyperLogLog`.
 - Jaccard similarity: use `MinHash` first.
+- Candidate retrieval for similarity search: use `MinHashLshIndex`, then rerank with MinHash Jaccard.
 - Jaccard from existing cardinality pipelines: use `HyperLogLog` + `jacard` helpers.
 - Membership without delete: use `BloomFilter`.
 - Membership with delete: use `CuckooFilter`.
@@ -99,6 +101,7 @@ cargo run --example cuckoo_filter
 cargo run --example hyperloglog
 cargo run --example jacard
 cargo run --example minhash
+cargo run --example lsh_minhash
 cargo run --example minmax_sketch
 cargo run --example count_sketch
 cargo run --example space_saving

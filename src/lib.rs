@@ -33,6 +33,7 @@
 //! - [`tdigest::TDigest`] for tail-friendly quantiles.
 //! - [`cuckoo_filter::CuckooFilter`] for membership with deletions.
 //! - [`minhash::MinHash`] for approximate Jaccard estimation.
+//! - [`lsh_minhash::MinHashLshIndex`] for approximate nearest-neighbor lookup.
 //! - [`reservoir_sampling::ReservoirSampling`] for uniform stream sampling.
 
 use core::fmt;
@@ -45,6 +46,7 @@ pub mod cuckoo_filter;
 pub mod hyperloglog;
 pub mod jacard;
 pub mod kll;
+pub mod lsh_minhash;
 pub mod minhash;
 pub mod minmax_sketch;
 pub mod reservoir_sampling;
@@ -72,7 +74,7 @@ impl fmt::Display for SketchError {
 impl std::error::Error for SketchError {}
 
 /// Computes a deterministic 64-bit hash using an item and a fixed seed.
-pub(crate) fn seeded_hash64<T: Hash>(item: &T, seed: u64) -> u64 {
+pub(crate) fn seeded_hash64<T: Hash + ?Sized>(item: &T, seed: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
     item.hash(&mut hasher);
