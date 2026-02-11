@@ -15,6 +15,9 @@ All sketches are designed for streaming workloads where exact data structures
 (`HashMap`, full sorted buffers, exact sets) are too expensive in memory or
 throughput.
 
+### Note
+This crate was designed by humans, but coded with AI.
+
 ## Add To A Project
 
 This repository is currently consumed as a local crate:
