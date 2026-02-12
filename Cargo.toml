@@ -1,10 +1,12 @@
 [package]
 name = "sketches"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 autobins = false
 description = "Probabilistic data structures for scalable approximate analytics"
 license = "MIT"
 readme = "README.md"
+authors = ["Raja Lehtihet", "Wael El Oraiby"]
+repository = "https://github.com/NeoCogi/sketches"
 
 [dependencies]
