@@ -1,4 +1,5 @@
 # sketches
+[![crates.io](https://img.shields.io/crates/v/sketches?logo=rust&label=crates.io)](https://crates.io/crates/sketches)
 
 Probabilistic data structures for scalable approximate analytics in Rust.
 
