@@ -182,9 +182,30 @@ impl MinHash {
     /// Returns [`SketchError::IncompatibleSketches`] when the signature widths
     /// or hash families differ.
     pub fn estimate_jaccard(&self, other: &Self) -> Result<f64, SketchError> {
-        self.ensure_compatible(other, "num_hashes/hash family must match")?;
+        self.estimate_jaccard_signature(
+            &other.signature,
+            other.observed_any,
+            other.hash_family.derivation_seed,
+        )
+    }
 
-        match (self.observed_any, other.observed_any) {
+    /// Estimates Jaccard against compact signature state retained by another
+    /// crate data structure.
+    pub(crate) fn estimate_jaccard_signature(
+        &self,
+        other_signature: &[u64],
+        other_observed_any: bool,
+        other_family_seed: u64,
+    ) -> Result<f64, SketchError> {
+        if self.hash_family.derivation_seed != other_family_seed
+            || self.signature.len() != other_signature.len()
+        {
+            return Err(SketchError::IncompatibleSketches(
+                "num_hashes/hash family must match",
+            ));
+        }
+
+        match (self.observed_any, other_observed_any) {
             (false, false) => return Ok(1.0),
             (false, true) | (true, false) => return Ok(0.0),
             (true, true) => {}
@@ -193,10 +214,16 @@ impl MinHash {
         let matches = self
             .signature
             .iter()
-            .zip(other.signature.iter())
+            .zip(other_signature.iter())
             .filter(|(left, right)| left == right)
             .count();
         Ok(matches as f64 / self.signature.len() as f64)
+    }
+
+    /// Returns the compact identity of the configured hash family for other
+    /// crate data structures that retain MinHash signatures.
+    pub(crate) fn hash_family_seed(&self) -> u64 {
+        self.hash_family.derivation_seed
     }
 
     /// Merges another sketch in-place by taking element-wise minima.

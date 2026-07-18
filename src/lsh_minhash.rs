@@ -24,12 +24,59 @@
 //!
 //! The index splits a MinHash signature into bands and hashes each band into a
 //! table bucket. A query retrieves candidates that collide in at least one band.
+//! This is the standard LSH preprocessing/query shape: every indexed item has
+//! one compact posting in each band table, and a query unions the matching
+//! buckets before optional reranking.
+//!
+//! Each user ID is owned once in an internal record arena. Band tables contain
+//! only machine-word handles, so the algorithm-required `O(items * bands)`
+//! postings do not become deep copies of string or compound IDs. The index
+//! retains one compact MinHash signature per record for removal and approximate
+//! Jaccard reranking.
+//!
+//! This representation follows the table-and-posting model described by
+//! [Gionis, Indyk, and Motwani][gionis] and the MinHash `(K, L)` formulation
+//! described by [Shrivastava and Li][shrivastava]. It changes ownership, not
+//! collision probabilities or candidate selection.
+//!
+//! [gionis]: https://www.vldb.org/conf/1999/P49.pdf
+//! [shrivastava]: https://arxiv.org/abs/1406.4784
 
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::collections::{HashMap, HashSet, hash_map::RandomState};
+use std::hash::{BuildHasher, Hash};
 
-use crate::{SketchError, seeded_hash64, splitmix64};
 use crate::minhash::MinHash;
+use crate::{SketchError, seeded_hash64, splitmix64};
+
+/// Stable internal reference to one arena record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EntryHandle(usize);
+
+/// Minimal MinHash state needed for removal and approximate reranking.
+#[derive(Debug, Clone)]
+struct StoredSignature {
+    values: Box<[u64]>,
+    observed_any: bool,
+}
+
+impl StoredSignature {
+    fn from_minhash(signature: &MinHash) -> Self {
+        Self {
+            values: signature.signature().into(),
+            observed_any: !signature.is_empty(),
+        }
+    }
+}
+
+/// Canonical per-ID state. `next_same_hash` resolves the extremely rare case
+/// where distinct IDs have the same randomized 64-bit lookup hash.
+#[derive(Debug, Clone)]
+struct Entry<Id> {
+    id: Id,
+    id_hash: u64,
+    next_same_hash: Option<EntryHandle>,
+    signature: StoredSignature,
+}
 
 /// Locality-Sensitive Hashing index built on MinHash signatures.
 ///
@@ -61,6 +108,16 @@ use crate::minhash::MinHash;
 /// let candidates = index.query_candidates(&query).unwrap();
 /// assert!(candidates.contains(&1));
 /// ```
+///
+/// # Representation and complexity
+///
+/// For `n` items, `b` bands, and `k` MinHash components, the index stores
+/// `O(nk)` signature words and `O(nb)` machine-word postings. Each `Id` is owned
+/// once regardless of `b`. Excluding the cost of hashing a user ID, insertion
+/// and removal take `O(k + b)` expected time; candidate lookup takes
+/// `O(k + postings visited)` expected time before output IDs are cloned.
+/// [`Self::query_top_k`] additionally scores each unique candidate using its
+/// retained MinHash signature.
 #[derive(Debug, Clone)]
 pub struct MinHashLshIndex<Id>
 where
@@ -70,8 +127,13 @@ where
     bands: usize,
     rows_per_band: usize,
     band_seeds: Vec<u64>,
-    tables: Vec<HashMap<u64, HashSet<Id>>>,
-    signatures: HashMap<Id, MinHash>,
+    hash_family_seed: Option<u64>,
+    tables: Vec<HashMap<u64, HashSet<EntryHandle>>>,
+    entries: Vec<Option<Entry<Id>>>,
+    free_entries: Vec<EntryHandle>,
+    id_hash_builder: RandomState,
+    id_heads: HashMap<u64, EntryHandle>,
+    entry_count: usize,
 }
 
 impl<Id> MinHashLshIndex<Id>
@@ -117,8 +179,13 @@ where
             bands,
             rows_per_band,
             band_seeds,
+            hash_family_seed: None,
             tables: vec![HashMap::new(); bands],
-            signatures: HashMap::new(),
+            entries: Vec::new(),
+            free_entries: Vec::new(),
+            id_hash_builder: RandomState::new(),
+            id_heads: HashMap::new(),
+            entry_count: 0,
         })
     }
 
@@ -139,37 +206,59 @@ where
 
     /// Returns the number of indexed items.
     pub fn len(&self) -> usize {
-        self.signatures.len()
+        self.entry_count
     }
 
     /// Returns `true` when no items are indexed.
     pub fn is_empty(&self) -> bool {
-        self.signatures.is_empty()
+        self.entry_count == 0
     }
 
     /// Returns `true` when an id is currently indexed.
     pub fn contains_id(&self, id: &Id) -> bool {
-        self.signatures.contains_key(id)
+        self.find_handle(id).is_some()
     }
 
     /// Inserts (or replaces) one signature by id.
     ///
-    /// If the id already exists, its old signature is removed and replaced.
+    /// The index takes ownership of `id` without cloning it. Each band receives
+    /// only a numeric handle. If the id already exists, its retained signature
+    /// and band postings are replaced in place.
+    ///
+    /// The borrowed MinHash signature is copied once into compact index-owned
+    /// storage so the index remains independent of subsequent caller changes.
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when `signature` does not
-    /// match index dimensions.
+    /// match the index dimensions or the hash family established by previously
+    /// inserted signatures.
     pub fn insert(&mut self, id: Id, signature: &MinHash) -> Result<(), SketchError> {
         self.ensure_compatible(signature)?;
-
-        self.remove(&id);
-
-        for band in 0..self.bands {
-            let band_hash = self.band_hash(signature.signature(), band);
-            self.tables[band].entry(band_hash).or_default().insert(id.clone());
+        if self.hash_family_seed.is_none() {
+            self.hash_family_seed = Some(signature.hash_family_seed());
         }
 
-        self.signatures.insert(id, signature.clone());
+        let id_hash = self.hash_id(&id);
+        if let Some(handle) = self.find_handle_with_hash(&id, id_hash) {
+            self.remove_handle_from_bands(handle);
+            self.entries[handle.0]
+                .as_mut()
+                .expect("live handle must reference an entry")
+                .signature = StoredSignature::from_minhash(signature);
+            self.add_handle_to_bands(handle);
+            return Ok(());
+        }
+
+        let entry = Entry {
+            id,
+            id_hash,
+            next_same_hash: self.id_heads.get(&id_hash).copied(),
+            signature: StoredSignature::from_minhash(signature),
+        };
+        let handle = self.allocate_entry(entry);
+        self.id_heads.insert(id_hash, handle);
+        self.add_handle_to_bands(handle);
+        self.entry_count += 1;
         Ok(())
     }
 
@@ -177,65 +266,66 @@ where
     ///
     /// Returns `true` if the id existed.
     pub fn remove(&mut self, id: &Id) -> bool {
-        let Some(signature) = self.signatures.remove(id) else {
+        let id_hash = self.hash_id(id);
+        let Some(handle) = self.find_handle_with_hash(id, id_hash) else {
             return false;
         };
 
-        for band in 0..self.bands {
-            let band_hash = self.band_hash(signature.signature(), band);
-
-            let mut should_remove_bucket = false;
-            if let Some(bucket) = self.tables[band].get_mut(&band_hash) {
-                bucket.remove(id);
-                should_remove_bucket = bucket.is_empty();
-            }
-
-            if should_remove_bucket {
-                self.tables[band].remove(&band_hash);
-            }
-        }
-
+        self.remove_handle_from_bands(handle);
+        self.unlink_id_handle(handle);
+        self.entries[handle.0] = None;
+        self.free_entries.push(handle);
+        self.entry_count -= 1;
         true
     }
 
     /// Returns candidate ids sharing at least one band with the query.
     ///
+    /// Band collisions are deduplicated as numeric handles. The underlying ID
+    /// is cloned only once for each unique value returned by this owned-result
+    /// API, regardless of how many bands selected it.
+    ///
     /// # Errors
-    /// Returns [`SketchError::IncompatibleSketches`] when query dimensions
-    /// mismatch this index.
+    /// Returns [`SketchError::IncompatibleSketches`] when the query dimensions
+    /// or hash family mismatch this index.
     pub fn query_candidates(&self, query: &MinHash) -> Result<Vec<Id>, SketchError> {
-        self.ensure_compatible(query)?;
-
-        let mut candidates = HashSet::new();
-        for band in 0..self.bands {
-            let band_hash = self.band_hash(query.signature(), band);
-            if let Some(bucket) = self.tables[band].get(&band_hash) {
-                candidates.extend(bucket.iter().cloned());
-            }
-        }
-
-        Ok(candidates.into_iter().collect())
+        let handles = self.candidate_handles(query)?;
+        Ok(handles
+            .into_iter()
+            .filter_map(|handle| self.entries.get(handle.0)?.as_ref())
+            .map(|entry| entry.id.clone())
+            .collect())
     }
 
     /// Returns top `k` candidates reranked by MinHash Jaccard estimate.
     ///
-    /// Output tuples are `(id, estimated_jaccard)`, sorted descending.
+    /// Output tuples are `(id, estimated_jaccard)`, sorted descending. Candidate
+    /// handles are deduplicated before IDs are cloned or signatures are scored.
     ///
     /// # Errors
-    /// Returns [`SketchError::IncompatibleSketches`] when query dimensions
-    /// mismatch this index.
+    /// Returns [`SketchError::IncompatibleSketches`] when the query dimensions
+    /// or hash family mismatch this index.
     pub fn query_top_k(&self, query: &MinHash, k: usize) -> Result<Vec<(Id, f64)>, SketchError> {
-        self.ensure_compatible(query)?;
         if k == 0 {
+            self.ensure_compatible(query)?;
             return Ok(Vec::new());
         }
 
         let mut scored = Vec::new();
-        for id in self.query_candidates(query)? {
-            if let Some(signature) = self.signatures.get(&id) {
-                let similarity = signature.estimate_jaccard(query)?;
-                scored.push((id, similarity));
-            }
+        let handles = self.candidate_handles(query)?;
+        let family_seed = self
+            .hash_family_seed
+            .unwrap_or_else(|| query.hash_family_seed());
+        for handle in handles {
+            let Some(entry) = self.entries.get(handle.0).and_then(Option::as_ref) else {
+                continue;
+            };
+            let similarity = query.estimate_jaccard_signature(
+                &entry.signature.values,
+                entry.signature.observed_any,
+                family_seed,
+            )?;
+            scored.push((entry.id.clone(), similarity));
         }
 
         scored.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
@@ -245,7 +335,11 @@ where
 
     /// Clears all index state.
     pub fn clear(&mut self) {
-        self.signatures.clear();
+        self.hash_family_seed = None;
+        self.entries.clear();
+        self.free_entries.clear();
+        self.id_heads.clear();
+        self.entry_count = 0;
         for table in &mut self.tables {
             table.clear();
         }
@@ -257,7 +351,128 @@ where
                 "signature num_hashes must match index num_hashes",
             ));
         }
+        if self
+            .hash_family_seed
+            .is_some_and(|seed| seed != signature.hash_family_seed())
+        {
+            return Err(SketchError::IncompatibleSketches(
+                "signature hash family must match index hash family",
+            ));
+        }
         Ok(())
+    }
+
+    fn candidate_handles(&self, query: &MinHash) -> Result<HashSet<EntryHandle>, SketchError> {
+        self.ensure_compatible(query)?;
+
+        let mut candidates = HashSet::new();
+        for band in 0..self.bands {
+            let band_hash = self.band_hash(query.signature(), band);
+            if let Some(bucket) = self.tables[band].get(&band_hash) {
+                candidates.extend(bucket.iter().copied());
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn add_handle_to_bands(&mut self, handle: EntryHandle) {
+        for band in 0..self.bands {
+            let band_hash = self.band_hash_for_handle(handle, band);
+            self.tables[band]
+                .entry(band_hash)
+                .or_default()
+                .insert(handle);
+        }
+    }
+
+    fn remove_handle_from_bands(&mut self, handle: EntryHandle) {
+        for band in 0..self.bands {
+            let band_hash = self.band_hash_for_handle(handle, band);
+            let should_remove_bucket =
+                self.tables[band].get_mut(&band_hash).is_some_and(|bucket| {
+                    bucket.remove(&handle);
+                    bucket.is_empty()
+                });
+            if should_remove_bucket {
+                self.tables[band].remove(&band_hash);
+            }
+        }
+    }
+
+    fn band_hash_for_handle(&self, handle: EntryHandle, band: usize) -> u64 {
+        let signature = &self.entries[handle.0]
+            .as_ref()
+            .expect("live handle must reference an entry")
+            .signature
+            .values;
+        self.band_hash(signature, band)
+    }
+
+    fn allocate_entry(&mut self, entry: Entry<Id>) -> EntryHandle {
+        if let Some(handle) = self.free_entries.pop() {
+            debug_assert!(self.entries[handle.0].is_none());
+            self.entries[handle.0] = Some(entry);
+            handle
+        } else {
+            let handle = EntryHandle(self.entries.len());
+            self.entries.push(Some(entry));
+            handle
+        }
+    }
+
+    fn hash_id(&self, id: &Id) -> u64 {
+        self.id_hash_builder.hash_one(id)
+    }
+
+    fn find_handle(&self, id: &Id) -> Option<EntryHandle> {
+        self.find_handle_with_hash(id, self.hash_id(id))
+    }
+
+    fn find_handle_with_hash(&self, id: &Id, id_hash: u64) -> Option<EntryHandle> {
+        let mut current = self.id_heads.get(&id_hash).copied();
+        while let Some(handle) = current {
+            let entry = self.entries.get(handle.0)?.as_ref()?;
+            if &entry.id == id {
+                return Some(handle);
+            }
+            current = entry.next_same_hash;
+        }
+        None
+    }
+
+    fn unlink_id_handle(&mut self, handle: EntryHandle) {
+        let entry = self.entries[handle.0]
+            .as_ref()
+            .expect("live handle must reference an entry");
+        let id_hash = entry.id_hash;
+        let target_next = entry.next_same_hash;
+        let head = self.id_heads[&id_hash];
+
+        if head == handle {
+            if let Some(next) = target_next {
+                self.id_heads.insert(id_hash, next);
+            } else {
+                self.id_heads.remove(&id_hash);
+            }
+            return;
+        }
+
+        let mut current = head;
+        loop {
+            let next = self.entries[current.0]
+                .as_ref()
+                .expect("ID chain handle must reference an entry")
+                .next_same_hash
+                .expect("target handle must be linked from its ID hash head");
+            if next == handle {
+                self.entries[current.0]
+                    .as_mut()
+                    .expect("ID chain handle must reference an entry")
+                    .next_same_hash = target_next;
+                return;
+            }
+            current = next;
+        }
     }
 
     fn band_hash(&self, signature: &[u64], band: usize) -> u64 {
@@ -269,8 +484,51 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::hash::{Hash, Hasher};
+    use std::rc::Rc;
+
     use super::MinHashLshIndex;
     use crate::minhash::MinHash;
+
+    #[derive(Debug)]
+    struct CloneCountedId {
+        value: u64,
+        clones: Rc<Cell<usize>>,
+    }
+
+    impl Clone for CloneCountedId {
+        fn clone(&self) -> Self {
+            self.clones.set(self.clones.get() + 1);
+            Self {
+                value: self.value,
+                clones: Rc::clone(&self.clones),
+            }
+        }
+    }
+
+    impl PartialEq for CloneCountedId {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for CloneCountedId {}
+
+    impl Hash for CloneCountedId {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CollidingId(u64);
+
+    impl Hash for CollidingId {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            0_u8.hash(state);
+        }
+    }
 
     fn signature_for_range(start: u64, end: u64, num_hashes: usize) -> MinHash {
         let mut signature = MinHash::new(num_hashes).unwrap();
@@ -322,6 +580,67 @@ mod tests {
     }
 
     #[test]
+    fn insertion_does_not_clone_id_and_query_clones_each_candidate_once() {
+        let clones = Rc::new(Cell::new(0));
+        let id = CloneCountedId {
+            value: 7,
+            clones: Rc::clone(&clones),
+        };
+        let signature = signature_for_range(0, 1_000, 64);
+        let mut index = MinHashLshIndex::new(64, 8).unwrap();
+
+        index.insert(id, &signature).unwrap();
+        assert_eq!(clones.get(), 0, "insertion must move the canonical ID");
+
+        let candidates = index.query_candidates(&signature).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(clones.get(), 1, "deduplicate handles before cloning IDs");
+    }
+
+    #[test]
+    fn cloning_index_clones_each_canonical_id_once() {
+        let clones = Rc::new(Cell::new(0));
+        let id = CloneCountedId {
+            value: 7,
+            clones: Rc::clone(&clones),
+        };
+        let signature = signature_for_range(0, 1_000, 64);
+        let mut index = MinHashLshIndex::new(64, 8).unwrap();
+        index.insert(id, &signature).unwrap();
+
+        let cloned = index.clone();
+        assert_eq!(cloned.len(), 1);
+        assert_eq!(clones.get(), 1);
+
+        let lookup = CloneCountedId {
+            value: 7,
+            clones: Rc::clone(&clones),
+        };
+        assert!(cloned.contains_id(&lookup));
+        assert_eq!(clones.get(), 1, "lookup must use the cloned hash state");
+    }
+
+    #[test]
+    fn randomized_id_hash_collisions_are_resolved_by_equality() {
+        let signature_a = signature_for_range(0, 1_000, 64);
+        let signature_b = signature_for_range(10_000, 11_000, 64);
+        let mut index = MinHashLshIndex::new(64, 8).unwrap();
+
+        index.insert(CollidingId(1), &signature_a).unwrap();
+        index.insert(CollidingId(2), &signature_b).unwrap();
+        assert!(index.contains_id(&CollidingId(1)));
+        assert!(index.contains_id(&CollidingId(2)));
+
+        assert!(index.remove(&CollidingId(1)));
+        assert!(!index.contains_id(&CollidingId(1)));
+        assert!(index.contains_id(&CollidingId(2)));
+
+        let candidates = index.query_candidates(&signature_b).unwrap();
+        assert!(candidates.contains(&CollidingId(2)));
+        assert!(!candidates.contains(&CollidingId(1)));
+    }
+
+    #[test]
     fn remove_existing_and_missing_ids() {
         let mut index = MinHashLshIndex::<u64>::new(64, 8).unwrap();
         let signature = signature_for_range(0, 1_000, 64);
@@ -330,6 +649,28 @@ mod tests {
         assert!(index.remove(&10));
         assert!(!index.remove(&10));
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn removal_clears_postings_before_handle_reuse() {
+        let first = signature_for_range(0, 1_000, 64);
+        let second = signature_for_range(10_000, 11_000, 64);
+        let mut index = MinHashLshIndex::new(64, 8).unwrap();
+
+        index.insert(1_u64, &first).unwrap();
+        let handle = index.find_handle(&1).unwrap();
+        assert!(index.remove(&1));
+        assert!(
+            index
+                .tables
+                .iter()
+                .all(|table| table.values().all(|bucket| !bucket.contains(&handle)))
+        );
+
+        index.insert(2_u64, &second).unwrap();
+        assert_eq!(index.find_handle(&2), Some(handle));
+        assert!(!index.query_candidates(&first).unwrap().contains(&1));
+        assert!(index.query_candidates(&second).unwrap().contains(&2));
     }
 
     #[test]
@@ -417,6 +758,10 @@ mod tests {
         index.clear();
         assert!(index.is_empty());
         assert_eq!(index.len(), 0);
+        assert!(index.entries.is_empty());
+        assert!(index.free_entries.is_empty());
+        assert!(index.id_heads.is_empty());
+        assert!(index.hash_family_seed.is_none());
         assert!(index.query_candidates(&signature).unwrap().is_empty());
     }
 }
