@@ -29,6 +29,11 @@
 //! and all capacities are reconsidered whenever the hierarchy grows or sketches
 //! are merged.
 //!
+//! Quantiles use the crate's empirical inverse-CDF convention: for retained
+//! weighted mass `N`, `q` selects zero-based rank
+//! `min(floor(q * N), N - 1)`. This is also the exact-sample convention used by
+//! [`crate::tdigest::TDigest`].
+//!
 //! It does not implement the paper's later sampler or GK-based refinements.
 //! Those refinements improve asymptotic space or failure-probability dependence
 //! but are separate from the basic fully mergeable construction used here.
@@ -208,6 +213,11 @@ impl KllSketch {
 
     /// Returns the approximate quantile at `q` where `q` is in `[0, 1]`.
     ///
+    /// The selected zero-based rank is `min(floor(q * N), N - 1)`, where `N`
+    /// is the retained weighted mass. For example, the median of `[0, 10]` is
+    /// `10`. This is the crate-wide empirical inverse-CDF convention shared
+    /// with [`crate::tdigest::TDigest`].
+    ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid `q` or empty
     /// sketches.
@@ -237,7 +247,8 @@ impl KllSketch {
             .iter()
             .map(|(_, weight)| *weight as u128)
             .sum();
-        let target_rank = ((total_weight.saturating_sub(1)) as f64 * q).round() as u128;
+        let target_rank =
+            ((total_weight as f64 * q).floor() as u128).min(total_weight.saturating_sub(1));
 
         let mut cumulative = 0_u128;
         for (value, weight) in weighted_values {
@@ -373,7 +384,9 @@ mod tests {
         let upper_rank = sorted
             .partition_point(|value| *value <= estimate)
             .saturating_sub(1) as f64;
-        let target_rank = quantile * sorted.len().saturating_sub(1) as f64;
+        let target_rank = (quantile * sorted.len() as f64)
+            .floor()
+            .min(sorted.len().saturating_sub(1) as f64);
         let absolute_error = if target_rank < lower_rank {
             lower_rank - target_rank
         } else if target_rank > upper_rank {

@@ -62,6 +62,22 @@ If your primary goal is:
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
 
+## Quantile Convention
+
+`KllSketch` and `TDigest` use the same empirical inverse-CDF convention. For
+`N` exact samples and `q` in `[0, 1]`, the selected zero-based rank is:
+
+```text
+min(floor(q * N), N - 1)
+```
+
+Consequently, the median of `[0, 10]` is `10`. KLL returns a retained sample at
+the selected approximate rank, so after compaction its endpoint queries are the
+smallest and largest retained values rather than guaranteed exact stream
+extrema. t-digest follows the same rank rule for singleton centroids, may
+interpolate between multi-sample centroid midpoint ranks, and separately
+retains the exact observed minimum and maximum for `q = 0` and `q = 1`.
+
 ## Quick Examples
 
 Approximate distinct counting:

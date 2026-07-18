@@ -21,6 +21,15 @@
 // SOFTWARE.
 //
 //! t-digest for approximate quantiles, especially in distribution tails.
+//!
+//! Quantile interpolation follows Section 2.9 of Dunning and Ertl's
+//! [t-digest paper] and the singleton-aware behavior of the reference
+//! `MergingDigest`. Exact samples use zero-based rank
+//! `min(floor(q * N), N - 1)`. Centroids containing multiple samples are
+//! interpolated at their midpoint ranks, while singleton centroids remain
+//! exact steps. The exact observed minimum and maximum are retained separately.
+//!
+//! [t-digest paper]: https://arxiv.org/pdf/1902.04023
 
 use crate::SketchError;
 
@@ -49,6 +58,8 @@ pub struct TDigest {
     compression: f64,
     centroids: Vec<Centroid>,
     total_weight: f64,
+    min: f64,
+    max: f64,
 }
 
 impl TDigest {
@@ -71,6 +82,8 @@ impl TDigest {
             compression,
             centroids: Vec::new(),
             total_weight: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
         })
     }
 
@@ -115,14 +128,32 @@ impl TDigest {
     ///
     /// Non-finite values are ignored.
     pub fn add(&mut self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
         self.add_weighted(value, 1.0);
     }
 
     /// Returns the approximate quantile for `q` in `[0, 1]`.
     ///
+    /// For exact, uncompressed samples, `q` selects zero-based rank
+    /// `min(floor(q * N), N - 1)`. Thus the median of `[0, 10]` is `10`.
+    /// This is the same empirical inverse-CDF convention used by
+    /// [`crate::kll::KllSketch`].
+    ///
+    /// For compressed centroids, interpolation follows the [t-digest paper]:
+    /// centroids containing multiple samples are positioned at their midpoint
+    /// ranks, singleton centroids remain exact samples, and terminal
+    /// interpolation uses the separately retained observed minimum and maximum.
+    ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid `q` or empty
     /// digests.
+    ///
+    /// [t-digest paper]: https://arxiv.org/pdf/1902.04023
     pub fn quantile(&self, q: f64) -> Result<f64, SketchError> {
         if !q.is_finite() || !(0.0..=1.0).contains(&q) {
             return Err(SketchError::InvalidParameter(
@@ -138,40 +169,87 @@ impl TDigest {
         let mut centroids = self.centroids.clone();
         centroids.sort_unstable_by(|left, right| left.mean.total_cmp(&right.mean));
 
-        if q <= 0.0 {
+        if q == 0.0 {
+            return Ok(self.min);
+        }
+        if q == 1.0 {
+            return Ok(self.max);
+        }
+        if centroids.len() == 1 {
             return Ok(centroids[0].mean);
         }
-        if q >= 1.0 {
-            return Ok(centroids[centroids.len() - 1].mean);
+
+        let index = q * self.total_weight;
+        if index < 1.0 {
+            return Ok(self.min);
         }
 
-        let target = q * self.total_weight;
-        let mut cumulative = 0.0;
-        for index in 0..centroids.len() {
-            let current = centroids[index];
-            let next_cumulative = cumulative + current.weight;
-            if target <= next_cumulative {
-                if index == 0 {
-                    return Ok(current.mean);
-                }
-
-                let previous = centroids[index - 1];
-                let left_rank = cumulative - previous.weight * 0.5;
-                let right_rank = cumulative + current.weight * 0.5;
-                if right_rank <= left_rank + f64::EPSILON {
-                    return Ok(current.mean);
-                }
-
-                let t = ((target - left_rank) / (right_rank - left_rank)).clamp(0.0, 1.0);
-                return Ok(previous.mean + t * (current.mean - previous.mean));
+        let first = centroids[0];
+        if first.weight > 1.0 && index < first.weight * 0.5 {
+            let interior_weight = first.weight * 0.5 - 1.0;
+            if interior_weight > 0.0 {
+                let fraction = ((index - 1.0) / interior_weight).clamp(0.0, 1.0);
+                return Ok(self.min + fraction * (first.mean - self.min));
             }
-            cumulative = next_cumulative;
         }
 
-        Ok(centroids[centroids.len() - 1].mean)
+        if index > self.total_weight - 1.0 {
+            return Ok(self.max);
+        }
+
+        let last = centroids[centroids.len() - 1];
+        let weight_from_right = self.total_weight - index;
+        if last.weight > 1.0 && weight_from_right <= last.weight * 0.5 {
+            let interior_weight = last.weight * 0.5 - 1.0;
+            if interior_weight > 0.0 {
+                let fraction = ((weight_from_right - 1.0) / interior_weight).clamp(0.0, 1.0);
+                return Ok(self.max - fraction * (self.max - last.mean));
+            }
+        }
+
+        let mut weight_so_far = first.weight * 0.5;
+        for pair in centroids.windows(2) {
+            let left = pair[0];
+            let right = pair[1];
+            let interval_weight = (left.weight + right.weight) * 0.5;
+
+            if weight_so_far + interval_weight > index {
+                let mut left_singleton_weight = 0.0;
+                if left.weight == 1.0 {
+                    if index - weight_so_far < 0.5 {
+                        return Ok(left.mean);
+                    }
+                    left_singleton_weight = 0.5;
+                }
+
+                let mut right_singleton_weight = 0.0;
+                if right.weight == 1.0 {
+                    if weight_so_far + interval_weight - index <= 0.5 {
+                        return Ok(right.mean);
+                    }
+                    right_singleton_weight = 0.5;
+                }
+
+                let right_weight = index - weight_so_far - left_singleton_weight;
+                let left_weight = weight_so_far + interval_weight - index - right_singleton_weight;
+                return Ok(weighted_average(
+                    left.mean,
+                    left_weight,
+                    right.mean,
+                    right_weight,
+                ));
+            }
+
+            weight_so_far += interval_weight;
+        }
+
+        Ok(self.max)
     }
 
     /// Merges another digest into this one.
+    ///
+    /// Centroids are recompressed and the exact observed minimum and maximum
+    /// are combined independently so endpoint queries remain exact.
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when compression differs.
@@ -180,6 +258,11 @@ impl TDigest {
             return Err(SketchError::IncompatibleSketches(
                 "compression must match for merge",
             ));
+        }
+
+        if !other.is_empty() {
+            self.min = self.min.min(other.min);
+            self.max = self.max.max(other.max);
         }
 
         for centroid in &other.centroids {
@@ -193,6 +276,8 @@ impl TDigest {
     pub fn clear(&mut self) {
         self.centroids.clear();
         self.total_weight = 0.0;
+        self.min = f64::INFINITY;
+        self.max = f64::NEG_INFINITY;
     }
 
     fn add_weighted(&mut self, value: f64, weight: f64) {
@@ -253,7 +338,10 @@ impl TDigest {
     }
 
     fn centroid_quantile(&self, index: usize) -> f64 {
-        let cumulative_before = self.centroids[..index].iter().map(|centroid| centroid.weight).sum::<f64>();
+        let cumulative_before = self.centroids[..index]
+            .iter()
+            .map(|centroid| centroid.weight)
+            .sum::<f64>();
         let centered = cumulative_before + self.centroids[index].weight * 0.5;
         (centered / self.total_weight.max(1.0)).clamp(0.0, 1.0)
     }
@@ -277,7 +365,8 @@ impl TDigest {
 
         for centroid in old {
             if let Some(last) = merged.last_mut() {
-                let q = ((cumulative + 0.5 * last.weight) / self.total_weight.max(1.0)).clamp(0.0, 1.0);
+                let q =
+                    ((cumulative + 0.5 * last.weight) / self.total_weight.max(1.0)).clamp(0.0, 1.0);
                 let max_weight = self.max_centroid_weight(q);
 
                 if last.weight + centroid.weight <= max_weight {
@@ -297,9 +386,26 @@ impl TDigest {
     }
 }
 
+fn weighted_average(left: f64, left_weight: f64, right: f64, right_weight: f64) -> f64 {
+    let total_weight = left_weight + right_weight;
+    if total_weight <= 0.0 {
+        return (left + right) * 0.5;
+    }
+
+    let value = (left * left_weight + right * right_weight) / total_weight;
+    value.clamp(left.min(right), left.max(right))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TDigest;
+    use super::{Centroid, TDigest};
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1e-12,
+            "actual={actual} expected={expected}"
+        );
+    }
 
     #[test]
     fn constructor_validates_compression() {
@@ -313,6 +419,136 @@ mod tests {
         assert!(digest.quantile(0.5).is_err());
         assert!(digest.quantile(-0.1).is_err());
         assert!(digest.quantile(1.1).is_err());
+    }
+
+    #[test]
+    fn two_singletons_step_at_the_empirical_rank_boundary() {
+        let mut digest = TDigest::new(100.0).unwrap();
+        digest.add(0.0);
+        digest.add(10.0);
+
+        let below = f64::from_bits(0.5_f64.to_bits() - 1);
+        let above = f64::from_bits(0.5_f64.to_bits() + 1);
+        assert_eq!(digest.quantile(below).unwrap(), 0.0);
+        assert_eq!(digest.quantile(0.5).unwrap(), 10.0);
+        assert_eq!(digest.quantile(above).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn multi_sample_centroids_interpolate_at_midpoint_ranks_and_extrema() {
+        let digest = TDigest {
+            compression: 100.0,
+            centroids: vec![
+                Centroid {
+                    mean: 0.0,
+                    weight: 4.0,
+                },
+                Centroid {
+                    mean: 10.0,
+                    weight: 4.0,
+                },
+            ],
+            total_weight: 8.0,
+            min: -2.0,
+            max: 12.0,
+        };
+
+        for (q, expected) in [
+            (0.0, -2.0),
+            (0.125, -2.0),
+            (0.1875, -1.0),
+            (0.25, 0.0),
+            (0.5, 5.0),
+            (0.75, 10.0),
+            (0.8125, 11.0),
+            (0.875, 12.0),
+            (1.0, 12.0),
+        ] {
+            assert_close(digest.quantile(q).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn endpoint_queries_do_not_depend_on_terminal_centroid_means() {
+        let digest = TDigest {
+            compression: 100.0,
+            centroids: vec![Centroid {
+                mean: 5.0,
+                weight: 8.0,
+            }],
+            total_weight: 8.0,
+            min: 0.0,
+            max: 10.0,
+        };
+
+        assert_eq!(digest.quantile(0.0).unwrap(), 0.0);
+        assert_eq!(digest.quantile(1.0).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn adjacent_singletons_are_not_interpolated() {
+        let digest = TDigest {
+            compression: 100.0,
+            centroids: vec![
+                Centroid {
+                    mean: 0.0,
+                    weight: 4.0,
+                },
+                Centroid {
+                    mean: 10.0,
+                    weight: 1.0,
+                },
+                Centroid {
+                    mean: 20.0,
+                    weight: 1.0,
+                },
+            ],
+            total_weight: 6.0,
+            min: -2.0,
+            max: 20.0,
+        };
+
+        assert_eq!(digest.quantile(5.0 / 6.0 - 1e-12).unwrap(), 10.0);
+        assert_eq!(digest.quantile(5.0 / 6.0).unwrap(), 20.0);
+        assert_eq!(digest.quantile(5.0 / 6.0 + 1e-12).unwrap(), 20.0);
+    }
+
+    #[test]
+    fn exact_extrema_survive_compression_and_merge() {
+        let mut left = TDigest::new(20.0).unwrap();
+        left.add(-123.5);
+        for value in 0_u64..5_000 {
+            left.add(value as f64);
+        }
+
+        let mut right = TDigest::new(20.0).unwrap();
+        for value in 5_000_u64..10_000 {
+            right.add(value as f64);
+        }
+        right.add(12_345.5);
+
+        left.merge(&right).unwrap();
+
+        assert_eq!(left.quantile(0.0).unwrap(), -123.5);
+        assert_eq!(left.quantile(1.0).unwrap(), 12_345.5);
+    }
+
+    #[test]
+    fn quantiles_are_monotonic_across_centroid_boundaries() {
+        let mut digest = TDigest::new(40.0).unwrap();
+        for value in 0_u64..20_000 {
+            digest.add((value % 1_003) as f64);
+        }
+
+        let mut previous = digest.quantile(0.0).unwrap();
+        for step in 1..=10_000 {
+            let current = digest.quantile(step as f64 / 10_000.0).unwrap();
+            assert!(
+                previous <= current,
+                "step={step} previous={previous} current={current}"
+            );
+            previous = current;
+        }
     }
 
     #[test]
@@ -371,5 +607,9 @@ mod tests {
         digest.clear();
         assert!(digest.is_empty());
         assert!(digest.quantile(0.5).is_err());
+
+        digest.add(9.0);
+        assert_eq!(digest.quantile(0.0).unwrap(), 9.0);
+        assert_eq!(digest.quantile(1.0).unwrap(), 9.0);
     }
 }

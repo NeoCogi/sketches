@@ -88,3 +88,74 @@ pub(crate) fn splitmix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
 }
+
+#[cfg(test)]
+mod quantile_contract_tests {
+    use crate::kll::KllSketch;
+    use crate::tdigest::TDigest;
+
+    type QuantileCase<'a> = (&'a [f64], &'a [(f64, f64)]);
+
+    #[test]
+    fn kll_and_tdigest_share_the_exact_small_sample_convention() {
+        let cases: &[QuantileCase<'_>] = &[
+            (&[7.0], &[(0.0, 7.0), (0.5, 7.0), (1.0, 7.0)]),
+            (
+                &[0.0, 10.0],
+                &[
+                    (0.0, 0.0),
+                    (0.5 - f64::EPSILON, 0.0),
+                    (0.5, 10.0),
+                    (0.5 + f64::EPSILON, 10.0),
+                    (1.0, 10.0),
+                ],
+            ),
+            (
+                &[0.0, 10.0, 20.0],
+                &[
+                    (0.0, 0.0),
+                    (1.0 / 3.0, 10.0),
+                    (0.5, 10.0),
+                    (2.0 / 3.0, 20.0),
+                    (1.0, 20.0),
+                ],
+            ),
+            (
+                &[0.0, 10.0, 20.0, 30.0],
+                &[
+                    (0.0, 0.0),
+                    (0.25, 10.0),
+                    (0.5, 20.0),
+                    (0.75, 30.0),
+                    (1.0, 30.0),
+                ],
+            ),
+            (
+                &[0.0, 0.0, 10.0, 10.0],
+                &[(0.0, 0.0), (0.25, 0.0), (0.5, 10.0), (1.0, 10.0)],
+            ),
+        ];
+
+        for &(values, queries) in cases {
+            let mut kll = KllSketch::with_seed(200, 7).unwrap();
+            let mut tdigest = TDigest::new(100.0).unwrap();
+            for &value in values {
+                kll.add(value);
+                tdigest.add(value);
+            }
+
+            for &(q, expected) in queries {
+                assert_eq!(
+                    kll.quantile(q).unwrap(),
+                    expected,
+                    "KLL values={values:?} q={q}"
+                );
+                assert_eq!(
+                    tdigest.quantile(q).unwrap(),
+                    expected,
+                    "t-digest values={values:?} q={q}"
+                );
+            }
+        }
+    }
+}
