@@ -25,6 +25,17 @@
 //! Compared to Bloom filters, cuckoo filters support deletion while keeping a
 //! compact in-memory representation.
 //!
+//! # Safe deletion precondition
+//!
+//! [`CuckooFilter::delete`] may be called safely only for an item instance that
+//! the caller knows was previously inserted successfully and has not already
+//! been deleted. A positive [`CuckooFilter::contains`] result is not sufficient
+//! evidence because it may be a false positive. Deleting a non-member that
+//! collides with a stored fingerprint can remove a different real member and
+//! introduce a false negative. This is the deletion precondition described in
+//! Section 3.3 of the [paper]. Safe deletion of arbitrary keys requires exact
+//! membership information outside the filter.
+//!
 //! # Difference from the original insertion algorithm
 //!
 //! [Algorithm 1 in the original Cuckoo Filter paper][paper] returns failure
@@ -281,13 +292,25 @@ impl CuckooFilter {
         self.bucket_contains(index_a, fingerprint) || self.bucket_contains(index_b, fingerprint)
     }
 
-    /// Deletes one item instance.
+    /// Deletes one known-present item instance.
     ///
-    /// Returns `true` if a matching fingerprint was removed.
+    /// Call this method only when the caller knows that this item instance was
+    /// previously inserted successfully and has not already been deleted. A
+    /// positive [`Self::contains`] result does not establish that precondition:
+    /// it may be a false positive. Deleting a non-member can remove a different
+    /// real item with a colliding fingerprint and introduce a false negative.
+    /// Safe deletion of arbitrary keys requires exact membership tracking
+    /// outside the filter.
+    ///
+    /// Returns `true` if a matching fingerprint was removed. Because the filter
+    /// stores fingerprints rather than complete items, `true` does not prove
+    /// that the fingerprint belonged uniquely to `item`.
     pub fn delete<T: Hash>(&mut self, item: &T) -> bool {
         let fingerprint = self.fingerprint(item);
         let (index_a, index_b) = self.bucket_indexes(item, fingerprint);
 
+        // Exact identity is unavailable here; callers must uphold the
+        // known-present precondition documented above.
         if self.remove_from_bucket(index_a, fingerprint)
             || self.remove_from_bucket(index_b, fingerprint)
         {
@@ -564,8 +587,26 @@ mod tests {
     }
 
     #[test]
-    fn deleting_unknown_item_returns_false() {
+    fn deleting_from_an_empty_filter_returns_false() {
         let mut filter = CuckooFilter::new(100, 0.01).unwrap();
         assert!(!filter.delete(&"ghost"));
+    }
+
+    #[test]
+    fn deleting_a_colliding_non_member_can_remove_an_inserted_member() {
+        let mut filter = CuckooFilter::with_parameters(2, 4, 50).unwrap();
+        let inserted = 0_u64;
+        assert!(filter.insert(&inserted));
+
+        let colliding_non_member = (1_u64..100_000)
+            .find(|candidate| filter.contains(candidate))
+            .expect("small fingerprints should yield a false-positive fixture");
+
+        // Section 3.3 of the Cuckoo Filter paper requires callers to delete
+        // only items known to have been inserted. A false-positive lookup is
+        // not proof of insertion: deleting it removes the sole matching
+        // fingerprint, which actually belongs to `inserted`.
+        assert!(filter.delete(&colliding_non_member));
+        assert!(!filter.contains(&inserted));
     }
 }

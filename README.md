@@ -33,7 +33,7 @@ sketches = { path = "../sketches" }
 | Sketch | Module | Use it when | Notes |
 | --- | --- | --- | --- |
 | Bloom Filter | `bloom_filter` | You need very fast membership checks and can tolerate false positives | No deletions |
-| Cuckoo Filter | `cuckoo_filter` | You need membership checks and deletions | Can fail inserts at high load |
+| Cuckoo Filter | `cuckoo_filter` | You need membership checks and deletions | Delete only items known to have been inserted; inserts can fail at high load |
 | HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable, tiny memory footprint |
 | MinMax Sketch | `minmax_sketch` | You need approximate non-negative frequency counts | Conservative updates reduce overestimation |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
@@ -54,13 +54,22 @@ If your primary goal is:
 - Candidate retrieval for similarity search: use `MinHashLshIndex`, then rerank with MinHash Jaccard.
 - Jaccard from existing cardinality pipelines: use `HyperLogLog` + `jacard` helpers.
 - Membership without delete: use `BloomFilter`.
-- Membership with delete: use `CuckooFilter`.
+- Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
 - Approximate frequency (non-negative): use `MinMaxSketch`.
 - Approximate frequency (signed +/- updates): use `CountSketch`.
 - Heavy hitters / top-k: use `SpaceSaving`.
 - General quantiles: use `KllSketch`.
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
+
+## Cuckoo Filter Deletion Contract
+
+Call `CuckooFilter::delete` only for an item instance that the caller knows was
+previously inserted successfully and has not already been deleted. A positive
+`contains` result is insufficient because it may be a false positive. Deleting
+such a non-member can remove a different real item's colliding fingerprint and
+introduce a false negative. Applications that must delete arbitrary keys safely
+need exact membership tracking outside the filter.
 
 ## Quantile Convention
 
