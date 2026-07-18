@@ -86,6 +86,8 @@ smallest and largest retained values rather than guaranteed exact stream
 extrema. t-digest follows the same rank rule for singleton centroids, may
 interpolate between multi-sample centroid midpoint ranks, and separately
 retains the exact observed minimum and maximum for `q = 0` and `q = 1`.
+Its centroid means and interpolated quantiles remain finite across the complete
+finite `f64` input range, including mixtures of `-f64::MAX` and `f64::MAX`.
 
 ## Quick Examples
 

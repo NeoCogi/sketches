@@ -28,6 +28,10 @@
 //! `min(floor(q * N), N - 1)`. Centroids containing multiple samples are
 //! interpolated at their midpoint ranks, while singleton centroids remain
 //! exact steps. The exact observed minimum and maximum are retained separately.
+//! The paper states its mean and interpolation formulas over real numbers; this
+//! implementation evaluates the equivalent convex combinations in a
+//! sign-aware form so intermediate `f64` arithmetic stays finite for every
+//! finite sample value.
 //!
 //! [t-digest paper]: https://arxiv.org/pdf/1902.04023
 
@@ -126,7 +130,8 @@ impl TDigest {
 
     /// Adds one value to the digest.
     ///
-    /// Non-finite values are ignored.
+    /// Every finite `f64`, including values at either finite extreme, is
+    /// supported. Non-finite values are ignored.
     pub fn add(&mut self, value: f64) {
         if !value.is_finite() {
             return;
@@ -189,7 +194,7 @@ impl TDigest {
             let interior_weight = first.weight * 0.5 - 1.0;
             if interior_weight > 0.0 {
                 let fraction = ((index - 1.0) / interior_weight).clamp(0.0, 1.0);
-                return Ok(self.min + fraction * (first.mean - self.min));
+                return Ok(finite_lerp(self.min, first.mean, fraction));
             }
         }
 
@@ -203,7 +208,7 @@ impl TDigest {
             let interior_weight = last.weight * 0.5 - 1.0;
             if interior_weight > 0.0 {
                 let fraction = ((weight_from_right - 1.0) / interior_weight).clamp(0.0, 1.0);
-                return Ok(self.max - fraction * (self.max - last.mean));
+                return Ok(finite_lerp(self.max, last.mean, fraction));
             }
         }
 
@@ -297,15 +302,7 @@ impl TDigest {
         self.centroids
             .sort_unstable_by(|left, right| left.mean.total_cmp(&right.mean));
 
-        let mut nearest_index = 0usize;
-        let mut nearest_distance = (self.centroids[0].mean - value).abs();
-        for (index, centroid) in self.centroids.iter().enumerate().skip(1) {
-            let distance = (centroid.mean - value).abs();
-            if distance < nearest_distance {
-                nearest_distance = distance;
-                nearest_index = index;
-            }
-        }
+        let nearest_index = self.nearest_centroid(value);
 
         let q = self.centroid_quantile(nearest_index);
         let max_weight = self.max_centroid_weight(q);
@@ -313,7 +310,7 @@ impl TDigest {
         if self.centroids[nearest_index].weight + weight <= max_weight {
             let centroid = &mut self.centroids[nearest_index];
             let updated_weight = centroid.weight + weight;
-            centroid.mean += (value - centroid.mean) * (weight / updated_weight);
+            centroid.mean = weighted_average(centroid.mean, centroid.weight, value, weight);
             centroid.weight = updated_weight;
         } else {
             let insert_index = match self
@@ -346,8 +343,25 @@ impl TDigest {
         (centered / self.total_weight.max(1.0)).clamp(0.0, 1.0)
     }
 
+    fn nearest_centroid(&self, value: f64) -> usize {
+        match self
+            .centroids
+            .binary_search_by(|centroid| centroid.mean.total_cmp(&value))
+        {
+            Ok(index) => index,
+            Err(0) => 0,
+            Err(index) if index == self.centroids.len() => index - 1,
+            Err(index) => {
+                let left = index - 1;
+                let midpoint =
+                    finite_lerp(self.centroids[left].mean, self.centroids[index].mean, 0.5);
+                if value <= midpoint { left } else { index }
+            }
+        }
+    }
+
     fn max_centroid_weight(&self, q: f64) -> f64 {
-        let scaled = (4.0 * self.total_weight / self.compression) * q * (1.0 - q);
+        let scaled = (self.total_weight / self.compression) * 4.0 * q * (1.0 - q);
         scaled.max(1.0)
     }
 
@@ -371,7 +385,8 @@ impl TDigest {
 
                 if last.weight + centroid.weight <= max_weight {
                     let updated_weight = last.weight + centroid.weight;
-                    last.mean += (centroid.mean - last.mean) * (centroid.weight / updated_weight);
+                    last.mean =
+                        weighted_average(last.mean, last.weight, centroid.mean, centroid.weight);
                     last.weight = updated_weight;
                     continue;
                 }
@@ -386,19 +401,63 @@ impl TDigest {
     }
 }
 
-fn weighted_average(left: f64, left_weight: f64, right: f64, right_weight: f64) -> f64 {
-    let total_weight = left_weight + right_weight;
-    if total_weight <= 0.0 {
-        return (left + right) * 0.5;
+/// Evaluates a convex combination without overflowing for finite endpoints.
+///
+/// Same-sign endpoints use a bounded difference. Opposite-sign endpoints use
+/// scaled terms whose addition cannot overflow because their signs differ.
+fn finite_lerp(left: f64, right: f64, right_fraction: f64) -> f64 {
+    debug_assert!(left.is_finite());
+    debug_assert!(right.is_finite());
+    debug_assert!((0.0..=1.0).contains(&right_fraction));
+
+    if right_fraction <= 0.0 {
+        return left;
+    }
+    if right_fraction >= 1.0 {
+        return right;
     }
 
-    let value = (left * left_weight + right * right_weight) / total_weight;
+    let value = if left.is_sign_negative() == right.is_sign_negative() {
+        left + (right - left) * right_fraction
+    } else {
+        left * (1.0 - right_fraction) + right * right_fraction
+    };
+
     value.clamp(left.min(right), left.max(right))
+}
+
+/// Computes `right_weight / (left_weight + right_weight)` without forming the
+/// potentially overflowing sum.
+fn normalized_right_weight(left_weight: f64, right_weight: f64) -> f64 {
+    debug_assert!(left_weight.is_finite() && left_weight >= 0.0);
+    debug_assert!(right_weight.is_finite() && right_weight >= 0.0);
+
+    match (left_weight > 0.0, right_weight > 0.0) {
+        (false, false) => 0.5,
+        (false, true) => 1.0,
+        (true, false) => 0.0,
+        (true, true) if left_weight >= right_weight => {
+            let ratio = right_weight / left_weight;
+            ratio / (1.0 + ratio)
+        }
+        (true, true) => {
+            let ratio = left_weight / right_weight;
+            1.0 / (1.0 + ratio)
+        }
+    }
+}
+
+fn weighted_average(left: f64, left_weight: f64, right: f64, right_weight: f64) -> f64 {
+    finite_lerp(
+        left,
+        right,
+        normalized_right_weight(left_weight, right_weight),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Centroid, TDigest};
+    use super::{Centroid, TDigest, finite_lerp, weighted_average};
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
@@ -419,6 +478,182 @@ mod tests {
         assert!(digest.quantile(0.5).is_err());
         assert!(digest.quantile(-0.1).is_err());
         assert!(digest.quantile(1.1).is_err());
+    }
+
+    #[test]
+    fn finite_lerp_handles_extreme_finite_endpoints() {
+        for (left, right, fraction) in [
+            (-f64::MAX, f64::MAX, 0.25),
+            (-f64::MAX, f64::MAX, 0.5),
+            (-f64::MAX, f64::MAX, 0.75),
+            (f64::MAX / 2.0, f64::MAX, 0.5),
+            (-f64::MAX, -f64::MAX / 2.0, 0.5),
+        ] {
+            let value = finite_lerp(left, right, fraction);
+            assert!(value.is_finite(), "left={left} right={right} value={value}");
+            assert!(
+                left.min(right) <= value && value <= left.max(right),
+                "left={left} right={right} value={value}"
+            );
+        }
+
+        assert_eq!(finite_lerp(-f64::MAX, f64::MAX, 0.0), -f64::MAX);
+        assert_eq!(finite_lerp(-f64::MAX, f64::MAX, 0.5), 0.0);
+        assert_eq!(finite_lerp(-f64::MAX, f64::MAX, 1.0), f64::MAX);
+    }
+
+    #[test]
+    fn weighted_average_normalizes_extreme_weights_before_interpolation() {
+        assert_eq!(
+            weighted_average(-f64::MAX, f64::MAX, f64::MAX, f64::MAX),
+            0.0
+        );
+
+        let unequal = weighted_average(-f64::MAX, f64::MAX, f64::MAX, f64::MAX / 2.0);
+        let expected = -f64::MAX / 3.0;
+        assert!(unequal.is_finite());
+        assert!((unequal - expected).abs() <= expected.abs() * 4.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn nearest_centroid_comparison_does_not_overflow() {
+        let digest = TDigest {
+            compression: 100.0,
+            centroids: vec![
+                Centroid {
+                    mean: -f64::MAX,
+                    weight: 1.0,
+                },
+                Centroid {
+                    mean: -f64::MAX / 2.0,
+                    weight: 1.0,
+                },
+            ],
+            total_weight: 2.0,
+            min: -f64::MAX,
+            max: -f64::MAX / 2.0,
+        };
+
+        assert_eq!(digest.nearest_centroid(f64::MAX), 1);
+    }
+
+    #[test]
+    fn extreme_centroid_and_endpoint_interpolation_stays_finite() {
+        let between_centroids = TDigest {
+            compression: 100.0,
+            centroids: vec![
+                Centroid {
+                    mean: -f64::MAX,
+                    weight: 4.0,
+                },
+                Centroid {
+                    mean: f64::MAX,
+                    weight: 4.0,
+                },
+            ],
+            total_weight: 8.0,
+            min: -f64::MAX,
+            max: f64::MAX,
+        };
+        assert_eq!(between_centroids.quantile(0.5).unwrap(), 0.0);
+
+        let left_endpoint = TDigest {
+            compression: 100.0,
+            centroids: vec![
+                Centroid {
+                    mean: f64::MAX / 2.0,
+                    weight: 4.0,
+                },
+                Centroid {
+                    mean: f64::MAX,
+                    weight: 4.0,
+                },
+            ],
+            total_weight: 8.0,
+            min: -f64::MAX,
+            max: f64::MAX,
+        };
+        assert!(left_endpoint.quantile(0.1875).unwrap().is_finite());
+
+        let right_endpoint = TDigest {
+            compression: 100.0,
+            centroids: vec![
+                Centroid {
+                    mean: -f64::MAX,
+                    weight: 4.0,
+                },
+                Centroid {
+                    mean: -f64::MAX / 2.0,
+                    weight: 4.0,
+                },
+            ],
+            total_weight: 8.0,
+            min: -f64::MAX,
+            max: f64::MAX,
+        };
+        assert!(right_endpoint.quantile(0.8125).unwrap().is_finite());
+    }
+
+    #[test]
+    fn extreme_finite_stream_produces_finite_monotonic_quantiles() {
+        let mut digest = TDigest::new(20.0).unwrap();
+        for _ in 0..1_000 {
+            digest.add(-f64::MAX);
+            digest.add(f64::MAX);
+        }
+
+        assert!(
+            digest
+                .centroids
+                .iter()
+                .all(|centroid| centroid.mean.is_finite())
+        );
+
+        let mut previous = digest.quantile(0.0).unwrap();
+        for step in 1..=1_000 {
+            let current = digest.quantile(step as f64 / 1_000.0).unwrap();
+            assert!(current.is_finite(), "step={step} current={current}");
+            assert!(
+                previous <= current,
+                "step={step} previous={previous} current={current}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn shifted_and_scaled_streams_have_comparable_normalized_quantiles() {
+        const SAMPLE_COUNT: usize = 10_000;
+        let scale = f64::MAX / (SAMPLE_COUNT as f64 * 2.0);
+        let shift = 5.0e307;
+        let shifted_step = 4.0e292;
+
+        let mut baseline = TDigest::new(100.0).unwrap();
+        let mut scaled = TDigest::new(100.0).unwrap();
+        let mut shifted = TDigest::new(100.0).unwrap();
+        for index in 0..SAMPLE_COUNT {
+            let value = index as f64;
+            baseline.add(value);
+            scaled.add(value * scale);
+            shifted.add(shift + value * shifted_step);
+        }
+
+        for q in [0.01, 0.5, 0.99] {
+            let expected = baseline.quantile(q).unwrap();
+            let scaled_normalized = scaled.quantile(q).unwrap() / scale;
+            let shifted_normalized = (shifted.quantile(q).unwrap() - shift) / shifted_step;
+
+            assert!(scaled_normalized.is_finite());
+            assert!(shifted_normalized.is_finite());
+            assert!(
+                (scaled_normalized - expected).abs() <= 2.0,
+                "q={q} expected={expected} scaled={scaled_normalized}"
+            );
+            assert!(
+                (shifted_normalized - expected).abs() <= 2.0,
+                "q={q} expected={expected} shifted={shifted_normalized}"
+            );
+        }
     }
 
     #[test]
