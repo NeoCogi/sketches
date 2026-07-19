@@ -37,7 +37,7 @@ sketches = { path = "../sketches" }
 | HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable, tiny memory footprint |
 | MinMax Sketch | `minmax_sketch` | You need approximate non-negative frequency counts | Conservative updates reduce overestimation |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
-| Space-Saving | `space_saving` | You need top-k / heavy hitters from a stream | Tracks only bounded number of candidates |
+| Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
 | KLL Sketch | `kll` | You need general quantiles (median, p90, p99) | Good default quantile sketch |
 | t-digest | `tdigest` | You care most about tail quantiles (p95/p99/p999) | Typically stronger tail behavior |
 | MinHash | `minhash` | You need Jaccard similarity between sets | Best default for similarity tasks |
@@ -70,6 +70,29 @@ previously inserted successfully and has not already been deleted. A positive
 such a non-member can remove a different real item's colliding fingerprint and
 introduce a false negative. Applications that must delete arbitrary keys safely
 need exact membership tracking outside the filter.
+
+## Space-Saving Update Contract
+
+`SpaceSaving` accepts one observation per `insert(item)` call. It intentionally
+does not expose a weighted or batched update: the original Stream-Summary data
+structure obtains expected constant-time updates because every counter moves
+only from `count` to `count + 1`. Equal counters share a bucket, count buckets
+stay linked in sorted order, and `top_k(k)` walks down from the largest bucket
+without sorting every retained counter.
+
+For example:
+
+```rust
+use sketches::space_saving::SpaceSaving;
+
+let mut heavy_hitters = SpaceSaving::new(3)?;
+for item in ["apple", "apple", "banana", "apple", "carrot", "durian"] {
+    heavy_hitters.insert(item);
+}
+
+assert_eq!(heavy_hitters.top_k(1)[0].0, "apple");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ## Quantile Convention
 

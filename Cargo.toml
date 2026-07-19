@@ -14,3 +14,7 @@ repository = "https://github.com/NeoCogi/sketches"
 [[bench]]
 name = "tdigest"
 harness = false
+
+[[bench]]
+name = "space_saving"
+harness = false

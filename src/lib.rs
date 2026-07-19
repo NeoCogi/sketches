@@ -28,7 +28,8 @@
 //! - [`jacard`] for approximate set overlap/Jaccard helpers on HyperLogLog.
 //! - [`bloom_filter::BloomFilter`] for approximate set membership checks.
 //! - [`count_sketch::CountSketch`] for signed approximate frequency estimation.
-//! - [`space_saving::SpaceSaving`] for approximate heavy hitters.
+//! - [`space_saving::SpaceSaving`] for approximate heavy hitters in
+//!   unit-weight streams.
 //! - [`kll::KllSketch`] for approximate quantiles.
 //! - [`tdigest::TDigest`] for tail-friendly quantiles.
 //! - [`cuckoo_filter::CuckooFilter`] for membership with deletions.
