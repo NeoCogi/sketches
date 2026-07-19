@@ -10,3 +10,7 @@ authors = ["Raja Lehtihet", "Wael El Oraiby"]
 repository = "https://github.com/NeoCogi/sketches"
 
 [dependencies]
+
+[[bench]]
+name = "tdigest"
+harness = false

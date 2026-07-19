@@ -88,6 +88,10 @@ interpolate between multi-sample centroid midpoint ranks, and separately
 retains the exact observed minimum and maximum for `q = 0` and `q = 1`.
 Its centroid means and interpolated quantiles remain finite across the complete
 finite `f64` input range, including mixtures of `-f64::MAX` and `f64::MAX`.
+Additions are accumulated in an ordered buffer of roughly `10 * compression`
+entries and batch-merged with the compressed centroids. Quantile queries merge
+those two ordered views while reading, so they neither clone nor sort the
+centroid state.
 
 ## Quick Examples
 

@@ -32,15 +32,54 @@
 //! implementation evaluates the equivalent convex combinations in a
 //! sign-aware form so intermediate `f64` arithmetic stays finite for every
 //! finite sample value.
+//! Ingestion follows the paper's progressive-merge design: additions collect
+//! in an ordered buffer and are periodically merged with the already ordered
+//! centroid array. Keeping the buffer ordered costs `O(log B)` per addition,
+//! where `B` is bounded by roughly `10 * compression`, but lets read-only
+//! quantile queries traverse all current data without cloning or sorting.
 //!
 //! [t-digest paper]: https://arxiv.org/pdf/1902.04023
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
 use crate::SketchError;
+
+const BUFFER_MULTIPLIER: f64 = 10.0;
 
 #[derive(Debug, Clone, Copy)]
 struct Centroid {
     mean: f64,
     weight: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderedValue(f64);
+
+impl PartialEq for OrderedValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for OrderedValue {}
+
+impl PartialOrd for OrderedValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct BufferedKey {
+    mean: OrderedValue,
+    sequence: u64,
 }
 
 /// Approximate quantile sketch based on t-digest centroids.
@@ -60,7 +99,11 @@ struct Centroid {
 #[derive(Debug, Clone)]
 pub struct TDigest {
     compression: f64,
+    /// Fully merged centroids, always ordered by mean.
     centroids: Vec<Centroid>,
+    /// Pending centroids ordered for allocation-free read-only queries.
+    buffered: BTreeMap<BufferedKey, f64>,
+    next_sequence: u64,
     total_weight: f64,
     min: f64,
     max: f64,
@@ -85,6 +128,8 @@ impl TDigest {
         Ok(Self {
             compression,
             centroids: Vec::new(),
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 0.0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
@@ -113,9 +158,9 @@ impl TDigest {
         self.compression
     }
 
-    /// Returns the number of centroids currently tracked.
+    /// Returns the number of merged and buffered centroids currently tracked.
     pub fn centroid_count(&self) -> usize {
-        self.centroids.len()
+        self.centroids.len() + self.buffered.len()
     }
 
     /// Returns the total observed weight rounded to `u64`.
@@ -165,14 +210,11 @@ impl TDigest {
                 "q must be finite and in [0, 1]",
             ));
         }
-        if self.centroids.is_empty() {
+        if self.centroid_count() == 0 {
             return Err(SketchError::InvalidParameter(
                 "quantile is undefined for an empty digest",
             ));
         }
-
-        let mut centroids = self.centroids.clone();
-        centroids.sort_unstable_by(|left, right| left.mean.total_cmp(&right.mean));
 
         if q == 0.0 {
             return Ok(self.min);
@@ -180,8 +222,11 @@ impl TDigest {
         if q == 1.0 {
             return Ok(self.max);
         }
-        if centroids.len() == 1 {
-            return Ok(centroids[0].mean);
+
+        let mut centroids = self.ordered_centroids();
+        let first = centroids.next().expect("non-empty digest has a centroid");
+        if self.centroid_count() == 1 {
+            return Ok(first.mean);
         }
 
         let index = q * self.total_weight;
@@ -189,7 +234,6 @@ impl TDigest {
             return Ok(self.min);
         }
 
-        let first = centroids[0];
         if first.weight > 1.0 && index < first.weight * 0.5 {
             let interior_weight = first.weight * 0.5 - 1.0;
             if interior_weight > 0.0 {
@@ -202,7 +246,9 @@ impl TDigest {
             return Ok(self.max);
         }
 
-        let last = centroids[centroids.len() - 1];
+        let last = self
+            .last_ordered_centroid()
+            .expect("non-empty digest has a centroid");
         let weight_from_right = self.total_weight - index;
         if last.weight > 1.0 && weight_from_right <= last.weight * 0.5 {
             let interior_weight = last.weight * 0.5 - 1.0;
@@ -213,9 +259,8 @@ impl TDigest {
         }
 
         let mut weight_so_far = first.weight * 0.5;
-        for pair in centroids.windows(2) {
-            let left = pair[0];
-            let right = pair[1];
+        let mut left = first;
+        for right in centroids {
             let interval_weight = (left.weight + right.weight) * 0.5;
 
             if weight_so_far + interval_weight > index {
@@ -246,6 +291,7 @@ impl TDigest {
             }
 
             weight_so_far += interval_weight;
+            left = right;
         }
 
         Ok(self.max)
@@ -270,7 +316,7 @@ impl TDigest {
             self.max = self.max.max(other.max);
         }
 
-        for centroid in &other.centroids {
+        for centroid in other.ordered_centroids() {
             self.add_weighted(centroid.mean, centroid.weight);
         }
         self.compress();
@@ -280,6 +326,8 @@ impl TDigest {
     /// Clears all centroids and observed weight.
     pub fn clear(&mut self) {
         self.centroids.clear();
+        self.buffered.clear();
+        self.next_sequence = 0;
         self.total_weight = 0.0;
         self.min = f64::INFINITY;
         self.max = f64::NEG_INFINITY;
@@ -290,72 +338,54 @@ impl TDigest {
             return;
         }
 
-        if self.centroids.is_empty() {
-            self.centroids.push(Centroid {
-                mean: value,
-                weight,
-            });
-            self.total_weight += weight;
-            return;
+        if self.next_sequence == u64::MAX {
+            self.compress();
         }
 
-        self.centroids
-            .sort_unstable_by(|left, right| left.mean.total_cmp(&right.mean));
-
-        let nearest_index = self.nearest_centroid(value);
-
-        let q = self.centroid_quantile(nearest_index);
-        let max_weight = self.max_centroid_weight(q);
-
-        if self.centroids[nearest_index].weight + weight <= max_weight {
-            let centroid = &mut self.centroids[nearest_index];
-            let updated_weight = centroid.weight + weight;
-            centroid.mean = weighted_average(centroid.mean, centroid.weight, value, weight);
-            centroid.weight = updated_weight;
-        } else {
-            let insert_index = match self
-                .centroids
-                .binary_search_by(|centroid| centroid.mean.total_cmp(&value))
-            {
-                Ok(index) | Err(index) => index,
-            };
-            self.centroids.insert(
-                insert_index,
-                Centroid {
-                    mean: value,
-                    weight,
-                },
-            );
-        }
+        let key = BufferedKey {
+            mean: OrderedValue(value),
+            sequence: self.next_sequence,
+        };
+        self.next_sequence += 1;
+        let replaced = self.buffered.insert(key, weight);
+        debug_assert!(replaced.is_none());
 
         self.total_weight += weight;
-        if self.centroids.len() > (self.compression * 8.0) as usize {
+        if self.buffered.len() >= self.buffer_limit() {
             self.compress();
         }
     }
 
-    fn centroid_quantile(&self, index: usize) -> f64 {
-        let cumulative_before = self.centroids[..index]
-            .iter()
-            .map(|centroid| centroid.weight)
-            .sum::<f64>();
-        let centered = cumulative_before + self.centroids[index].weight * 0.5;
-        (centered / self.total_weight.max(1.0)).clamp(0.0, 1.0)
+    fn buffer_limit(&self) -> usize {
+        (self.compression * BUFFER_MULTIPLIER).ceil() as usize
     }
 
-    fn nearest_centroid(&self, value: f64) -> usize {
-        match self
-            .centroids
-            .binary_search_by(|centroid| centroid.mean.total_cmp(&value))
-        {
-            Ok(index) => index,
-            Err(0) => 0,
-            Err(index) if index == self.centroids.len() => index - 1,
-            Err(index) => {
-                let left = index - 1;
-                let midpoint =
-                    finite_lerp(self.centroids[left].mean, self.centroids[index].mean, 0.5);
-                if value <= midpoint { left } else { index }
+    fn ordered_centroids(&self) -> OrderedCentroids<'_> {
+        OrderedCentroids {
+            merged: self.centroids.iter().peekable(),
+            buffered: self.buffered.iter().peekable(),
+        }
+    }
+
+    fn last_ordered_centroid(&self) -> Option<Centroid> {
+        let merged = self.centroids.last().copied();
+        let buffered = self
+            .buffered
+            .last_key_value()
+            .map(|(key, &weight)| Centroid {
+                mean: key.mean.0,
+                weight,
+            });
+
+        match (merged, buffered) {
+            (None, None) => None,
+            (Some(centroid), None) | (None, Some(centroid)) => Some(centroid),
+            (Some(merged), Some(buffered)) => {
+                if merged.mean.total_cmp(&buffered.mean) == Ordering::Greater {
+                    Some(merged)
+                } else {
+                    Some(buffered)
+                }
             }
         }
     }
@@ -366,18 +396,37 @@ impl TDigest {
     }
 
     fn compress(&mut self) {
-        if self.centroids.len() <= 1 {
+        if self.buffered.is_empty() && self.centroids.len() <= 1 {
             return;
         }
 
-        self.centroids
-            .sort_unstable_by(|left, right| left.mean.total_cmp(&right.mean));
-
         let old = std::mem::take(&mut self.centroids);
-        let mut merged: Vec<Centroid> = Vec::with_capacity(old.len());
+        let buffered = std::mem::take(&mut self.buffered);
+        let capacity = old.len() + buffered.len();
+        let mut old = old.into_iter().peekable();
+        let mut buffered = buffered.into_iter().peekable();
+        let mut merged: Vec<Centroid> = Vec::with_capacity(capacity);
         let mut cumulative = 0.0;
 
-        for centroid in old {
+        loop {
+            let take_buffered = match (old.peek(), buffered.peek()) {
+                (None, None) => break,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (Some(left), Some((right, _))) => {
+                    left.mean.total_cmp(&right.mean.0) == Ordering::Greater
+                }
+            };
+            let centroid = if take_buffered {
+                let (key, weight) = buffered.next().expect("buffered centroid is available");
+                Centroid {
+                    mean: key.mean.0,
+                    weight,
+                }
+            } else {
+                old.next().expect("merged centroid is available")
+            };
+
             if let Some(last) = merged.last_mut() {
                 let q =
                     ((cumulative + 0.5 * last.weight) / self.total_weight.max(1.0)).clamp(0.0, 1.0);
@@ -398,6 +447,36 @@ impl TDigest {
         }
 
         self.centroids = merged;
+        self.next_sequence = 0;
+    }
+}
+
+struct OrderedCentroids<'a> {
+    merged: std::iter::Peekable<std::slice::Iter<'a, Centroid>>,
+    buffered: std::iter::Peekable<std::collections::btree_map::Iter<'a, BufferedKey, f64>>,
+}
+
+impl Iterator for OrderedCentroids<'_> {
+    type Item = Centroid;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let take_buffered = match (self.merged.peek(), self.buffered.peek()) {
+            (None, None) => return None,
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(left), Some((right, _))) => {
+                left.mean.total_cmp(&right.mean.0) == Ordering::Greater
+            }
+        };
+
+        if take_buffered {
+            self.buffered.next().map(|(key, &weight)| Centroid {
+                mean: key.mean.0,
+                weight,
+            })
+        } else {
+            self.merged.next().copied()
+        }
     }
 }
 
@@ -457,6 +536,8 @@ fn weighted_average(left: f64, left_weight: f64, right: f64, right_weight: f64) 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{Centroid, TDigest, finite_lerp, weighted_average};
 
     fn assert_close(actual: f64, expected: f64) {
@@ -470,6 +551,66 @@ mod tests {
     fn constructor_validates_compression() {
         assert!(TDigest::new(5.0).is_err());
         assert!(TDigest::new(50.0).is_ok());
+    }
+
+    #[test]
+    fn additions_are_buffered_and_batch_compressed() {
+        let mut digest = TDigest::new(10.0).unwrap();
+        let buffer_limit = digest.buffer_limit();
+
+        for value in (1..buffer_limit).rev() {
+            digest.add(value as f64);
+        }
+
+        assert!(digest.centroids.is_empty());
+        assert_eq!(digest.buffered.len(), buffer_limit - 1);
+        assert!(digest.quantile(0.5).unwrap().is_finite());
+
+        digest.add(0.0);
+
+        assert!(digest.buffered.is_empty());
+        assert!(!digest.centroids.is_empty());
+        assert!(
+            digest
+                .centroids
+                .windows(2)
+                .all(|pair| pair[0].mean <= pair[1].mean)
+        );
+    }
+
+    #[test]
+    fn quantile_reads_merged_and_buffered_state_without_mutation() {
+        let mut digest = TDigest::new(10.0).unwrap();
+        let buffer_limit = digest.buffer_limit();
+        for value in 0..buffer_limit + 37 {
+            digest.add(((value * 47) % (buffer_limit + 37)) as f64);
+        }
+
+        assert!(!digest.centroids.is_empty());
+        assert!(!digest.buffered.is_empty());
+        let merged_len = digest.centroids.len();
+        let buffered_len = digest.buffered.len();
+        let next_sequence = digest.next_sequence;
+
+        for q in [0.01, 0.5, 0.99] {
+            assert!(digest.quantile(q).unwrap().is_finite());
+        }
+
+        assert_eq!(digest.centroids.len(), merged_len);
+        assert_eq!(digest.buffered.len(), buffered_len);
+        assert_eq!(digest.next_sequence, next_sequence);
+        assert!(
+            digest
+                .ordered_centroids()
+                .map(|centroid| centroid.mean)
+                .zip(
+                    digest
+                        .ordered_centroids()
+                        .skip(1)
+                        .map(|centroid| centroid.mean)
+                )
+                .all(|(left, right)| left <= right)
+        );
     }
 
     #[test]
@@ -516,28 +657,6 @@ mod tests {
     }
 
     #[test]
-    fn nearest_centroid_comparison_does_not_overflow() {
-        let digest = TDigest {
-            compression: 100.0,
-            centroids: vec![
-                Centroid {
-                    mean: -f64::MAX,
-                    weight: 1.0,
-                },
-                Centroid {
-                    mean: -f64::MAX / 2.0,
-                    weight: 1.0,
-                },
-            ],
-            total_weight: 2.0,
-            min: -f64::MAX,
-            max: -f64::MAX / 2.0,
-        };
-
-        assert_eq!(digest.nearest_centroid(f64::MAX), 1);
-    }
-
-    #[test]
     fn extreme_centroid_and_endpoint_interpolation_stays_finite() {
         let between_centroids = TDigest {
             compression: 100.0,
@@ -551,6 +670,8 @@ mod tests {
                     weight: 4.0,
                 },
             ],
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 8.0,
             min: -f64::MAX,
             max: f64::MAX,
@@ -569,6 +690,8 @@ mod tests {
                     weight: 4.0,
                 },
             ],
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 8.0,
             min: -f64::MAX,
             max: f64::MAX,
@@ -587,6 +710,8 @@ mod tests {
                     weight: 4.0,
                 },
             ],
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 8.0,
             min: -f64::MAX,
             max: f64::MAX,
@@ -604,8 +729,7 @@ mod tests {
 
         assert!(
             digest
-                .centroids
-                .iter()
+                .ordered_centroids()
                 .all(|centroid| centroid.mean.is_finite())
         );
 
@@ -657,6 +781,39 @@ mod tests {
     }
 
     #[test]
+    fn buffered_ingestion_retains_accuracy_across_orderings_and_compressions() {
+        const SAMPLE_COUNT: usize = 10_000;
+
+        for compression in [20.0, 100.0, 300.0] {
+            for ordering in ["ascending", "descending", "permuted"] {
+                let mut digest = TDigest::new(compression).unwrap();
+                for index in 0..SAMPLE_COUNT {
+                    let value = match ordering {
+                        "ascending" => index,
+                        "descending" => SAMPLE_COUNT - 1 - index,
+                        "permuted" => (index * 7_919) % SAMPLE_COUNT,
+                        _ => unreachable!(),
+                    };
+                    digest.add(value as f64);
+                }
+
+                for q in [0.01, 0.5, 0.99] {
+                    let estimate = digest.quantile(q).unwrap();
+                    let exact = (q * SAMPLE_COUNT as f64)
+                        .floor()
+                        .min((SAMPLE_COUNT - 1) as f64);
+                    let normalized_rank_error = (estimate - exact).abs() / SAMPLE_COUNT as f64;
+                    assert!(
+                        normalized_rank_error <= 0.03,
+                        "compression={compression} ordering={ordering} q={q} \
+                         estimate={estimate} error={normalized_rank_error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn two_singletons_step_at_the_empirical_rank_boundary() {
         let mut digest = TDigest::new(100.0).unwrap();
         digest.add(0.0);
@@ -683,6 +840,8 @@ mod tests {
                     weight: 4.0,
                 },
             ],
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 8.0,
             min: -2.0,
             max: 12.0,
@@ -711,6 +870,8 @@ mod tests {
                 mean: 5.0,
                 weight: 8.0,
             }],
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 8.0,
             min: 0.0,
             max: 10.0,
@@ -738,6 +899,8 @@ mod tests {
                     weight: 1.0,
                 },
             ],
+            buffered: BTreeMap::new(),
+            next_sequence: 0,
             total_weight: 6.0,
             min: -2.0,
             max: 20.0,
