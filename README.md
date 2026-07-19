@@ -62,6 +62,24 @@ If your primary goal is:
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
 
+## Cuckoo Filter Parameters
+
+Automatic cuckoo filters use four-entry buckets, fingerprints from 6 through
+16 bits, and a table sized to at most 96% target occupancy. The six-bit minimum
+follows the original paper's empirical finding that shorter fingerprints can
+prevent partial-key cuckoo hashing from reaching high occupancy in large
+tables. `CuckooFilter::with_parameters` rejects widths outside `6..=16`.
+
+The paper and reference implementation use a maximum of 500 relocation kicks,
+which is also the default used by this crate's automatic constructor. A larger
+limit can be selected explicitly with `CuckooFilter::with_parameters` when an
+application prefers more relocation work in exchange for fewer early failures
+near capacity.
+
+`expected_items` is a sizing target, not a guarantee that every insertion up to
+that count succeeds. At dense target loads, the randomized 500-kick insertion
+may fail earlier.
+
 ## Cuckoo Filter Deletion Contract
 
 Call `CuckooFilter::delete` only for an item instance that the caller knows was

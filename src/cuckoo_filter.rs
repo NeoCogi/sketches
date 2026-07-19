@@ -53,6 +53,19 @@
 //! one sequential log write per kick; insertions into an empty candidate slot
 //! do not use the log.
 //!
+//! # Parameter choices relative to the paper
+//!
+//! Section 4 of the [paper] reports that four-entry buckets sustain about 95%
+//! occupancy in large practical filters once fingerprints are at least six
+//! bits wide, while shorter fingerprints can fail earlier because partial-key
+//! cuckoo hashing offers too few distinct bucket pairs. Both constructors
+//! therefore reject fingerprint widths outside `6..=16`.
+//!
+//! The paper and its reference implementation use 500 as `MaxNumKicks`, which
+//! is also the default used by [`CuckooFilter::new`]. Applications that prefer
+//! more relocation work in exchange for fewer early failures near capacity can
+//! opt into a larger limit through [`CuckooFilter::with_parameters`].
+//!
 //! # False-positive-rate sizing
 //!
 //! Equation 6 in the [paper] sizes a fingerprint for two full candidate
@@ -61,9 +74,9 @@
 //! one adjustment: fingerprint value zero marks an empty slot, so a zero hash
 //! fingerprint is remapped to one. For `q = 2^fingerprint_bits`, that mapping
 //! makes the collision probability of two fingerprints `(q + 2) / q^2`
-//! instead of `1 / q`. [`CuckooFilter::new`] chooses the smallest supported
-//! width whose full-bucket bound meets the requested rate and rejects rates
-//! that would require more than 16 bits.
+//! instead of `1 / q`. [`CuckooFilter::new`] chooses the smallest automatic
+//! width (at least six bits) whose full-bucket bound meets the requested rate
+//! and rejects rates that would require more than 16 bits.
 //!
 //! [paper]: https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014.pdf
 
@@ -73,7 +86,8 @@ use crate::{SketchError, seeded_hash64, splitmix64};
 
 const BUCKET_SIZE: usize = 4;
 const DEFAULT_MAX_KICKS: usize = 500;
-const MIN_FINGERPRINT_BITS: u8 = 4;
+const MAX_TARGET_LOAD_FACTOR: f64 = 0.96;
+const MIN_FINGERPRINT_BITS: u8 = 6;
 const MAX_FINGERPRINT_BITS: u8 = 16;
 const INDEX_SEED: u64 = 0x243F_6A88_85A3_08D3;
 const FINGERPRINT_SEED: u64 = 0x1319_8A2E_0370_7344;
@@ -91,7 +105,176 @@ fn full_bucket_false_positive_rate_bound(fingerprint_bits: u8) -> f64 {
     (2.0 * BUCKET_SIZE as f64 * fingerprint_collision_probability(fingerprint_bits)).min(1.0)
 }
 
+/// Chooses the smallest power-of-two bucket count whose target occupancy does
+/// not exceed the 96% threshold used by the reference implementation.
+fn bucket_count_for_expected_items(expected_items: usize) -> Result<usize, SketchError> {
+    debug_assert!(expected_items > 0);
+
+    let minimum_buckets = expected_items.div_ceil(BUCKET_SIZE).max(2);
+    let mut buckets =
+        minimum_buckets
+            .checked_next_power_of_two()
+            .ok_or(SketchError::InvalidParameter(
+                "expected_items requires too many buckets",
+            ))?;
+    let target_load = expected_items as f64 / (buckets as f64 * BUCKET_SIZE as f64);
+
+    if target_load > MAX_TARGET_LOAD_FACTOR {
+        buckets = buckets.checked_mul(2).ok_or(SketchError::InvalidParameter(
+            "expected_items requires too many buckets",
+        ))?;
+    }
+    Ok(buckets)
+}
+
+/// Byte-aligned storage for buckets of four packed fingerprints.
+///
+/// A bucket uses `ceil(BUCKET_SIZE * fingerprint_bits / 8)` bytes. Keeping
+/// buckets byte-aligned makes each lookup touch one contiguous byte range while
+/// wasting at most four padding bits per bucket for odd fingerprint widths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackedBuckets {
+    bytes: Vec<u8>,
+    bucket_count: usize,
+    bytes_per_bucket: usize,
+    fingerprint_bits: u8,
+}
+
+impl PackedBuckets {
+    fn new(bucket_count: usize, fingerprint_bits: u8) -> Result<Self, SketchError> {
+        let bits_per_bucket = BUCKET_SIZE * usize::from(fingerprint_bits);
+        let bytes_per_bucket = bits_per_bucket.div_ceil(8);
+        let storage_len =
+            bucket_count
+                .checked_mul(bytes_per_bucket)
+                .ok_or(SketchError::InvalidParameter(
+                    "packed bucket storage size overflows usize",
+                ))?;
+        // A small zeroed suffix lets every bucket be decoded with one safe
+        // eight-byte load, including the final bucket and widths below 16.
+        let allocation_len = storage_len
+            .checked_add(std::mem::size_of::<u64>() - 1)
+            .ok_or(SketchError::InvalidParameter(
+                "packed bucket storage size overflows usize",
+            ))?;
+
+        Ok(Self {
+            bytes: vec![0; allocation_len],
+            bucket_count,
+            bytes_per_bucket,
+            fingerprint_bits,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.bucket_count
+    }
+
+    #[cfg(test)]
+    fn storage_len(&self) -> usize {
+        self.bucket_count * self.bytes_per_bucket
+    }
+
+    fn clear(&mut self) {
+        self.bytes.fill(0);
+    }
+
+    fn contains(&self, bucket: usize, fingerprint: u16) -> bool {
+        let word = self.read_bucket(bucket);
+        let mask = self.fingerprint_mask();
+
+        (0..BUCKET_SIZE)
+            .any(|slot| ((word >> self.slot_shift(slot)) & mask) == u64::from(fingerprint))
+    }
+
+    #[cfg(test)]
+    fn has_empty(&self, bucket: usize) -> bool {
+        self.contains(bucket, 0)
+    }
+
+    fn insert(&mut self, bucket: usize, fingerprint: u16) -> bool {
+        debug_assert_ne!(fingerprint, 0);
+        debug_assert!(u64::from(fingerprint) <= self.fingerprint_mask());
+
+        let mut word = self.read_bucket(bucket);
+        let mask = self.fingerprint_mask();
+
+        for slot in 0..BUCKET_SIZE {
+            let shift = self.slot_shift(slot);
+            if ((word >> shift) & mask) == 0 {
+                word |= u64::from(fingerprint) << shift;
+                self.write_bucket(bucket, word);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove(&mut self, bucket: usize, fingerprint: u16) -> bool {
+        let mut word = self.read_bucket(bucket);
+        let mask = self.fingerprint_mask();
+
+        for slot in 0..BUCKET_SIZE {
+            let shift = self.slot_shift(slot);
+            if ((word >> shift) & mask) == u64::from(fingerprint) {
+                word &= !(mask << shift);
+                self.write_bucket(bucket, word);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn swap_slot(&mut self, bucket: usize, slot: usize, fingerprint: &mut u16) {
+        debug_assert!(slot < BUCKET_SIZE);
+        debug_assert!(u64::from(*fingerprint) <= self.fingerprint_mask());
+
+        let mut word = self.read_bucket(bucket);
+        let mask = self.fingerprint_mask();
+        let shift = self.slot_shift(slot);
+        let previous = ((word >> shift) & mask) as u16;
+
+        word = (word & !(mask << shift)) | (u64::from(*fingerprint) << shift);
+        self.write_bucket(bucket, word);
+        *fingerprint = previous;
+    }
+
+    #[cfg(test)]
+    fn read_slot(&self, bucket: usize, slot: usize) -> u16 {
+        debug_assert!(slot < BUCKET_SIZE);
+        ((self.read_bucket(bucket) >> self.slot_shift(slot)) & self.fingerprint_mask()) as u16
+    }
+
+    fn fingerprint_mask(&self) -> u64 {
+        (1_u64 << self.fingerprint_bits) - 1
+    }
+
+    fn slot_shift(&self, slot: usize) -> usize {
+        slot * usize::from(self.fingerprint_bits)
+    }
+
+    fn read_bucket(&self, bucket: usize) -> u64 {
+        debug_assert!(bucket < self.bucket_count);
+        let start = bucket * self.bytes_per_bucket;
+        let bytes = self.bytes[start..start + std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("packed bucket storage always has read padding");
+        u64::from_le_bytes(bytes)
+    }
+
+    fn write_bucket(&mut self, bucket: usize, word: u64) {
+        debug_assert!(bucket < self.bucket_count);
+        let start = bucket * self.bytes_per_bucket;
+        let destination = &mut self.bytes[start..start + self.bytes_per_bucket];
+        destination.copy_from_slice(&word.to_le_bytes()[..destination.len()]);
+    }
+}
+
 /// Approximate set-membership filter with support for deletion.
+///
+/// Each four-entry bucket stores fingerprints in a byte-aligned packed field,
+/// using `ceil(4 * fingerprint_bits / 8)` bytes rather than four fixed-width
+/// integers.
 ///
 /// # Example
 /// ```rust
@@ -105,8 +288,7 @@ fn full_bucket_false_positive_rate_bound(fingerprint_bits: u8) -> f64 {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CuckooFilter {
-    buckets: Vec<[u16; BUCKET_SIZE]>,
-    fingerprint_bits: u8,
+    buckets: PackedBuckets,
     max_kicks: usize,
     inserted_items: u64,
     rng_state: u64,
@@ -117,11 +299,19 @@ pub struct CuckooFilter {
 impl CuckooFilter {
     /// Creates a filter from expected inserts and target false-positive rate.
     ///
-    /// The fingerprint width is the smallest value in the supported range
-    /// `4..=16` whose conservative full-bucket false-positive-rate bound meets
+    /// The fingerprint width is the smallest value in the automatic range
+    /// `6..=16` whose conservative full-bucket false-positive-rate bound meets
     /// `false_positive_rate`. The calculation follows Equation 6 of the
     /// original Cuckoo Filter paper and accounts for this implementation's
     /// remapping of the reserved zero fingerprint to one.
+    /// Six bits is the minimum because shorter partial-key fingerprints may not
+    /// sustain high occupancy in large tables.
+    ///
+    /// The bucket count is the smallest supported power of two whose target
+    /// load does not exceed 96%, matching the reference implementation's
+    /// sizing threshold. `expected_items` is a sizing target rather than a
+    /// successful-insertion guarantee: the randomized 500-kick insertion can
+    /// still fail before that count, especially near the target load.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid inputs or when the
@@ -147,9 +337,7 @@ impl CuckooFilter {
             .ok_or(SketchError::InvalidParameter(
                 "false_positive_rate requires fingerprints wider than 16 bits",
             ))?;
-        let buckets = (((expected_items as f64 / BUCKET_SIZE as f64) / 0.90).ceil() as usize)
-            .max(2)
-            .next_power_of_two();
+        let buckets = bucket_count_for_expected_items(expected_items)?;
 
         Self::with_parameters(buckets, fingerprint_bits, DEFAULT_MAX_KICKS)
     }
@@ -157,6 +345,11 @@ impl CuckooFilter {
     /// Creates a filter from explicit parameters.
     ///
     /// `bucket_count` must be a non-zero power of two.
+    /// `fingerprint_bits` must be in `6..=16`, enforcing the practical minimum
+    /// reported for four-entry buckets in Section 4 of the paper.
+    /// `max_kicks = 500` selects the paper/reference limit used by the automatic
+    /// constructor. Larger values trade additional worst-case insertion and
+    /// rollback work for fewer early failures near capacity.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid values.
@@ -170,9 +363,9 @@ impl CuckooFilter {
                 "bucket_count must be a non-zero power of two",
             ));
         }
-        if fingerprint_bits == 0 || fingerprint_bits > MAX_FINGERPRINT_BITS {
+        if !(MIN_FINGERPRINT_BITS..=MAX_FINGERPRINT_BITS).contains(&fingerprint_bits) {
             return Err(SketchError::InvalidParameter(
-                "fingerprint_bits must be in the inclusive range [1, 16]",
+                "fingerprint_bits must be in the inclusive range [6, 16]",
             ));
         }
         if max_kicks == 0 {
@@ -182,8 +375,7 @@ impl CuckooFilter {
         }
 
         Ok(Self {
-            buckets: vec![[0; BUCKET_SIZE]; bucket_count],
-            fingerprint_bits,
+            buckets: PackedBuckets::new(bucket_count, fingerprint_bits)?,
             max_kicks,
             inserted_items: 0,
             rng_state: 0xD6E8_FD93_5E7A_4A6D,
@@ -198,7 +390,7 @@ impl CuckooFilter {
 
     /// Returns the fingerprint width in bits.
     pub fn fingerprint_bits(&self) -> u8 {
-        self.fingerprint_bits
+        self.buckets.fingerprint_bits
     }
 
     /// Returns the total number of successful insertions minus deletions.
@@ -228,7 +420,7 @@ impl CuckooFilter {
     /// approximation. The value is not load-aware; partially filled filters
     /// normally have a lower false-positive rate.
     pub fn expected_false_positive_rate(&self) -> f64 {
-        full_bucket_false_positive_rate_bound(self.fingerprint_bits)
+        full_bucket_false_positive_rate_bound(self.fingerprint_bits())
     }
 
     /// Inserts one item into the filter.
@@ -268,7 +460,7 @@ impl CuckooFilter {
         for _ in 0..self.max_kicks {
             let slot = (self.next_u64() as usize) % BUCKET_SIZE;
             self.relocation_log.push(bucket * BUCKET_SIZE + slot);
-            std::mem::swap(&mut fingerprint, &mut self.buckets[bucket][slot]);
+            self.buckets.swap_slot(bucket, slot, &mut fingerprint);
             bucket = self.alternate_index(bucket, fingerprint);
 
             if self.insert_into_bucket(bucket, fingerprint) {
@@ -322,35 +514,21 @@ impl CuckooFilter {
 
     /// Clears all buckets and resets counters.
     pub fn clear(&mut self) {
-        for bucket in &mut self.buckets {
-            *bucket = [0; BUCKET_SIZE];
-        }
+        self.buckets.clear();
         self.inserted_items = 0;
         self.relocation_log.clear();
     }
 
     fn insert_into_bucket(&mut self, bucket_index: usize, fingerprint: u16) -> bool {
-        for slot in &mut self.buckets[bucket_index] {
-            if *slot == 0 {
-                *slot = fingerprint;
-                return true;
-            }
-        }
-        false
+        self.buckets.insert(bucket_index, fingerprint)
     }
 
     fn remove_from_bucket(&mut self, bucket_index: usize, fingerprint: u16) -> bool {
-        for slot in &mut self.buckets[bucket_index] {
-            if *slot == fingerprint {
-                *slot = 0;
-                return true;
-            }
-        }
-        false
+        self.buckets.remove(bucket_index, fingerprint)
     }
 
     fn bucket_contains(&self, bucket_index: usize, fingerprint: u16) -> bool {
-        self.buckets[bucket_index].contains(&fingerprint)
+        self.buckets.contains(bucket_index, fingerprint)
     }
 
     /// Reverses the paper-style swap chain after exhausting `max_kicks`.
@@ -358,7 +536,7 @@ impl CuckooFilter {
         for &location in self.relocation_log.iter().rev() {
             let bucket = location / BUCKET_SIZE;
             let slot = location % BUCKET_SIZE;
-            std::mem::swap(fingerprint, &mut self.buckets[bucket][slot]);
+            self.buckets.swap_slot(bucket, slot, fingerprint);
         }
     }
 
@@ -379,10 +557,11 @@ impl CuckooFilter {
 
     fn fingerprint<T: Hash>(&self, item: &T) -> u16 {
         let hash = seeded_hash64(item, FINGERPRINT_SEED);
-        let mask = if self.fingerprint_bits == 16 {
+        let fingerprint_bits = self.fingerprint_bits();
+        let mask = if fingerprint_bits == 16 {
             u64::from(u16::MAX)
         } else {
-            (1_u64 << self.fingerprint_bits) - 1
+            (1_u64 << fingerprint_bits) - 1
         };
 
         let fingerprint = (hash & mask) as u16;
@@ -398,9 +577,64 @@ impl CuckooFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUCKET_SIZE, CuckooFilter, MAX_FINGERPRINT_BITS, MIN_FINGERPRINT_BITS,
+        BUCKET_SIZE, CuckooFilter, MAX_FINGERPRINT_BITS, MAX_TARGET_LOAD_FACTOR,
+        MIN_FINGERPRINT_BITS, PackedBuckets, bucket_count_for_expected_items,
         fingerprint_collision_probability, full_bucket_false_positive_rate_bound,
     };
+
+    #[test]
+    fn packed_buckets_roundtrip_every_encodable_width() {
+        let bucket_count = 3;
+
+        for fingerprint_bits in 1..=MAX_FINGERPRINT_BITS {
+            let mut buckets = PackedBuckets::new(bucket_count, fingerprint_bits).unwrap();
+            let expected_bytes =
+                bucket_count * (BUCKET_SIZE * usize::from(fingerprint_bits)).div_ceil(8);
+            let mask = (1_u64 << fingerprint_bits) - 1;
+            let mut expected = [[0_u16; BUCKET_SIZE]; 3];
+
+            assert_eq!(buckets.storage_len(), expected_bytes);
+
+            for (bucket, expected_bucket) in expected.iter_mut().enumerate() {
+                for (slot, expected_slot) in expected_bucket.iter_mut().enumerate() {
+                    let value = ((((bucket * BUCKET_SIZE + slot + 1) as u64) & mask).max(1)) as u16;
+                    let mut incoming = value;
+                    buckets.swap_slot(bucket, slot, &mut incoming);
+                    assert_eq!(incoming, 0);
+                    *expected_slot = value;
+                }
+            }
+
+            for (bucket, expected_bucket) in expected.iter().enumerate() {
+                assert!(!buckets.has_empty(bucket));
+                for (slot, &value) in expected_bucket.iter().enumerate() {
+                    assert_eq!(buckets.read_slot(bucket, slot), value);
+                    assert!(buckets.contains(bucket, value));
+                }
+            }
+
+            buckets.clear();
+            for bucket in 0..bucket_count {
+                assert!(buckets.has_empty(bucket));
+                for slot in 0..BUCKET_SIZE {
+                    assert_eq!(buckets.read_slot(bucket, slot), 0);
+                }
+            }
+
+            for (bucket, expected_bucket) in expected.iter().enumerate() {
+                for &value in expected_bucket {
+                    assert!(buckets.insert(bucket, value));
+                }
+                assert!(!buckets.insert(bucket, 1));
+
+                for &value in expected_bucket {
+                    assert!(buckets.remove(bucket, value));
+                }
+                assert!(!buckets.remove(bucket, 1));
+                assert!(buckets.has_empty(bucket));
+            }
+        }
+    }
 
     #[test]
     fn constructor_validates_parameters() {
@@ -409,12 +643,62 @@ mod tests {
         assert!(CuckooFilter::new(100, 1.0).is_err());
         assert!(CuckooFilter::with_parameters(3, 8, 100).is_err());
         assert!(CuckooFilter::with_parameters(8, 0, 100).is_err());
+        assert!(CuckooFilter::with_parameters(8, 5, 100).is_err());
+        assert!(CuckooFilter::with_parameters(8, 6, 100).is_ok());
         assert!(CuckooFilter::with_parameters(8, 8, 0).is_err());
     }
 
     #[test]
+    fn automatic_sizing_uses_reference_load_threshold() {
+        let expected_items = 1_000_000;
+        let filter = CuckooFilter::new(expected_items, 0.01).unwrap();
+
+        assert_eq!(filter.bucket_count(), 262_144);
+        assert_eq!(filter.fingerprint_bits(), 10);
+        assert_eq!(filter.max_kicks, 500);
+        assert_eq!(filter.buckets.storage_len(), 262_144 * 5);
+        assert!(
+            expected_items as f64 / (filter.bucket_count() * BUCKET_SIZE) as f64
+                <= MAX_TARGET_LOAD_FACTOR
+        );
+
+        let capacity = 262_144 * BUCKET_SIZE;
+        let last_item_below_threshold = (capacity as f64 * MAX_TARGET_LOAD_FACTOR).floor() as usize;
+        assert_eq!(
+            bucket_count_for_expected_items(last_item_below_threshold).unwrap(),
+            262_144
+        );
+        assert_eq!(
+            bucket_count_for_expected_items(last_item_below_threshold + 1).unwrap(),
+            524_288
+        );
+    }
+
+    #[test]
+    fn automatic_sizing_is_minimal_across_power_of_two_boundaries() {
+        for expected_items in [
+            1, 8, 9, 100, 1_000, 10_000, 100_000, 1_000_000, 1_006_632, 1_006_633,
+        ] {
+            let buckets = bucket_count_for_expected_items(expected_items).unwrap();
+            let load = expected_items as f64 / (buckets as f64 * BUCKET_SIZE as f64);
+
+            assert!(buckets.is_power_of_two());
+            assert!(buckets >= 2);
+            assert!(load <= MAX_TARGET_LOAD_FACTOR);
+
+            if buckets > 2 {
+                let previous_load =
+                    expected_items as f64 / ((buckets / 2) as f64 * BUCKET_SIZE as f64);
+                assert!(previous_load > MAX_TARGET_LOAD_FACTOR);
+            }
+        }
+    }
+
+    #[test]
     fn constructor_selects_smallest_width_meeting_requested_rate() {
-        for (target_rate, expected_bits) in [(0.03, 9), (0.01, 10), (0.001, 13), (0.00013, 16)] {
+        for (target_rate, expected_bits) in
+            [(0.9, 6), (0.03, 9), (0.01, 10), (0.001, 13), (0.00013, 16)]
+        {
             let filter = CuckooFilter::new(1_000, target_rate).unwrap();
 
             assert_eq!(filter.fingerprint_bits(), expected_bits);
@@ -468,7 +752,7 @@ mod tests {
 
     #[test]
     fn tiny_filter_eventually_refuses_insert() {
-        let mut filter = CuckooFilter::with_parameters(2, 4, 50).unwrap();
+        let mut filter = CuckooFilter::with_parameters(2, 6, 50).unwrap();
         let mut accepted = 0;
         for value in 0_u64..100 {
             if filter.insert(&value) {
@@ -525,7 +809,7 @@ mod tests {
             let fingerprint = filter.fingerprint(&value);
             let (index_a, index_b) = filter.bucket_indexes(&value, fingerprint);
             let needs_relocation =
-                !filter.buckets[index_a].contains(&0) && !filter.buckets[index_b].contains(&0);
+                !filter.buckets.has_empty(index_a) && !filter.buckets.has_empty(index_b);
             let count_before = filter.inserted_items();
 
             if !filter.insert(&value) {
@@ -594,7 +878,7 @@ mod tests {
 
     #[test]
     fn deleting_a_colliding_non_member_can_remove_an_inserted_member() {
-        let mut filter = CuckooFilter::with_parameters(2, 4, 50).unwrap();
+        let mut filter = CuckooFilter::with_parameters(2, 6, 50).unwrap();
         let inserted = 0_u64;
         assert!(filter.insert(&inserted));
 
