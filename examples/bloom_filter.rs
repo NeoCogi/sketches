@@ -31,10 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("contains alice: {}", filter.contains(&"alice"));
     println!("contains david: {}", filter.contains(&"david"));
-    println!(
-        "estimated false-positive rate after inserts: {:.6}",
-        filter.estimated_false_positive_rate()
-    );
+    println!("insert operations: {}", filter.inserted_items());
 
     Ok(())
 }

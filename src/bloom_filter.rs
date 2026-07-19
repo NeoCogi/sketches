@@ -23,6 +23,11 @@
 //! Bloom filter for approximate set membership.
 //!
 //! A Bloom filter can return false positives, but never false negatives.
+//! The target false-positive rate passed to [`BloomFilter::new`] is used only
+//! to size the filter for the expected number of distinct items. The filter
+//! does not report a runtime false-positive rate: that probability also
+//! depends on assumptions about hashing and the distribution of absent
+//! queries, which the bitmap does not retain.
 
 use std::hash::Hash;
 
@@ -50,7 +55,8 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
-    /// Creates a Bloom filter from expected inserts and target false-positive rate.
+    /// Creates a Bloom filter from an expected number of distinct items and a
+    /// target false-positive rate.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid input values.
@@ -85,7 +91,8 @@ impl BloomFilter {
         })
     }
 
-    /// Returns the recommended bit length for a target workload/rate.
+    /// Returns the recommended bit length for an expected number of distinct
+    /// items and a target rate.
     ///
     /// Formula: `m = -n * ln(p) / (ln(2)^2)`.
     ///
@@ -116,7 +123,8 @@ impl BloomFilter {
         Ok(bits.max(1))
     }
 
-    /// Returns the recommended number of hash functions for a bit length/workload.
+    /// Returns the recommended number of hash functions for a bit length and
+    /// expected number of distinct items.
     ///
     /// Formula: `k = (m / n) * ln(2)`.
     ///
@@ -148,7 +156,12 @@ impl BloomFilter {
         self.num_hashes
     }
 
-    /// Returns the number of insert operations applied (saturating counter).
+    /// Returns the number of `insert` operations applied, including duplicate
+    /// items, as a saturating counter.
+    ///
+    /// This is operational telemetry, not a distinct-item count or a measure
+    /// of bitmap load. Merging sums the operation counters from both filters,
+    /// even when their inserted items overlap.
     pub fn inserted_items(&self) -> u64 {
         self.inserted_items
     }
@@ -187,19 +200,6 @@ impl BloomFilter {
             probe = probe.wrapping_add(h2);
         }
         true
-    }
-
-    /// Returns the estimated false-positive rate for the current insert count.
-    ///
-    /// Formula: `(1 - exp(-k * n / m))^k`.
-    pub fn estimated_false_positive_rate(&self) -> f64 {
-        if self.inserted_items == 0 {
-            return 0.0;
-        }
-        let m = self.bit_len as f64;
-        let k = self.num_hashes as f64;
-        let n = self.inserted_items as f64;
-        (1.0 - (-k * n / m).exp()).powf(k)
     }
 
     /// Clears all bits and resets the insert counter.
@@ -335,6 +335,7 @@ mod tests {
         left.merge(&right).unwrap();
         assert!(left.contains(&"left-only"));
         assert!(left.contains(&"right-only"));
+        assert_eq!(left.inserted_items(), 2);
     }
 
     #[test]
@@ -342,19 +343,6 @@ mod tests {
         let mut left = BloomFilter::with_size(256, 3).unwrap();
         let right = BloomFilter::with_size(512, 3).unwrap();
         assert!(left.merge(&right).is_err());
-    }
-
-    #[test]
-    fn estimated_false_positive_rate_increases_with_more_insertions() {
-        let mut filter = BloomFilter::new(1_000, 0.01).unwrap();
-        let start_rate = filter.estimated_false_positive_rate();
-
-        for value in 0_u64..1_000 {
-            filter.insert(&value);
-        }
-        let end_rate = filter.estimated_false_positive_rate();
-
-        assert!(start_rate <= end_rate);
     }
 
     #[test]
