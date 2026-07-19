@@ -34,7 +34,7 @@ sketches = { path = "../sketches" }
 | --- | --- | --- | --- |
 | Bloom Filter | `bloom_filter` | You need very fast membership checks and can tolerate false positives | No deletions |
 | Cuckoo Filter | `cuckoo_filter` | You need membership checks and deletions | Delete only items known to have been inserted; inserts can fail at high load |
-| HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable, tiny memory footprint |
+| HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable; target standard errors below `0.00203125` are unsupported |
 | MinMax Sketch | `minmax_sketch` | You need approximate non-negative frequency counts | Conservative updates reduce overestimation |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
 | Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
@@ -94,6 +94,16 @@ assert_eq!(heavy_hitters.top_k(1)[0].0, "apple");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## HyperLogLog Error Contract
+
+`HyperLogLog::with_error_rate(target)` treats `target` as a nominal relative
+standard error and selects the smallest precision from 4 through 18 for which
+`1.04 / sqrt(2^precision) <= target`. It returns an error when the target is
+below `0.00203125`, the nominal standard error at precision 18, instead of
+silently returning a less accurate sketch. This is a statistical standard
+error, not a deterministic maximum error for every estimate. The achieved
+nominal value is available through `expected_relative_error()`.
+
 ## Quantile Convention
 
 `KllSketch` and `TDigest` use the same empirical inverse-CDF convention. For
@@ -123,11 +133,12 @@ Approximate distinct counting:
 ```rust
 use sketches::hyperloglog::HyperLogLog;
 
-let mut hll = HyperLogLog::new(12)?;
+let mut hll = HyperLogLog::with_error_rate(0.01)?;
 for i in 0_u64..100_000 {
     hll.add(&i);
 }
 println!("distinct ~ {}", hll.count());
+println!("nominal relative standard error = {}", hll.expected_relative_error());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

@@ -25,15 +25,26 @@
 //! The implementation follows the classic HyperLogLog estimator with:
 //! - small-range linear counting correction,
 //! - large-range correction for 64-bit hash space.
+//!
+//! Precision is configurable from 4 through 18. [`HyperLogLog::with_error_rate`]
+//! interprets its argument as a target nominal relative standard error and
+//! rejects targets below the `0.00203125` achievable at precision 18. The
+//! standard error describes the estimator's expected statistical variation;
+//! it is not a deterministic bound on every estimate.
 
 use std::hash::Hash;
 
-use crate::{SketchError, seeded_hash64};
 use crate::jacard::JacardIndex;
+use crate::{SketchError, seeded_hash64};
 
 const MIN_PRECISION: u8 = 4;
 const MAX_PRECISION: u8 = 18;
+const RELATIVE_STANDARD_ERROR_FACTOR: f64 = 1.04;
 const HASH_SEED: u64 = 0xD6E8_FD93_5E7A_4A6D;
+
+fn relative_standard_error(precision: u8) -> f64 {
+    RELATIVE_STANDARD_ERROR_FACTOR / ((1_usize << precision) as f64).sqrt()
+}
 
 /// Approximate distinct counter using HyperLogLog registers.
 ///
@@ -76,23 +87,33 @@ impl HyperLogLog {
         })
     }
 
-    /// Creates a HyperLogLog from a target relative error.
+    /// Creates a HyperLogLog from a target nominal relative standard error.
     ///
-    /// The target must be in `(0, 1)`. Internally this computes:
-    /// `p = ceil(log2((1.04 / error)^2))`, clamped to `[4, 18]`.
+    /// Selects the smallest supported precision whose nominal relative standard
+    /// error, `1.04 / sqrt(2^p)`, is no greater than the target. Supported
+    /// precision is `[4, 18]`, so the smallest accepted target is `0.00203125`.
+    /// A standard error is an expected measure of statistical variation, not a
+    /// deterministic upper bound on every cardinality estimate.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] when `relative_error` is invalid.
-    pub fn with_error_rate(relative_error: f64) -> Result<Self, SketchError> {
-        if !relative_error.is_finite() || relative_error <= 0.0 || relative_error >= 1.0 {
+    /// Returns [`SketchError::InvalidParameter`] when the target is not finite
+    /// and strictly between zero and one, or when precision 18 cannot meet it.
+    pub fn with_error_rate(target_relative_error: f64) -> Result<Self, SketchError> {
+        if !target_relative_error.is_finite()
+            || target_relative_error <= 0.0
+            || target_relative_error >= 1.0
+        {
             return Err(SketchError::InvalidParameter(
-                "relative_error must be finite and strictly between 0 and 1",
+                "target relative error must be finite and strictly between 0 and 1",
             ));
         }
 
-        let required_registers = (1.04 / relative_error).powi(2);
-        let raw_precision = required_registers.log2().ceil() as u8;
-        let precision = raw_precision.clamp(MIN_PRECISION, MAX_PRECISION);
+        let precision = (MIN_PRECISION..=MAX_PRECISION)
+            .find(|&precision| relative_standard_error(precision) <= target_relative_error)
+            .ok_or(SketchError::InvalidParameter(
+                "target relative error is below the minimum supported value of 0.00203125",
+            ))?;
+
         Self::new(precision)
     }
 
@@ -106,9 +127,12 @@ impl HyperLogLog {
         self.registers.len()
     }
 
-    /// Returns the theoretical relative error: `1.04 / sqrt(m)`.
+    /// Returns the nominal relative standard error: `1.04 / sqrt(m)`.
+    ///
+    /// This is the expected statistical variation for the configured register
+    /// count, not a deterministic bound on every estimate.
     pub fn expected_relative_error(&self) -> f64 {
-        1.04 / (self.register_count() as f64).sqrt()
+        relative_standard_error(self.precision)
     }
 
     /// Returns `true` if no item has been observed yet.
@@ -348,6 +372,38 @@ mod tests {
     }
 
     #[test]
+    fn error_rate_constructor_selects_smallest_precision_that_meets_target() {
+        for target in [0.9, 0.05, 0.01, 0.005] {
+            let hll = HyperLogLog::with_error_rate(target).unwrap();
+            assert!(hll.expected_relative_error() <= target);
+
+            if hll.precision() > super::MIN_PRECISION {
+                let smaller = HyperLogLog::new(hll.precision() - 1).unwrap();
+                assert!(smaller.expected_relative_error() > target);
+            }
+        }
+    }
+
+    #[test]
+    fn error_rate_constructor_enforces_supported_boundary() {
+        let minimum_supported = HyperLogLog::new(super::MAX_PRECISION)
+            .unwrap()
+            .expected_relative_error();
+        let immediately_smaller = f64::from_bits(minimum_supported.to_bits() - 1);
+
+        let boundary = HyperLogLog::with_error_rate(minimum_supported).unwrap();
+        assert_eq!(boundary.precision(), super::MAX_PRECISION);
+        assert!(HyperLogLog::with_error_rate(immediately_smaller).is_err());
+        assert!(HyperLogLog::with_error_rate(0.001).is_err());
+        assert!(HyperLogLog::with_error_rate(0.000001).is_err());
+
+        let largest_valid_target = f64::from_bits(1.0_f64.to_bits() - 1);
+        let loosest = HyperLogLog::with_error_rate(largest_valid_target).unwrap();
+        assert_eq!(loosest.precision(), super::MIN_PRECISION);
+        assert!(loosest.expected_relative_error() <= largest_valid_target);
+    }
+
+    #[test]
     fn empty_sketch_estimates_zero() {
         let hll = HyperLogLog::new(12).unwrap();
         assert!(hll.is_empty());
@@ -463,5 +519,4 @@ mod tests {
         let expected = 1.04 / (hll.register_count() as f64).sqrt();
         assert!((hll.expected_relative_error() - expected).abs() < 1e-12);
     }
-
 }

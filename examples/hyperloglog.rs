@@ -23,6 +23,8 @@
 use sketches::hyperloglog::HyperLogLog;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The constructor selects the smallest supported precision whose nominal
+    // relative standard error is no greater than this target.
     let mut hll = HyperLogLog::with_error_rate(0.02)?;
 
     for user_id in 0_u64..100_000 {
@@ -30,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "Estimated unique users: {} (expected relative error {:.4})",
+        "Estimated unique users: {} (nominal relative standard error {:.4})",
         hll.count(),
         hll.expected_relative_error()
     );
