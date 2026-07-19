@@ -66,6 +66,15 @@
 //! more relocation work in exchange for fewer early failures near capacity can
 //! opt into a larger limit through [`CuckooFilter::with_parameters`].
 //!
+//! # Hash derivation
+//!
+//! Each operation hashes the complete item once. The low bits form the
+//! fingerprint and the remaining high bits select the primary bucket, as in
+//! the paper's partial-key construction. The alternate bucket is derived from
+//! the current bucket and a cheap multiplicative mix of the fingerprint. This
+//! lets relocation operate on stored fingerprints without retaining or
+//! rehashing the original items.
+//!
 //! # False-positive-rate sizing
 //!
 //! Equation 6 in the [paper] sizes a fingerprint for two full candidate
@@ -89,9 +98,8 @@ const DEFAULT_MAX_KICKS: usize = 500;
 const MAX_TARGET_LOAD_FACTOR: f64 = 0.96;
 const MIN_FINGERPRINT_BITS: u8 = 6;
 const MAX_FINGERPRINT_BITS: u8 = 16;
-const INDEX_SEED: u64 = 0x243F_6A88_85A3_08D3;
-const FINGERPRINT_SEED: u64 = 0x1319_8A2E_0370_7344;
-const ALT_INDEX_SEED: u64 = 0xA409_3822_299F_31D0;
+const ITEM_HASH_SEED: u64 = 0x243F_6A88_85A3_08D3;
+const FINGERPRINT_MIX_MULTIPLIER: u64 = 0x5BD1_E995;
 
 /// Probability that two independently hashed fingerprints collide after the
 /// reserved zero value is remapped to one.
@@ -434,9 +442,8 @@ impl CuckooFilter {
     /// `O(max_kicks)` reverse pass only when insertion fails. The bounded
     /// worst-case insertion time remains `O(max_kicks)`.
     pub fn insert<T: Hash>(&mut self, item: &T) -> bool {
-        let mut fingerprint = self.fingerprint(item);
+        let (mut fingerprint, index_a, index_b) = self.item_location(item);
         let original_fingerprint = fingerprint;
-        let (index_a, index_b) = self.bucket_indexes(item, fingerprint);
 
         if self.insert_into_bucket(index_a, fingerprint)
             || self.insert_into_bucket(index_b, fingerprint)
@@ -479,8 +486,7 @@ impl CuckooFilter {
 
     /// Returns `true` if the item is possibly in the set.
     pub fn contains<T: Hash>(&self, item: &T) -> bool {
-        let fingerprint = self.fingerprint(item);
-        let (index_a, index_b) = self.bucket_indexes(item, fingerprint);
+        let (fingerprint, index_a, index_b) = self.item_location(item);
         self.bucket_contains(index_a, fingerprint) || self.bucket_contains(index_b, fingerprint)
     }
 
@@ -498,8 +504,7 @@ impl CuckooFilter {
     /// stores fingerprints rather than complete items, `true` does not prove
     /// that the fingerprint belonged uniquely to `item`.
     pub fn delete<T: Hash>(&mut self, item: &T) -> bool {
-        let fingerprint = self.fingerprint(item);
-        let (index_a, index_b) = self.bucket_indexes(item, fingerprint);
+        let (fingerprint, index_a, index_b) = self.item_location(item);
 
         // Exact identity is unavailable here; callers must uphold the
         // known-present precondition documented above.
@@ -540,23 +545,20 @@ impl CuckooFilter {
         }
     }
 
-    fn primary_index<T: Hash>(&self, item: &T) -> usize {
-        (seeded_hash64(item, INDEX_SEED) as usize) & (self.buckets.len() - 1)
-    }
-
-    fn bucket_indexes<T: Hash>(&self, item: &T, fingerprint: u16) -> (usize, usize) {
-        let index_a = self.primary_index(item);
+    fn item_location<T: Hash>(&self, item: &T) -> (u16, usize, usize) {
+        let hash = seeded_hash64(item, ITEM_HASH_SEED);
+        let fingerprint = self.fingerprint_from_hash(hash);
+        let index_a = self.primary_index_from_hash(hash);
         let index_b = self.alternate_index(index_a, fingerprint);
-        (index_a, index_b)
+        (fingerprint, index_a, index_b)
     }
 
     fn alternate_index(&self, index: usize, fingerprint: u16) -> usize {
-        let hashed_fingerprint = seeded_hash64(&fingerprint, ALT_INDEX_SEED) as usize;
-        (index ^ hashed_fingerprint) & (self.buckets.len() - 1)
+        let delta = u64::from(fingerprint).wrapping_mul(FINGERPRINT_MIX_MULTIPLIER) as usize;
+        (index ^ delta) & (self.buckets.len() - 1)
     }
 
-    fn fingerprint<T: Hash>(&self, item: &T) -> u16 {
-        let hash = seeded_hash64(item, FINGERPRINT_SEED);
+    fn fingerprint_from_hash(&self, hash: u64) -> u16 {
         let fingerprint_bits = self.fingerprint_bits();
         let mask = if fingerprint_bits == 16 {
             u64::from(u16::MAX)
@@ -568,6 +570,10 @@ impl CuckooFilter {
         fingerprint.max(1)
     }
 
+    fn primary_index_from_hash(&self, hash: u64) -> usize {
+        ((hash >> self.fingerprint_bits()) as usize) & (self.buckets.len() - 1)
+    }
+
     fn next_u64(&mut self) -> u64 {
         self.rng_state = splitmix64(self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15));
         self.rng_state
@@ -576,6 +582,11 @@ impl CuckooFilter {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::Cell,
+        hash::{Hash, Hasher},
+    };
+
     use super::{
         BUCKET_SIZE, CuckooFilter, MAX_FINGERPRINT_BITS, MAX_TARGET_LOAD_FACTOR,
         MIN_FINGERPRINT_BITS, PackedBuckets, bucket_count_for_expected_items,
@@ -740,6 +751,51 @@ mod tests {
     }
 
     #[test]
+    fn public_operations_hash_each_item_once() {
+        struct CountingItem {
+            value: u64,
+            hash_calls: Cell<usize>,
+        }
+
+        impl Hash for CountingItem {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.hash_calls.set(self.hash_calls.get() + 1);
+                self.value.hash(state);
+            }
+        }
+
+        let item = CountingItem {
+            value: 42,
+            hash_calls: Cell::new(0),
+        };
+        let mut filter = CuckooFilter::new(100, 0.01).unwrap();
+
+        assert!(filter.insert(&item));
+        assert_eq!(item.hash_calls.get(), 1);
+        assert!(filter.contains(&item));
+        assert_eq!(item.hash_calls.get(), 2);
+        assert!(filter.delete(&item));
+        assert_eq!(item.hash_calls.get(), 3);
+    }
+
+    #[test]
+    fn alternate_index_is_an_involution() {
+        for fingerprint_bits in MIN_FINGERPRINT_BITS..=MAX_FINGERPRINT_BITS {
+            let filter = CuckooFilter::with_parameters(1_024, fingerprint_bits, 500).unwrap();
+            let max_fingerprint = ((1_u32 << fingerprint_bits) - 1) as u16;
+
+            for fingerprint in [1, max_fingerprint / 2, max_fingerprint] {
+                for index in 0..filter.bucket_count() {
+                    let alternate = filter.alternate_index(index, fingerprint);
+
+                    assert!(alternate < filter.bucket_count());
+                    assert_eq!(filter.alternate_index(alternate, fingerprint), index);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn load_factor_increases_with_inserts() {
         let mut filter = CuckooFilter::new(1_000, 0.01).unwrap();
         let before = filter.load_factor();
@@ -806,8 +862,7 @@ mod tests {
         let mut observed_relocation = false;
 
         for value in 0_u64..10_000 {
-            let fingerprint = filter.fingerprint(&value);
-            let (index_a, index_b) = filter.bucket_indexes(&value, fingerprint);
+            let (_, index_a, index_b) = filter.item_location(&value);
             let needs_relocation =
                 !filter.buckets.has_empty(index_a) && !filter.buckets.has_empty(index_b);
             let count_before = filter.inserted_items();
