@@ -196,6 +196,27 @@ remain in HLL form and better set-operation estimates are required, use the
 joint maximum-likelihood approach from Ertl's paper rather than interpreting
 these inclusion-exclusion helpers as precise low-overlap estimators.
 
+## MinHash LSH Candidate Model
+
+`MinHashLshIndex` uses classical MinHash banding. If a signature is divided
+into `b` bands of `r` rows and two sets have Jaccard similarity `s`, the ideal
+independent-MinHash model gives the candidate probability:
+
+```text
+1 - (1 - s^r)^b
+```
+
+The index exposes this curve through `candidate_probability` and its inverse
+through `similarity_for_candidate_probability`. For example, 128 components
+split into 32 bands of 4 rows select a pair with similarity `0.5` with modeled
+probability about `0.873`.
+
+Banding is a probabilistic candidate filter. `query_top_k` ranks only items that
+match the query in at least one band; it does not scan every indexed signature
+and therefore does not guarantee the global top `k`. MinHash signatures use the
+classical multiple-hash construction in this crate. One-permutation hashing and
+densification are not implemented.
+
 ## Quantile Convention
 
 `KllSketch` and `TDigest` use the same empirical inverse-CDF convention. For

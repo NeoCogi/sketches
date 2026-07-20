@@ -20,13 +20,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-//! MinHash banding LSH index for approximate nearest-neighbor candidate search.
+//! Classical MinHash banding LSH for approximate candidate search.
 //!
-//! The index splits a MinHash signature into bands and hashes each band into a
-//! table bucket. A query retrieves candidates that collide in at least one band.
-//! This is the standard LSH preprocessing/query shape: every indexed item has
-//! one compact posting in each band table, and a query unions the matching
-//! buckets before optional reranking.
+//! A signature with `m = b * r` components is split into `b` consecutive bands
+//! of `r` rows. Each band is hashed into its own table, and a query retrieves the
+//! union of the buckets matching its bands. Under the ideal independent-MinHash
+//! model, two sets with Jaccard similarity `s` become candidates with
+//! probability `1 - (1 - s^r)^b`. Candidate selection is therefore
+//! probabilistic: a true nearest neighbor can be absent when none of its bands
+//! match the query.
 //!
 //! Each user ID is owned once in an internal record arena. Band tables contain
 //! only machine-word handles, so the algorithm-required `O(items * bands)`
@@ -34,14 +36,18 @@
 //! retains one compact MinHash signature per record for removal and approximate
 //! Jaccard reranking.
 //!
-//! This representation follows the table-and-posting model described by
-//! [Gionis, Indyk, and Motwani][gionis] and the MinHash `(K, L)` formulation
-//! described by [Shrivastava and Li][shrivastava]. It changes ownership, not
-//! collision probabilities or candidate selection.
+//! [`MinHash`] uses the classical multiple-hash construction rather than
+//! one-permutation hashing or densification. Building an `m`-component MinHash
+//! from `d` input elements therefore costs `O(d * m)`; this index receives that
+//! completed signature and hashes its `m` components once per insertion or
+//! query. The table repetition follows [Gionis, Indyk, and Motwani][gionis], and
+//! the MinHash banding analysis is presented in [Mining of Massive
+//! Datasets][mmds].
 //!
 //! [gionis]: https://www.vldb.org/conf/1999/P49.pdf
-//! [shrivastava]: https://arxiv.org/abs/1406.4784
+//! [mmds]: https://infolab.stanford.edu/~ullman/mmds/book.pdf
 
+use std::alloc::Layout;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, hash_map::RandomState};
 use std::hash::{BuildHasher, Hash};
@@ -146,13 +152,16 @@ struct Entry<Id> {
 ///
 /// # Representation and complexity
 ///
-/// For `n` items, `b` bands, and `k` MinHash components, the index stores
-/// `O(nk)` signature words and `O(nb)` machine-word postings. Each `Id` is owned
+/// For `n` items, `b` bands, and `m` MinHash components, the index stores
+/// `O(nm)` signature words and `O(nb)` machine-word postings. Each `Id` is owned
 /// once regardless of `b`. Excluding the cost of hashing a user ID, insertion
-/// and removal take `O(k + b)` expected time; candidate lookup takes
-/// `O(k + postings visited)` expected time before output IDs are cloned.
-/// [`Self::query_top_k`] additionally scores each unique candidate using its
-/// retained MinHash signature.
+/// and removal take `O(m + b)` expected time; candidate lookup takes
+/// `O(m + postings visited)` expected time before output IDs are cloned.
+///
+/// For `c` unique candidates and a requested result count `q`,
+/// [`Self::query_top_k`] spends `O(cm)` time scoring retained signatures,
+/// `O(c log q)` maintaining its bounded heap, and `O(q log q)` ordering the
+/// result. Only the final `min(c, q)` IDs are cloned.
 #[derive(Debug, Clone)]
 pub struct MinHashLshIndex<Id>
 where
@@ -177,10 +186,13 @@ where
 {
     /// Creates an LSH index from signature width and number of bands.
     ///
-    /// `num_hashes` must be divisible by `bands`.
+    /// `num_hashes` must be divisible by `bands`, and `bands` cannot exceed
+    /// `num_hashes`.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid dimensions.
+    /// Returns [`SketchError::InvalidParameter`] for invalid dimensions,
+    /// unrepresentable signature storage, or index configuration storage that
+    /// cannot be reserved.
     pub fn new(num_hashes: usize, bands: usize) -> Result<Self, SketchError> {
         if num_hashes == 0 {
             return Err(SketchError::InvalidParameter(
@@ -192,22 +204,42 @@ where
                 "bands must be greater than zero",
             ));
         }
-        if num_hashes % bands != 0 {
+        if bands > num_hashes {
+            return Err(SketchError::InvalidParameter(
+                "bands must not exceed num_hashes",
+            ));
+        }
+        if !num_hashes.is_multiple_of(bands) {
             return Err(SketchError::InvalidParameter(
                 "num_hashes must be divisible by bands",
             ));
         }
 
-        let rows_per_band = num_hashes / bands;
-        if rows_per_band == 0 {
-            return Err(SketchError::InvalidParameter(
-                "rows_per_band must be greater than zero",
-            ));
-        }
+        // The index does not allocate an `m`-word query signature itself, but
+        // accepting a width for which such a `[u64; m]` layout is impossible
+        // would create an index that no compatible MinHash could represent.
+        Layout::array::<u64>(num_hashes)
+            .map_err(|_| SketchError::InvalidParameter("num_hashes is too large to represent"))?;
 
-        let band_seeds = (0..bands)
-            .map(|band| splitmix64((band as u64).wrapping_add(0xA076_1D64_78BD_642F)))
-            .collect();
+        let rows_per_band = num_hashes / bands;
+
+        // Reserve both configuration vectors explicitly so capacity overflow
+        // and allocator failure become constructor errors rather than panics.
+        // `resize_with` calls `HashMap::new` once per band; empty maps do not
+        // allocate bucket arrays until their first posting is inserted.
+        let mut tables = Vec::new();
+        tables
+            .try_reserve_exact(bands)
+            .map_err(|_| SketchError::InvalidParameter("bands are too large to allocate"))?;
+        tables.resize_with(bands, HashMap::new);
+
+        let mut band_seeds = Vec::new();
+        band_seeds
+            .try_reserve_exact(bands)
+            .map_err(|_| SketchError::InvalidParameter("bands are too large to allocate"))?;
+        band_seeds.extend(
+            (0..bands).map(|band| splitmix64((band as u64).wrapping_add(0xA076_1D64_78BD_642F))),
+        );
 
         Ok(Self {
             num_hashes,
@@ -215,7 +247,7 @@ where
             rows_per_band,
             band_seeds,
             hash_family_seed: None,
-            tables: vec![HashMap::new(); bands],
+            tables,
             entries: Vec::new(),
             free_entries: Vec::new(),
             id_hash_builder: RandomState::new(),
@@ -237,6 +269,66 @@ where
     /// Returns the number of rows per band.
     pub fn rows_per_band(&self) -> usize {
         self.rows_per_band
+    }
+
+    /// Returns the modeled probability that two sets become LSH candidates at
+    /// a specified Jaccard similarity.
+    ///
+    /// With `b` bands and `r` rows per band, the ideal independent-MinHash
+    /// model gives `s^r` as the probability of matching one complete band at
+    /// similarity `s`. The probability of matching at least one band is then
+    /// `1 - (1 - s^r)^b`.
+    ///
+    /// This is a model of the candidate-selection curve, not a per-query
+    /// guarantee. The crate uses deterministically derived practical hash
+    /// functions rather than ideal random permutations, and the final 64-bit
+    /// band hash has a negligible additional false-positive collision chance.
+    ///
+    /// # Errors
+    /// Returns [`SketchError::InvalidParameter`] unless `similarity` is finite
+    /// and in the inclusive range `[0, 1]`.
+    pub fn candidate_probability(&self, similarity: f64) -> Result<f64, SketchError> {
+        if !similarity.is_finite() || !(0.0..=1.0).contains(&similarity) {
+            return Err(SketchError::InvalidParameter(
+                "similarity must be finite and between zero and one",
+            ));
+        }
+
+        let one_band_match = similarity.powf(self.rows_per_band as f64);
+
+        // Directly evaluating `1 - (1 - one_band_match).powf(b)` loses
+        // precision when the result is close to zero. `ln_1p` accurately forms
+        // log(1 - x), and `-exp_m1` accurately forms 1 - exp(x).
+        let no_band_match_log = self.bands as f64 * (-one_band_match).ln_1p();
+        Ok(-no_band_match_log.exp_m1())
+    }
+
+    /// Returns the modeled Jaccard similarity at which the requested candidate
+    /// probability is reached.
+    ///
+    /// This is the inverse of [`Self::candidate_probability`]. In particular,
+    /// passing `0.5` returns the exact midpoint of the configured S-curve; the
+    /// commonly quoted `(1 / bands)^(1 / rows_per_band)` threshold is only a
+    /// rough approximation to that point.
+    ///
+    /// # Errors
+    /// Returns [`SketchError::InvalidParameter`] unless `probability` is finite
+    /// and in the inclusive range `[0, 1]`.
+    pub fn similarity_for_candidate_probability(
+        &self,
+        probability: f64,
+    ) -> Result<f64, SketchError> {
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            return Err(SketchError::InvalidParameter(
+                "probability must be finite and between zero and one",
+            ));
+        }
+
+        // Invert p = 1 - (1 - s^r)^b. As above, the log/expm1 form preserves
+        // small probabilities that direct subtraction would round away.
+        let all_band_miss_log = (-probability).ln_1p();
+        let one_band_match = -(all_band_miss_log / self.bands as f64).exp_m1();
+        Ok(one_band_match.powf(1.0 / self.rows_per_band as f64))
     }
 
     /// Returns the number of indexed items.
@@ -320,6 +412,11 @@ where
     /// is cloned only once for each unique value returned by this owned-result
     /// API, regardless of how many bands selected it.
     ///
+    /// Candidate selection is probabilistic: an item with no matching band is
+    /// absent even if it would have a high MinHash similarity estimate. Use
+    /// [`Self::candidate_probability`] to inspect the configured ideal-model
+    /// selection curve.
+    ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when the query dimensions
     /// or hash family mismatch this index.
@@ -338,6 +435,10 @@ where
     /// handles are deduplicated before signatures are scored. A bounded min-heap
     /// retains only the best `k` handles, so IDs are cloned only for returned
     /// results.
+    ///
+    /// This method returns the best retained estimates among LSH candidates; it
+    /// is not a global top-`k` scan. An indexed item that shares no band with the
+    /// query is not scored and cannot appear in the result.
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when the query dimensions
@@ -614,7 +715,10 @@ mod tests {
     fn constructor_validates_parameters() {
         assert!(MinHashLshIndex::<u64>::new(0, 8).is_err());
         assert!(MinHashLshIndex::<u64>::new(64, 0).is_err());
+        assert!(MinHashLshIndex::<u64>::new(8, 16).is_err());
         assert!(MinHashLshIndex::<u64>::new(63, 8).is_err());
+        assert!(MinHashLshIndex::<u64>::new(usize::MAX, 1).is_err());
+        assert!(MinHashLshIndex::<u64>::new(usize::MAX, usize::MAX).is_err());
         assert!(MinHashLshIndex::<u64>::new(64, 8).is_ok());
     }
 
@@ -624,6 +728,48 @@ mod tests {
         assert_eq!(index.num_hashes(), 96);
         assert_eq!(index.bands(), 12);
         assert_eq!(index.rows_per_band(), 8);
+    }
+
+    #[test]
+    fn candidate_probability_matches_the_classical_banding_formula() {
+        let index = MinHashLshIndex::<u64>::new(128, 32).unwrap();
+        let similarity = 0.5_f64;
+        let expected = 1.0 - (1.0 - similarity.powi(4)).powi(32);
+        let actual = index.candidate_probability(similarity).unwrap();
+
+        assert!((actual - expected).abs() < 1e-15);
+        assert_eq!(index.candidate_probability(0.0).unwrap(), 0.0);
+        assert_eq!(index.candidate_probability(1.0).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn candidate_probability_inverse_roundtrips_probabilities() {
+        let index = MinHashLshIndex::<u64>::new(128, 32).unwrap();
+
+        // Round-trip probabilities rather than high similarities: near the top
+        // of this steep S-curve, many distinguishable similarities necessarily
+        // round to the same `f64` probability close to one.
+        for probability in [0.0_f64, 0.001, 0.1, 0.5, 0.9, 0.99, 1.0] {
+            let similarity = index
+                .similarity_for_candidate_probability(probability)
+                .unwrap();
+            let recovered = index.candidate_probability(similarity).unwrap();
+
+            assert!(
+                (recovered - probability).abs() < 1e-12,
+                "similarity={similarity} probability={probability} recovered={recovered}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_probability_helpers_validate_inputs() {
+        let index = MinHashLshIndex::<u64>::new(128, 32).unwrap();
+
+        for invalid in [-f64::EPSILON, 1.0 + f64::EPSILON, f64::NAN, f64::INFINITY] {
+            assert!(index.candidate_probability(invalid).is_err());
+            assert!(index.similarity_for_candidate_probability(invalid).is_err());
+        }
     }
 
     #[test]
