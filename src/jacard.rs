@@ -21,6 +21,18 @@
 // SOFTWARE.
 //
 //! Jaccard similarity trait shared by sketch implementations.
+//!
+//! # HyperLogLog caveat
+//!
+//! [`crate::hyperloglog::HyperLogLog`] implements this trait using cardinality
+//! estimates and the inclusion-exclusion identity. That is useful when only HLL
+//! state is available, but it has a materially weaker accuracy profile than
+//! MinHash similarity: inclusion-exclusion can be quite inaccurate when the true
+//! Jaccard index is small. Clamping the result to `[0, 1]` does not correct this
+//! statistical error. See the extensive warning on
+//! [`crate::hyperloglog::HyperLogLog::jaccard_index`] and [Ertl 2017].
+//!
+//! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 
 use crate::SketchError;
 
@@ -29,6 +41,11 @@ use crate::SketchError;
 /// The returned value is expected to be in `[0, 1]`:
 /// - `0.0` means disjoint sets,
 /// - `1.0` means identical sets.
+///
+/// These values describe the exact Jaccard scale, not a guarantee that every
+/// approximate implementation can reliably prove disjointness or identity.
+/// In particular, consult the implementation-specific limitations before using
+/// approximate zero or near-zero results as classification thresholds.
 ///
 /// # Example
 /// ```rust

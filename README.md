@@ -52,7 +52,8 @@ If your primary goal is:
 - Distinct counting: use `HyperLogLog`.
 - Jaccard similarity: use `MinHash` first.
 - Candidate retrieval for similarity search: use `MinHashLshIndex`, then rerank with MinHash Jaccard.
-- Jaccard from existing cardinality pipelines: use `HyperLogLog` + `jacard` helpers.
+- Jaccard from existing cardinality pipelines: `HyperLogLog` + `jacard` helpers
+  are available, but read the low-overlap limitations below before using them.
 - Membership without delete: use `BloomFilter`.
 - Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
 - Approximate frequency (non-negative): use `MinMaxSketch`.
@@ -121,6 +122,47 @@ below `0.00203125`, the nominal standard error at precision 18, instead of
 silently returning a less accurate sketch. This is a statistical standard
 error, not a deterministic maximum error for every estimate. The achieved
 nominal value is available through `expected_relative_error()`.
+
+Cardinality is calculated using the maximum-likelihood estimator presented as
+the second single-sketch estimator in [Ertl's paper](https://arxiv.org/pdf/1702.01284).
+In the paper this is **Algorithm 8**. Its literal Algorithm 2 is the
+register-wise merge operation, not a cardinality estimator. The implementation
+builds the register multiplicity vector and follows Algorithm 8's lower-bound
+initialization and stable secant iteration; it does not combine that estimator
+with the original HyperLogLog `2.5m` transition or large-range correction.
+
+## HyperLogLog Intersection and Jaccard Limitations
+
+**HyperLogLog only supports union natively.** Merging takes the register-wise
+maximum, producing a valid sketch for `A ∪ B`. This crate keeps
+`intersection_estimate()` and `jaccard_index()` for workflows where only HLL
+state is available, but those helpers use conventional inclusion-exclusion:
+
+```text
+|A ∩ B| ≈ estimate(A) + estimate(B) - estimate(A ∪ B)
+```
+
+This subtraction can amplify cardinality-estimation noise dramatically. As
+[Ertl explains](https://arxiv.org/pdf/1702.01284), inclusion-exclusion can be
+quite inaccurate, especially for small Jaccard indices. When the intersection
+is small relative to the input sets, the error in the three much larger
+cardinality estimates can equal or exceed the intersection itself.
+
+The implementation clamps an intersection to `[0, min(|A|, |B|)]` and Jaccard
+to `[0, 1]`, but clamping only prevents mathematically impossible outputs. It
+does **not** correct the statistical error. In particular:
+
+- a returned intersection or Jaccard of zero does not prove disjointness;
+- a positive estimate does not prove that the exact intersection is nonzero;
+- `expected_relative_error()` applies to single-sketch cardinality, not to the
+  derived intersection or Jaccard estimate;
+- accuracy degrades as the true intersection/Jaccard becomes small relative to
+  the input sets.
+
+Use `MinHash` when Jaccard similarity is the primary workload. If data must
+remain in HLL form and better set-operation estimates are required, use the
+joint maximum-likelihood approach from Ertl's paper rather than interpreting
+these inclusion-exclusion helpers as precise low-overlap estimators.
 
 ## Quantile Convention
 

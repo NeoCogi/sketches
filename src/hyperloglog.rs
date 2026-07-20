@@ -22,15 +22,41 @@
 //
 //! HyperLogLog cardinality estimator.
 //!
-//! The implementation follows the classic HyperLogLog estimator with:
-//! - small-range linear counting correction,
-//! - large-range correction for 64-bit hash space.
+//! Cardinality is calculated with the maximum-likelihood estimator described as
+//! the second single-sketch estimator in [Ertl 2017]. In the paper this is
+//! **Algorithm 8**; its literal Algorithm 2 is the register-wise merge operation.
+//! The maximum-likelihood estimator works directly from the register-value
+//! multiplicities and avoids the original estimator's empirically chosen
+//! small-/large-range transitions.
 //!
 //! Precision is configurable from 4 through 18. [`HyperLogLog::with_error_rate`]
 //! interprets its argument as a target nominal relative standard error and
 //! rejects targets below the `0.00203125` achievable at precision 18. The
 //! standard error describes the estimator's expected statistical variation;
 //! it is not a deterministic bound on every estimate.
+//!
+//! # Intersection and Jaccard limitations
+//!
+//! HyperLogLog natively represents unions through register-wise maxima. This
+//! module's [`HyperLogLog::intersection_estimate`] and
+//! [`HyperLogLog::jaccard_index`] instead use the conventional
+//! inclusion-exclusion estimate `|A| + |B| - |A ∪ B|`. As explained by
+//! [Ertl 2017], that approach can be quite inaccurate, especially when the true
+//! Jaccard index is small. Subtracting three noisy cardinality estimates can
+//! leave an error comparable to the sizes of the input sets rather than the
+//! much smaller intersection.
+//!
+//! Clamping the result into its mathematical range only prevents impossible
+//! negative or oversized outputs. It does not recover the lost information,
+//! make a zero result proof of disjointness, or make a positive result proof of
+//! overlap. [`HyperLogLog::expected_relative_error`] describes single-sketch
+//! cardinality error only; it is not an error guarantee for intersections or
+//! Jaccard values. Prefer [`crate::minhash::MinHash`] when similarity is the
+//! primary workload. Ertl's joint maximum-likelihood method is the appropriate
+//! HLL-specific alternative when substantially better set-operation estimates
+//! are required.
+//!
+//! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 
 use std::hash::Hash;
 
@@ -41,6 +67,9 @@ const MIN_PRECISION: u8 = 4;
 const MAX_PRECISION: u8 = 18;
 const RELATIVE_STANDARD_ERROR_FACTOR: f64 = 1.04;
 const HASH_SEED: u64 = 0xD6E8_FD93_5E7A_4A6D;
+const HASH_BITS: usize = u64::BITS as usize;
+const MAX_REGISTER_COUNTS: usize = HASH_BITS + 2;
+const MAX_LIKELIHOOD_EPSILON: f64 = 1e-2;
 
 fn relative_standard_error(precision: u8) -> f64 {
     RELATIVE_STANDARD_ERROR_FACTOR / ((1_usize << precision) as f64).sqrt()
@@ -152,41 +181,21 @@ impl HyperLogLog {
     }
 
     /// Returns the estimated cardinality as `f64`.
+    ///
+    /// This uses the maximum-likelihood cardinality estimator presented as
+    /// Algorithm 8 in [Ertl 2017], which is the paper's second single-sketch
+    /// estimator. (The paper's literal Algorithm 2 describes sketch merging,
+    /// not cardinality estimation.)
+    ///
+    /// [Ertl 2017]: https://arxiv.org/pdf/1702.01284
     pub fn estimate(&self) -> f64 {
-        if self.is_empty() {
-            return 0.0;
+        let mut counts = [0_usize; MAX_REGISTER_COUNTS];
+        for &register in &self.registers {
+            counts[register as usize] += 1;
         }
 
-        let m = self.register_count() as f64;
-        let alpha = Self::alpha(self.register_count());
-        let harmonic_sum = self
-            .registers
-            .iter()
-            .map(|&register| 2_f64.powi(-(register as i32)))
-            .sum::<f64>();
-
-        let raw_estimate = alpha * m * m / harmonic_sum;
-        let zero_registers = self
-            .registers
-            .iter()
-            .filter(|&&register| register == 0)
-            .count() as f64;
-
-        // Small-range correction (linear counting).
-        let corrected_small = if raw_estimate <= 2.5 * m && zero_registers > 0.0 {
-            m * (m / zero_registers).ln()
-        } else {
-            raw_estimate
-        };
-
-        // Large-range correction in 64-bit hash space.
-        let two_to_64 = (u64::MAX as f64) + 1.0;
-        if corrected_small > two_to_64 / 30.0 {
-            let ratio = (corrected_small / two_to_64).min(1.0 - f64::EPSILON);
-            -two_to_64 * (1.0 - ratio).ln()
-        } else {
-            corrected_small
-        }
+        let suffix_bits = HASH_BITS - self.precision as usize;
+        Self::maximum_likelihood_estimate(&counts[..=suffix_bits + 1], self.register_count())
     }
 
     /// Returns the estimated cardinality rounded to `u64`.
@@ -200,6 +209,13 @@ impl HyperLogLog {
     }
 
     /// Merges another HyperLogLog into this sketch.
+    ///
+    /// Register-wise maximum is the native HLL union operation and corresponds
+    /// to Algorithm 2 in [Ertl 2017]. Cardinality of the merged state is then
+    /// calculated by the Algorithm 8 maximum-likelihood estimator used by
+    /// [`Self::estimate`].
+    ///
+    /// [Ertl 2017]: https://arxiv.org/pdf/1702.01284
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when precision differs.
@@ -254,6 +270,21 @@ impl HyperLogLog {
     /// The output is clamped to `[0, min(|A|, |B|)]` because estimator noise
     /// can occasionally push inclusion-exclusion slightly outside that range.
     ///
+    /// # Statistical limitations
+    ///
+    /// This is the conventional inclusion-exclusion approach, not Ertl's joint
+    /// maximum-likelihood estimator. [Ertl 2017] shows that inclusion-exclusion
+    /// becomes inaccurate in particular for small Jaccard indices: the desired
+    /// intersection is obtained by subtracting cardinality estimates whose
+    /// individual errors scale with the much larger input sets.
+    ///
+    /// Clamping does not correct that statistical error. A returned zero does
+    /// not prove disjointness, and a positive value does not prove overlap. The
+    /// nominal error from [`Self::expected_relative_error`] applies to an HLL
+    /// cardinality estimate, not to this derived intersection estimate.
+    ///
+    /// [Ertl 2017]: https://arxiv.org/pdf/1702.01284
+    ///
     /// # Example
     /// ```rust
     /// use sketches::hyperloglog::HyperLogLog;
@@ -292,6 +323,23 @@ impl HyperLogLog {
     ///
     /// For two empty sets, this method returns `1.0` by convention.
     ///
+    /// # Statistical limitations
+    ///
+    /// This method derives the intersection using inclusion-exclusion. It does
+    /// not implement the joint maximum-likelihood estimator from [Ertl 2017].
+    /// The paper explains that conventional inclusion-exclusion can be quite
+    /// inaccurate, especially for small Jaccard indices. In that regime the
+    /// result can be dominated by cardinality-estimation noise and clamping.
+    /// Consequently, `0.0` is not proof that the sets are disjoint, a positive
+    /// result is not proof of overlap, and
+    /// [`Self::expected_relative_error`] is not a Jaccard error bound.
+    ///
+    /// Prefer [`crate::minhash::MinHash`] for similarity-centric workloads. If
+    /// the inputs must remain HLL sketches, Ertl's joint maximum-likelihood
+    /// estimator is the substantially more accurate alternative.
+    ///
+    /// [Ertl 2017]: https://arxiv.org/pdf/1702.01284
+    ///
     /// # Example
     /// ```rust
     /// use sketches::hyperloglog::HyperLogLog;
@@ -322,7 +370,9 @@ impl HyperLogLog {
             return Ok(1.0);
         }
 
-        let intersection = self.intersection_estimate(other)?;
+        let a = self.estimate();
+        let b = other.estimate();
+        let intersection = (a + b - union).max(0.0).min(a.min(b));
         Ok((intersection / union).clamp(0.0, 1.0))
     }
 
@@ -334,13 +384,95 @@ impl HyperLogLog {
         rank.min(max_rank) as u8
     }
 
-    /// Returns the bias-correction constant for register count `m`.
-    fn alpha(m: usize) -> f64 {
-        match m {
-            16 => 0.673,
-            32 => 0.697,
-            64 => 0.709,
-            _ => 0.7213 / (1.0 + 1.079 / m as f64),
+    /// Implements the maximum-likelihood cardinality estimator from Algorithm 8
+    /// of Ertl's "New cardinality estimation algorithms for HyperLogLog sketches".
+    /// `counts` is the multiplicity vector `C[0..=q+1]` from the paper.
+    fn maximum_likelihood_estimate(counts: &[usize], register_count: usize) -> f64 {
+        debug_assert_eq!(counts.iter().sum::<usize>(), register_count);
+        let q = counts.len() - 2;
+        if counts[q + 1] == register_count {
+            return f64::INFINITY;
+        }
+
+        let k_min = counts.iter().position(|&count| count != 0).unwrap();
+        let k_min_prime = k_min.max(1);
+        let k_max = counts.iter().rposition(|&count| count != 0).unwrap();
+        let k_max_prime = k_max.min(q);
+
+        let mut z = 0.0;
+        if k_min_prime <= k_max_prime {
+            for &count in counts[k_min_prime..=k_max_prime].iter().rev() {
+                z = 0.5 * z + count as f64;
+            }
+        }
+        z *= 2_f64.powi(-(k_min_prime as i32));
+
+        let mut c_prime = counts[q + 1];
+        if q >= 1 {
+            c_prime += counts[k_max_prime];
+        }
+
+        let a = z + counts[0] as f64;
+        let b = z + (counts[q + 1] as f64) * 2_f64.powi(-(q as i32));
+        let nonzero_registers = (register_count - counts[0]) as f64;
+
+        let mut x = if b <= 1.5 * a {
+            nonzero_registers / (0.5 * b + a)
+        } else {
+            (nonzero_registers / b) * (b / a).ln_1p()
+        };
+
+        let relative_error_limit = MAX_LIKELIHOOD_EPSILON / (register_count as f64).sqrt();
+        let mut delta_x = x;
+        let mut g_previous = 0.0;
+
+        while delta_x > x * relative_error_limit {
+            let kappa_minus_one = Self::frexp_exponent(x);
+            let scale_exponent = (k_max_prime as i32 + 1).max(kappa_minus_one + 2);
+            let mut x_prime = x * 2_f64.powi(-scale_exponent);
+            let x_prime_squared = x_prime * x_prime;
+            let mut h = x_prime - x_prime_squared / 3.0
+                + (x_prime_squared * x_prime_squared) * (1.0 / 45.0 - x_prime_squared / 472.5);
+
+            for _ in (k_max_prime as i32)..=kappa_minus_one {
+                let one_minus_h = 1.0 - h;
+                h = (x_prime + h * one_minus_h) / (x_prime + one_minus_h);
+                x_prime *= 2.0;
+            }
+
+            let mut g = c_prime as f64 * h;
+            for k in (k_min_prime..k_max_prime).rev() {
+                let one_minus_h = 1.0 - h;
+                h = (x_prime + h * one_minus_h) / (x_prime + one_minus_h);
+                x_prime *= 2.0;
+                g += counts[k] as f64 * h;
+            }
+            g += x * a;
+
+            if g > g_previous && g <= nonzero_registers {
+                delta_x *= (nonzero_registers - g) / (g - g_previous);
+            } else {
+                delta_x = 0.0;
+            }
+            x += delta_x;
+            g_previous = g;
+        }
+
+        x * register_count as f64
+    }
+
+    /// Returns the exponent produced by `frexp(x)` for positive finite `x`.
+    fn frexp_exponent(x: f64) -> i32 {
+        debug_assert!(x.is_finite() && x > 0.0);
+
+        let bits = x.to_bits();
+        let biased_exponent = ((bits >> 52) & 0x7ff) as i32;
+        if biased_exponent != 0 {
+            biased_exponent - 1022
+        } else {
+            let mantissa = bits & ((1_u64 << 52) - 1);
+            let highest_bit = 63 - mantissa.leading_zeros() as i32;
+            highest_bit - 1073
         }
     }
 }
@@ -354,6 +486,14 @@ impl JacardIndex for HyperLogLog {
 #[cfg(test)]
 mod tests {
     use super::HyperLogLog;
+
+    fn assert_relative_eq(actual: f64, expected: f64, tolerance: f64) {
+        let scale = expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance * scale,
+            "actual={actual:.17} expected={expected:.17} tolerance={tolerance}"
+        );
+    }
 
     #[test]
     fn precision_range_is_enforced() {
@@ -408,6 +548,86 @@ mod tests {
         let hll = HyperLogLog::new(12).unwrap();
         assert!(hll.is_empty());
         assert_eq!(hll.count(), 0);
+    }
+
+    #[test]
+    fn maximum_likelihood_estimator_matches_ertl_reference_results() {
+        // These multiplicity vectors use p=8, q=56. Expected values were
+        // generated by the MaxLikelihoodEstimator in the reference code
+        // accompanying Ertl 2017, Algorithm 8.
+        let mut mixed = [0_usize; 58];
+        mixed[0] = 80;
+        mixed[1] = 70;
+        mixed[2] = 50;
+        mixed[3] = 30;
+        mixed[4] = 20;
+        mixed[5] = 6;
+        assert_relative_eq(
+            HyperLogLog::maximum_likelihood_estimate(&mixed, 256),
+            286.866_625_986_763_15,
+            1e-13,
+        );
+
+        let mut no_zero = [0_usize; 58];
+        no_zero[1] = 5;
+        no_zero[2] = 40;
+        no_zero[3] = 70;
+        no_zero[4] = 80;
+        no_zero[5] = 50;
+        no_zero[8] = 11;
+        assert_relative_eq(
+            HyperLogLog::maximum_likelihood_estimate(&no_zero, 256),
+            1_675.894_405_487_860_2,
+            1e-13,
+        );
+
+        let mut high_and_saturated = [0_usize; 58];
+        high_and_saturated[40] = 5;
+        high_and_saturated[45] = 40;
+        high_and_saturated[50] = 70;
+        high_and_saturated[55] = 80;
+        high_and_saturated[56] = 50;
+        high_and_saturated[57] = 11;
+        assert_relative_eq(
+            HyperLogLog::maximum_likelihood_estimate(&high_and_saturated, 256),
+            10_290_268_119_670_374.0,
+            1e-13,
+        );
+    }
+
+    #[test]
+    fn maximum_likelihood_estimator_handles_boundary_states() {
+        let mut empty = [0_usize; 58];
+        empty[0] = 256;
+        assert_eq!(HyperLogLog::maximum_likelihood_estimate(&empty, 256), 0.0);
+
+        let mut saturated = [0_usize; 58];
+        saturated[57] = 256;
+        assert!(HyperLogLog::maximum_likelihood_estimate(&saturated, 256).is_infinite());
+    }
+
+    #[test]
+    fn maximum_likelihood_estimator_avoids_the_old_transition_bias_spike() {
+        let precision = 12;
+        let register_count = 1_u64 << precision;
+        let exact = register_count * 5 / 2;
+        let trials = 64_u64;
+        let mut relative_error_sum = 0.0;
+
+        for trial in 0..trials {
+            let base = (trial << 32) ^ (u64::from(precision) << 56) ^ (5 << 24) ^ 2;
+            let mut hll = HyperLogLog::new(precision).unwrap();
+            for value in 0..exact {
+                hll.add(&crate::splitmix64(base + value));
+            }
+            relative_error_sum += hll.estimate() / exact as f64 - 1.0;
+        }
+
+        let mean_relative_bias = relative_error_sum / trials as f64;
+        assert!(
+            mean_relative_bias.abs() < 0.01,
+            "mean_relative_bias={mean_relative_bias}"
+        );
     }
 
     #[test]
