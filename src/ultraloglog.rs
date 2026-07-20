@@ -55,7 +55,6 @@
 //! [Hash4j]: https://github.com/dynatrace-oss/hash4j
 
 use std::hash::Hash;
-use std::sync::OnceLock;
 
 use crate::jacard::{InclusionExclusionEstimates, JacardIndex, inclusion_exclusion_estimates};
 use crate::{SketchError, seeded_hash64};
@@ -80,6 +79,39 @@ const FGRA_ETA: [f64; 4] = [
 ];
 /// Number of nonsaturated, nonsmall encoded values needing table entries.
 const FGRA_REGISTER_CONTRIBUTION_COUNT: usize = 236;
+/// `2^-FGRA_TAU`, rounded to the nearest `f64`.
+///
+/// Stable Rust does not permit `f64::powf` during constant evaluation. Keeping
+/// its result as a constant lets the contribution table below be constructed
+/// entirely at compile time without lazy process-wide state.
+const FGRA_POW_2_MINUS_TAU: f64 = 0.566_641_771_331_672_8;
+
+/// Builds the ordinary-register FGRA contribution table at compile time.
+///
+/// Four consecutive register states share an exponent and differ only by
+/// their `FGRA_ETA` weight. The first group has exponent three; multiplying by
+/// `2^-tau` after every group advances to the next exponent. This recurrence
+/// replaces non-const `powf` calls while preserving constant-time lookup in
+/// the estimator and requiring no runtime cache or synchronization.
+const fn make_fgra_register_contributions() -> [f64; FGRA_REGISTER_CONTRIBUTION_COUNT] {
+    let mut contributions = [0.0; FGRA_REGISTER_CONTRIBUTION_COUNT];
+    let mut scale = FGRA_POW_2_MINUS_TAU * FGRA_POW_2_MINUS_TAU * FGRA_POW_2_MINUS_TAU;
+    let mut register = 0;
+
+    while register < contributions.len() {
+        contributions[register] = FGRA_ETA[register & 3] * scale;
+        register += 1;
+        if register & 3 == 0 {
+            scale *= FGRA_POW_2_MINUS_TAU;
+        }
+    }
+
+    contributions
+}
+
+/// Compile-time FGRA weights for ordinary encoded register values.
+const FGRA_REGISTER_CONTRIBUTIONS: [f64; FGRA_REGISTER_CONTRIBUTION_COUNT] =
+    make_fgra_register_contributions();
 
 /// Inverse square root of the per-register Fisher information for ULL.
 const MLE_RELATIVE_ERROR_FACTOR: f64 = 0.760_862_100_272_518_2;
@@ -563,23 +595,6 @@ impl UltraLogLog {
         (0_u8.wrapping_sub((leading_zeros_plus_one as u8).wrapping_mul(4))) | recent_bits as u8
     }
 
-    /// Returns the lazily initialized contribution table for ordinary FGRA
-    /// register values.
-    fn fgra_register_contributions() -> &'static [f64; FGRA_REGISTER_CONTRIBUTION_COUNT] {
-        static CONTRIBUTIONS: OnceLock<[f64; FGRA_REGISTER_CONTRIBUTION_COUNT]> = OnceLock::new();
-        CONTRIBUTIONS.get_or_init(|| {
-            // This closure evaluates the closed-form contribution once per
-            // process, keeping every later estimate free of per-register
-            // exponentiation.
-            let mut contributions = [0.0; FGRA_REGISTER_CONTRIBUTION_COUNT];
-            for (register, contribution) in contributions.iter_mut().enumerate() {
-                let exponent = ((register + 12) >> 2) as f64;
-                *contribution = FGRA_ETA[register & 3] * 2_f64.powf(-FGRA_TAU * exponent);
-            }
-            contributions
-        })
-    }
-
     /// Implements the paper's optimal further-generalized remaining-area
     /// cardinality estimator.
     fn estimate_fgra(&self) -> f64 {
@@ -589,7 +604,6 @@ impl UltraLogLog {
         let mut small_counts = [0_u64; 4];
         let mut saturated_counts = [0_u64; 4];
         let mut sum = 0.0;
-        let contributions = Self::fgra_register_contributions();
 
         // Classify the 256 possible bytes once. Ordinary registers use a table;
         // boundary registers are deferred to the analytical range corrections.
@@ -608,7 +622,7 @@ impl UltraLogLog {
                     _ => {}
                 }
             } else if register < 252 {
-                sum += count as f64 * contributions[shifted as usize];
+                sum += count as f64 * FGRA_REGISTER_CONTRIBUTIONS[shifted as usize];
             } else {
                 saturated_counts[(register - 252) as usize] += count;
             }
@@ -1008,7 +1022,9 @@ impl JacardIndex for UltraLogLog {
 
 #[cfg(test)]
 mod tests {
-    use super::{UltraLogLog, UltraLogLogEstimator};
+    use super::{
+        FGRA_ETA, FGRA_REGISTER_CONTRIBUTIONS, FGRA_TAU, UltraLogLog, UltraLogLogEstimator,
+    };
 
     /// Asserts a scale-aware floating-point tolerance and reports full values
     /// on failure.
@@ -1308,6 +1324,22 @@ mod tests {
             0.011_888_470_316_758_097,
             1e-15,
         );
+    }
+
+    // Checks every compile-time recurrence result against the direct FGRA
+    // formula. The tolerance covers only floating-point operation ordering.
+    #[test]
+    fn compile_time_fgra_contributions_match_direct_formula() {
+        for (register, &actual) in FGRA_REGISTER_CONTRIBUTIONS.iter().enumerate() {
+            let exponent = ((register + 12) >> 2) as f64;
+            let expected = FGRA_ETA[register & 3] * 2_f64.powf(-FGRA_TAU * exponent);
+            let relative_difference = ((actual - expected) / expected).abs();
+            assert!(
+                relative_difference <= 1e-14,
+                "register={register} actual={actual:.17e} expected={expected:.17e} \
+                 relative_difference={relative_difference:.17e}"
+            );
+        }
     }
 
     // Provides a broad end-to-end accuracy smoke test through the item-hashing
