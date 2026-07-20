@@ -42,7 +42,8 @@
 //! [gionis]: https://www.vldb.org/conf/1999/P49.pdf
 //! [shrivastava]: https://arxiv.org/abs/1406.4784
 
-use std::collections::{HashMap, HashSet, hash_map::RandomState};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, hash_map::RandomState};
 use std::hash::{BuildHasher, Hash};
 
 use crate::minhash::MinHash;
@@ -51,6 +52,40 @@ use crate::{SketchError, seeded_hash64, splitmix64};
 /// Stable internal reference to one arena record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct EntryHandle(usize);
+
+/// Candidate score retained by the bounded top-k heap.
+///
+/// Scores sort ascending so wrapping this type in [`Reverse`] makes the heap
+/// root the worst candidate currently retained. Handles provide a total,
+/// deterministic tie-break without cloning user IDs.
+#[derive(Debug, Clone, Copy)]
+struct ScoredHandle {
+    handle: EntryHandle,
+    similarity: f64,
+}
+
+impl PartialEq for ScoredHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.similarity.total_cmp(&other.similarity) == Ordering::Equal
+            && self.handle == other.handle
+    }
+}
+
+impl Eq for ScoredHandle {}
+
+impl PartialOrd for ScoredHandle {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredHandle {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.similarity
+            .total_cmp(&other.similarity)
+            .then_with(|| self.handle.0.cmp(&other.handle.0))
+    }
+}
 
 /// Minimal MinHash state needed for removal and approximate reranking.
 #[derive(Debug, Clone)]
@@ -300,7 +335,9 @@ where
     /// Returns top `k` candidates reranked by MinHash Jaccard estimate.
     ///
     /// Output tuples are `(id, estimated_jaccard)`, sorted descending. Candidate
-    /// handles are deduplicated before IDs are cloned or signatures are scored.
+    /// handles are deduplicated before signatures are scored. A bounded min-heap
+    /// retains only the best `k` handles, so IDs are cloned only for returned
+    /// results.
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when the query dimensions
@@ -311,26 +348,61 @@ where
             return Ok(Vec::new());
         }
 
-        let mut scored = Vec::new();
         let handles = self.candidate_handles(query)?;
+        if handles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result_count = k.min(handles.len());
+        let mut best = BinaryHeap::with_capacity(result_count);
         let family_seed = self
             .hash_family_seed
             .unwrap_or_else(|| query.hash_family_seed());
+
         for handle in handles {
-            let Some(entry) = self.entries.get(handle.0).and_then(Option::as_ref) else {
-                continue;
-            };
+            let entry = self.entries[handle.0]
+                .as_ref()
+                .expect("candidate handle must reference a live entry");
             let similarity = query.estimate_jaccard_signature(
                 &entry.signature.values,
                 entry.signature.observed_any,
                 family_seed,
             )?;
-            scored.push((entry.id.clone(), similarity));
+
+            let candidate = ScoredHandle { handle, similarity };
+
+            if best.len() < result_count {
+                best.push(Reverse(candidate));
+                continue;
+            }
+
+            let worst_retained = best
+                .peek()
+                .expect("top-k heap must be non-empty after reaching its capacity")
+                .0;
+            if candidate > worst_retained {
+                *best
+                    .peek_mut()
+                    .expect("top-k heap must be non-empty after reaching its capacity") =
+                    Reverse(candidate);
+            }
         }
 
-        scored.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
-        scored.truncate(k.min(scored.len()));
-        Ok(scored)
+        let mut selected: Vec<_> = best
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect();
+        selected.sort_unstable_by(|left, right| right.cmp(left));
+
+        Ok(selected
+            .into_iter()
+            .map(|candidate| {
+                let entry = self.entries[candidate.handle.0]
+                    .as_ref()
+                    .expect("selected handle must reference a live entry");
+                (entry.id.clone(), candidate.similarity)
+            })
+            .collect())
     }
 
     /// Clears all index state.
@@ -598,6 +670,34 @@ mod tests {
     }
 
     #[test]
+    fn query_top_k_clones_only_returned_ids() {
+        let clones = Rc::new(Cell::new(0));
+        let signature = signature_for_range(0, 1_000, 64);
+        let mut index = MinHashLshIndex::new(64, 8).unwrap();
+
+        for value in 0..100 {
+            index
+                .insert(
+                    CloneCountedId {
+                        value,
+                        clones: Rc::clone(&clones),
+                    },
+                    &signature,
+                )
+                .unwrap();
+        }
+        assert_eq!(clones.get(), 0, "insertion must move every canonical ID");
+
+        let top = index.query_top_k(&signature, 3).unwrap();
+        assert_eq!(top.len(), 3);
+        assert_eq!(
+            clones.get(),
+            3,
+            "top-k lookup must clone only the IDs it returns"
+        );
+    }
+
+    #[test]
     fn cloning_index_clones_each_canonical_id_once() {
         let clones = Rc::new(Cell::new(0));
         let id = CloneCountedId {
@@ -723,6 +823,42 @@ mod tests {
             assert!(pair[0].1 >= pair[1].1);
         }
         assert_eq!(top[0].0, 1);
+    }
+
+    #[test]
+    fn query_top_k_heap_keeps_the_best_candidates() {
+        let query = signature_for_range(0, 1_000, 64);
+        let signatures = vec![
+            (1_u64, signature_for_range(0, 1_000, 64)),
+            (2, signature_for_range(0, 1_100, 64)),
+            (3, signature_for_range(0, 1_200, 64)),
+            (4, signature_for_range(0, 1_300, 64)),
+            (5, signature_for_range(0, 1_400, 64)),
+        ];
+        // One row per band makes every signature in this nested family a
+        // candidate while leaving the retained MinHash scores distinct.
+        let mut index = MinHashLshIndex::new(64, 64).unwrap();
+        for (id, signature) in &signatures {
+            index.insert(*id, signature).unwrap();
+        }
+
+        let candidates = index.query_candidates(&query).unwrap();
+        assert_eq!(candidates.len(), signatures.len());
+
+        let mut expected: Vec<_> = signatures
+            .iter()
+            .filter(|(id, _)| candidates.contains(id))
+            .map(|(id, signature)| (*id, signature.estimate_jaccard(&query).unwrap()))
+            .collect();
+        expected.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| right.0.cmp(&left.0))
+        });
+        expected.truncate(2);
+
+        assert_eq!(index.query_top_k(&query, 2).unwrap(), expected);
     }
 
     #[test]
