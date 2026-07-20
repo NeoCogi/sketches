@@ -22,19 +22,61 @@
 //
 //! Jaccard similarity trait shared by sketch implementations.
 //!
-//! # HyperLogLog caveat
+//! # Cardinality-sketch caveat
 //!
-//! [`crate::hyperloglog::HyperLogLog`] implements this trait using cardinality
-//! estimates and the inclusion-exclusion identity. That is useful when only HLL
-//! state is available, but it has a materially weaker accuracy profile than
-//! MinHash similarity: inclusion-exclusion can be quite inaccurate when the true
-//! Jaccard index is small. Clamping the result to `[0, 1]` does not correct this
-//! statistical error. See the extensive warning on
-//! [`crate::hyperloglog::HyperLogLog::jaccard_index`] and [Ertl 2017].
+//! [`crate::hyperloglog::HyperLogLog`] and
+//! [`crate::ultraloglog::UltraLogLog`] implement this trait using cardinality
+//! estimates and the inclusion-exclusion identity. That is useful when only
+//! cardinality-sketch state is available, but it has a materially weaker
+//! accuracy profile than MinHash similarity: inclusion-exclusion can be quite
+//! inaccurate when the true Jaccard index is small. Clamping the result to
+//! `[0, 1]` does not correct this statistical error. See the extensive warnings
+//! on each implementation and [Ertl 2017].
 //!
 //! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 
 use crate::SketchError;
+
+/// Shared result of an inclusion-exclusion set-relation calculation.
+///
+/// Keeping both outputs together ensures that cardinality-based sketches use
+/// exactly the same clamping and empty-union convention.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct InclusionExclusionEstimates {
+    /// Intersection estimate clamped to the feasible cardinality range.
+    pub(crate) intersection: f64,
+    /// Jaccard estimate clamped to `[0, 1]`.
+    pub(crate) jaccard: f64,
+}
+
+/// Derives intersection and Jaccard estimates from three cardinality estimates.
+///
+/// This helper centralizes mechanics only; it does not make inclusion-exclusion
+/// statistically reliable for small intersections. The two-empty-set convention
+/// is Jaccard `1.0`.
+pub(crate) fn inclusion_exclusion_estimates(
+    left: f64,
+    right: f64,
+    union: f64,
+) -> InclusionExclusionEstimates {
+    // Estimator noise can produce a negative intersection or one larger than
+    // either input, so restrict the subtraction to its mathematically feasible
+    // interval.
+    let intersection = (left + right - union).max(0.0).min(left.min(right));
+
+    // Jaccard of two empty sets is one by convention; every nonempty union uses
+    // the ordinary intersection-to-union ratio.
+    let jaccard = if union == 0.0 {
+        1.0
+    } else {
+        (intersection / union).clamp(0.0, 1.0)
+    };
+
+    InclusionExclusionEstimates {
+        intersection,
+        jaccard,
+    }
+}
 
 /// Common API for sketches that can estimate Jaccard similarity.
 ///
@@ -79,8 +121,32 @@ pub trait JacardIndex {
 
 #[cfg(test)]
 mod tests {
-    use crate::{hyperloglog::HyperLogLog, jacard::JacardIndex, minhash::MinHash};
+    use crate::{
+        hyperloglog::HyperLogLog,
+        jacard::{JacardIndex, inclusion_exclusion_estimates},
+        minhash::MinHash,
+        ultraloglog::UltraLogLog,
+    };
 
+    // Verifies the shared helper's empty-set convention and both feasibility
+    // clamps independently of a particular sketch implementation.
+    #[test]
+    fn inclusion_exclusion_helper_clamps_noisy_estimates() {
+        let empty = inclusion_exclusion_estimates(0.0, 0.0, 0.0);
+        assert_eq!(empty.intersection, 0.0);
+        assert_eq!(empty.jaccard, 1.0);
+
+        let negative = inclusion_exclusion_estimates(100.0, 100.0, 250.0);
+        assert_eq!(negative.intersection, 0.0);
+        assert_eq!(negative.jaccard, 0.0);
+
+        let oversized = inclusion_exclusion_estimates(40.0, 60.0, 20.0);
+        assert_eq!(oversized.intersection, 40.0);
+        assert_eq!(oversized.jaccard, 1.0);
+    }
+
+    // Exercises HyperLogLog through the shared trait rather than its inherent
+    // method, guarding the trait delegation.
     #[test]
     fn trait_api_works_for_hyperloglog() {
         let mut left = HyperLogLog::new(12).unwrap();
@@ -96,6 +162,25 @@ mod tests {
         assert!(similarity > 0.20 && similarity < 0.60);
     }
 
+    // Exercises UltraLogLog through the same trait API used by the other set
+    // sketches.
+    #[test]
+    fn trait_api_works_for_ultraloglog() {
+        let mut left = UltraLogLog::new(12).unwrap();
+        let mut right = UltraLogLog::new(12).unwrap();
+        for value in 0_u64..5_000 {
+            left.add(&value);
+        }
+        for value in 2_500_u64..7_500 {
+            right.add(&value);
+        }
+
+        let similarity = JacardIndex::jaccard_index(&left, &right).unwrap();
+        assert!(similarity > 0.20 && similarity < 0.60);
+    }
+
+    // Retains coverage for MinHash's direct similarity estimator alongside the
+    // inclusion-exclusion implementations.
     #[test]
     fn trait_api_works_for_minhash() {
         let mut left = MinHash::new(128).unwrap();

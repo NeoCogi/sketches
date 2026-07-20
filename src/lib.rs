@@ -25,7 +25,10 @@
 //! The crate currently exposes:
 //! - [`minmax_sketch::MinMaxSketch`] for approximate frequency estimation.
 //! - [`hyperloglog::HyperLogLog`] for approximate cardinality estimation.
-//! - [`jacard`] for approximate set overlap/Jaccard helpers on HyperLogLog.
+//! - [`ultraloglog::UltraLogLog`] for more space-efficient approximate
+//!   cardinality estimation.
+//! - [`jacard`] for approximate set overlap/Jaccard helpers on cardinality and
+//!   similarity sketches.
 //! - [`bloom_filter::BloomFilter`] for approximate set membership checks.
 //! - [`count_sketch::CountSketch`] for signed approximate frequency estimation.
 //! - [`space_saving::SpaceSaving`] for approximate heavy hitters in
@@ -53,6 +56,7 @@ pub mod minmax_sketch;
 pub mod reservoir_sampling;
 pub mod space_saving;
 pub mod tdigest;
+pub mod ultraloglog;
 
 /// Errors returned by sketch constructors and merge operations.
 #[derive(Debug, Clone, PartialEq, Eq)]

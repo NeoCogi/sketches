@@ -35,6 +35,7 @@ sketches = { path = "../sketches" }
 | Bloom Filter | `bloom_filter` | You need very fast membership checks and can tolerate false positives | No deletions |
 | Cuckoo Filter | `cuckoo_filter` | You need membership checks and deletions | Delete only items known to have been inserted; inserts can fail at high load |
 | HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable; target standard errors below `0.00203125` are unsupported |
+| UltraLogLog | `ultraloglog` | You want a more space-efficient mergeable distinct counter | One-byte registers; fast FGRA and accuracy-first MLE estimators |
 | MinMax Sketch | `minmax_sketch` | You need approximate non-negative frequency counts | Conservative updates reduce overestimation |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
 | Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
@@ -49,11 +50,14 @@ sketches = { path = "../sketches" }
 
 If your primary goal is:
 
-- Distinct counting: use `HyperLogLog`.
+- Distinct counting with established HLL compatibility: use `HyperLogLog`.
+- New mergeable distinct-count pipelines: use `UltraLogLog` for better
+  precision at the same state size.
 - Jaccard similarity: use `MinHash` first.
 - Candidate retrieval for similarity search: use `MinHashLshIndex`, then rerank with MinHash Jaccard.
-- Jaccard from existing cardinality pipelines: `HyperLogLog` + `jacard` helpers
-  are available, but read the low-overlap limitations below before using them.
+- Jaccard from existing cardinality pipelines: `HyperLogLog` or `UltraLogLog`
+  plus the `jacard` trait are available, but read the low-overlap limitations
+  below before using them.
 - Membership without delete: use `BloomFilter`.
 - Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
 - Approximate frequency (non-negative): use `MinMaxSketch`.
@@ -130,6 +134,34 @@ register-wise merge operation, not a cardinality estimator. The implementation
 builds the register multiplicity vector and follows Algorithm 8's lower-bound
 initialization and stable secant iteration; it does not combine that estimator
 with the original HyperLogLog `2.5m` transition or large-range correction.
+
+## UltraLogLog Estimators and Merge Contract
+
+`UltraLogLog` is implemented separately from `HyperLogLog`; their register
+states are not interchangeable. It follows [Ertl's UltraLogLog paper](https://arxiv.org/abs/2308.16862)
+and uses one byte per register. The default optimal-FGRA estimator has
+asymptotic relative standard error `0.78224 / sqrt(m)`. The explicit
+`estimate_mle()` path uses the bias-reduced maximum-likelihood estimator with
+asymptotic relative standard error `0.76086 / sqrt(m)`. These correspond to
+about 24% and 28% lower state size, respectively, than six-bit HLL at equal
+asymptotic error.
+
+UltraLogLog can combine sketches with different precisions. Calling
+`low_precision.merge(&high_precision)` exactly reduces the source during the
+merge. The reverse direction returns an incompatibility error so that a
+receiver is never silently downsized. Use `left.merged(&right)` when the result
+should automatically use the smaller precision. As with every hash-based
+distinct counter, raw values passed to `add_hash()` must be uniformly
+distributed high-quality 64-bit hashes.
+
+UltraLogLog also implements `JacardIndex` and provides
+`intersection_estimate()` and `jaccard_index()`. These use the default FGRA
+cardinality estimator and inclusion-exclusion; they are not a specialized joint
+UltraLogLog estimator. Inputs with different precisions are first evaluated at
+their smaller common precision. The lower cardinality variance of UltraLogLog
+helps but does not fix the subtraction instability described below: small
+intersections can still be dominated by error from the much larger input and
+union estimates.
 
 ## HyperLogLog Intersection and Jaccard Limitations
 

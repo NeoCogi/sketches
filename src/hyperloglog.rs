@@ -60,7 +60,7 @@
 
 use std::hash::Hash;
 
-use crate::jacard::JacardIndex;
+use crate::jacard::{JacardIndex, inclusion_exclusion_estimates};
 use crate::{SketchError, seeded_hash64};
 
 const MIN_PRECISION: u8 = 4;
@@ -309,10 +309,7 @@ impl HyperLogLog {
         let union = self.union_estimate(other)?;
         let a = self.estimate();
         let b = other.estimate();
-
-        // Estimator variance can make inclusion-exclusion slightly negative.
-        let intersection = (a + b - union).max(0.0).min(a.min(b));
-        Ok(intersection)
+        Ok(inclusion_exclusion_estimates(a, b, union).intersection)
     }
 
     /// Returns the estimated Jaccard index `|A ∩ B| / |A ∪ B|`.
@@ -366,14 +363,9 @@ impl HyperLogLog {
     /// Returns [`SketchError::IncompatibleSketches`] when precision differs.
     pub fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError> {
         let union = self.union_estimate(other)?;
-        if union == 0.0 {
-            return Ok(1.0);
-        }
-
         let a = self.estimate();
         let b = other.estimate();
-        let intersection = (a + b - union).max(0.0).min(a.min(b));
-        Ok((intersection / union).clamp(0.0, 1.0))
+        Ok(inclusion_exclusion_estimates(a, b, union).jaccard)
     }
 
     /// Returns the rank of the first set bit in the suffix (1-indexed).
