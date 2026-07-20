@@ -239,6 +239,34 @@ entries and batch-merged with the compressed centroids. Quantile queries merge
 those two ordered views while reading, so they neither clone nor sort the
 centroid state.
 
+### KLL randomness and merging
+
+Each `KllSketch` owns its compaction random-number state. The crate does not use
+a global seed or coordinate separate sketches. `KllSketch::new(k)` uses a fixed
+default seed and is deterministic, which is convenient for a standalone sketch.
+
+When sketches are populated independently and may later be merged, the caller
+should generate a different seed for each sketch and use `with_seed`:
+
+```rust
+use sketches::kll::KllSketch;
+
+// In an application these come from a caller-owned RNG or are reproducibly
+// derived from a master seed and stable shard identifiers.
+let mut first = KllSketch::with_seed(200, 0xA11C_E001)?;
+let mut second = KllSketch::with_seed(200, 0xA11C_E002)?;
+
+first.add(10.0);
+second.add(20.0);
+first.merge(&second)?;
+# Ok::<(), sketches::SketchError>(())
+```
+
+Seeds are not merge-compatibility identifiers and do not need to match.
+Different seeds prevent independently built shards from making correlated
+compaction choices. A shared RNG, if desired, is used only by the caller to
+produce initial seeds; sketches never share an RNG while processing values.
+
 ## Quick Examples
 
 Approximate distinct counting:
