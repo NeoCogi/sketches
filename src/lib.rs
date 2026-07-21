@@ -65,6 +65,9 @@ pub enum SketchError {
     InvalidParameter(&'static str),
     /// Returned when combining two sketches that are not shape-compatible.
     IncompatibleSketches(&'static str),
+    /// Returned when combining sketches would exceed the supported observation
+    /// count.
+    ObservationCountOverflow,
 }
 
 impl fmt::Display for SketchError {
@@ -72,6 +75,9 @@ impl fmt::Display for SketchError {
         match self {
             Self::InvalidParameter(message) => write!(f, "invalid parameter: {message}"),
             Self::IncompatibleSketches(message) => write!(f, "incompatible sketches: {message}"),
+            Self::ObservationCountOverflow => {
+                write!(f, "KLL observation count exceeds u64::MAX")
+            }
         }
     }
 }

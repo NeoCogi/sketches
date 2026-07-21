@@ -243,13 +243,23 @@ impl KllSketch {
     /// Adds one value to the sketch.
     ///
     /// Non-finite values are ignored.
+    ///
+    /// # Panics
+    /// Panics if the observation count is already `u64::MAX`. This limit is
+    /// unreachable through practical single-value ingestion; fallible merges
+    /// report [`SketchError::ObservationCountOverflow`] instead.
     pub fn add(&mut self, value: f64) {
         if !value.is_finite() {
             return;
         }
 
+        let new_count = self
+            .count
+            .checked_add(1)
+            .expect("KLL observation count exceeds u64::MAX");
+
         self.levels[0].push(value);
-        self.count = self.count.saturating_add(1);
+        self.count = new_count;
         self.compact_after_add();
     }
 
@@ -277,7 +287,9 @@ impl KllSketch {
 
         let mut weighted_values = Vec::new();
         for (level, values) in self.levels.iter().enumerate() {
-            let weight = 1_u64.checked_shl(level as u32).unwrap_or(u64::MAX);
+            let weight = 1_u64
+                .checked_shl(level as u32)
+                .expect("KLL level exceeds the supported observation-count range");
             for &value in values {
                 weighted_values.push((value, weight));
             }
@@ -289,6 +301,10 @@ impl KllSketch {
             .iter()
             .map(|(_, weight)| *weight as u128)
             .sum();
+        debug_assert_eq!(
+            total_weight, self.count as u128,
+            "retained KLL weight must equal the observation count"
+        );
         let target_rank =
             ((total_weight as f64 * q).floor() as u128).min(total_weight.saturating_sub(1));
 
@@ -318,11 +334,19 @@ impl KllSketch {
     /// any new compactions and does not access global state.
     ///
     /// # Errors
-    /// Returns [`SketchError::IncompatibleSketches`] when `k` differs.
+    /// Returns [`SketchError::IncompatibleSketches`] when `k` differs, or
+    /// [`SketchError::ObservationCountOverflow`] when the combined observation
+    /// count would exceed `u64::MAX`. Validation occurs before mutation, so an
+    /// error leaves this sketch unchanged.
     pub fn merge(&mut self, other: &Self) -> Result<(), SketchError> {
         if self.k != other.k {
             return Err(SketchError::IncompatibleSketches("k must match for merge"));
         }
+
+        let merged_count = self
+            .count
+            .checked_add(other.count)
+            .ok_or(SketchError::ObservationCountOverflow)?;
 
         if self.levels.len() < other.levels.len() {
             self.levels.resize_with(other.levels.len(), Vec::new);
@@ -330,7 +354,7 @@ impl KllSketch {
         for (level, values) in other.levels.iter().enumerate() {
             self.levels[level].extend(values.iter().copied());
         }
-        self.count = self.count.saturating_add(other.count);
+        self.count = merged_count;
         self.compact_all_levels();
         Ok(())
     }
@@ -444,7 +468,7 @@ impl KllSketch {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_FAILURE_PROBABILITY, KllSketch, rank_error_bound, required_k};
-    use crate::splitmix64;
+    use crate::{SketchError, splitmix64};
 
     const REGRESSION_SEED: u64 = 0xD1B5_4A32_C192_ED03;
 
@@ -538,8 +562,12 @@ mod tests {
             return;
         }
 
+        let new_count = sketch
+            .count
+            .checked_add(1)
+            .expect("test stream must fit in the supported count");
         sketch.levels[0].push(value);
-        sketch.count = sketch.count.saturating_add(1);
+        sketch.count = new_count;
         sketch.compact_all_levels();
     }
 
@@ -772,6 +800,27 @@ mod tests {
         let mut left = KllSketch::with_seed(100, 7).unwrap();
         let right = KllSketch::with_seed(101, 8).unwrap();
         assert!(left.merge(&right).is_err());
+    }
+
+    #[test]
+    fn merge_rejects_observation_count_overflow_without_mutation() {
+        let mut sketch = KllSketch::with_seed(2, 7).unwrap();
+        sketch.add(1.0);
+
+        for _ in 0..63 {
+            let copy = sketch.clone();
+            sketch.merge(&copy).unwrap();
+        }
+
+        assert_eq!(sketch.count, 1_u64 << 63);
+        let before = sketch.clone();
+        let error = sketch.merge(&before).unwrap_err();
+
+        assert_eq!(error, SketchError::ObservationCountOverflow);
+        assert_eq!(sketch.count, before.count);
+        assert_eq!(sketch.levels, before.levels);
+        assert_eq!(sketch.rng_state, before.rng_state);
+        assert!(sketch.levels.len() <= u64::BITS as usize);
     }
 
     #[test]
