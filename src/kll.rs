@@ -543,7 +543,7 @@ impl KllSketch {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_FAILURE_PROBABILITY, KllSketch, rank_error_bound, required_k};
+    use super::{DEFAULT_FAILURE_PROBABILITY, KllSketch, rank_error_bound};
     use crate::{SketchError, splitmix64};
 
     const REGRESSION_SEED: u64 = 0xD1B5_4A32_C192_ED03;
@@ -556,6 +556,22 @@ mod tests {
             .map(|(level, values)| {
                 let weight = 1_u128.checked_shl(level as u32).unwrap();
                 values.len() as u128 * weight
+            })
+            .sum()
+    }
+
+    fn estimated_rank(sketch: &KllSketch, exclusive_upper_bound: f64) -> i128 {
+        sketch
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(level, values)| {
+                let weight = 1_i128.checked_shl(level as u32).unwrap();
+                let retained_below = values
+                    .iter()
+                    .filter(|&&value| value < exclusive_upper_bound)
+                    .count() as i128;
+                retained_below * weight
             })
             .sum()
     }
@@ -608,6 +624,16 @@ mod tests {
                 }
             })
             .collect();
+        let alternating_extremes = (0..length)
+            .map(|index| {
+                if index % 2 == 0 {
+                    index / 2
+                } else {
+                    length - 1 - index / 2
+                }
+            })
+            .map(|value| value as f64)
+            .collect();
 
         vec![
             ("ascending", ascending),
@@ -615,6 +641,7 @@ mod tests {
             ("shuffled", shuffled),
             ("repeated", repeated),
             ("skewed", skewed),
+            ("alternating-extremes", alternating_extremes),
         ]
     }
 
@@ -645,6 +672,24 @@ mod tests {
         sketch.levels[0].push(value);
         sketch.count = new_count;
         sketch.compact_all_levels();
+    }
+
+    fn merge_balanced(mut sketches: Vec<KllSketch>) -> KllSketch {
+        assert!(!sketches.is_empty());
+
+        while sketches.len() > 1 {
+            let mut next_level = Vec::with_capacity(sketches.len().div_ceil(2));
+            let mut pairs = sketches.into_iter();
+            while let Some(mut left) = pairs.next() {
+                if let Some(right) = pairs.next() {
+                    left.merge(&right).unwrap();
+                }
+                next_level.push(left);
+            }
+            sketches = next_level;
+        }
+
+        sketches.pop().unwrap()
     }
 
     #[test]
@@ -680,9 +725,26 @@ mod tests {
 
     #[test]
     fn error_rate_constructor_uses_documented_paper_bound() {
+        // These are known answers independently calculated from the documented
+        // paper bound. Keeping the expected values literal prevents this test
+        // from merely comparing the constructor with the helper it calls.
+        for &(rank_error, failure_probability, expected_k) in
+            &[(0.01, 0.01, 599), (0.05, 0.10, 90), (0.10, 0.50, 31)]
+        {
+            let sketch = KllSketch::with_error_rate_and_failure_probability_and_seed(
+                rank_error,
+                failure_probability,
+                8,
+            )
+            .unwrap();
+            assert_eq!(sketch.k(), expected_k);
+            assert!(rank_error_bound(expected_k, failure_probability) <= rank_error);
+            assert!(rank_error_bound(expected_k - 1, failure_probability) > rank_error);
+        }
+
         let rank_error = 0.01;
-        let failure_probability = 0.01;
-        let expected_k = required_k(rank_error, failure_probability).unwrap();
+        let failure_probability = DEFAULT_FAILURE_PROBABILITY;
+        let expected_k = 599;
         let configured =
             KllSketch::with_error_rate_and_failure_probability(rank_error, failure_probability)
                 .unwrap();
@@ -700,8 +762,6 @@ mod tests {
         assert_eq!(seeded.k(), expected_k);
         assert_eq!(fully_configured.k(), expected_k);
         assert_ne!(seeded.rng_state, fully_configured.rng_state);
-        assert!(rank_error_bound(expected_k, failure_probability) <= rank_error);
-        assert!(rank_error_bound(expected_k - 1, failure_probability) > rank_error);
 
         assert!(KllSketch::with_error_rate(0.0).is_err());
         assert!(KllSketch::with_error_rate(f64::NAN).is_err());
@@ -775,11 +835,12 @@ mod tests {
 
     #[test]
     fn rank_error_covers_orderings_k_values_and_seeds() {
-        let patterns = input_patterns(10_000);
+        let patterns = input_patterns(4_096);
 
         for &k in &[50_usize, 100, 200] {
             let error_limit = rank_error_bound(k, DEFAULT_FAILURE_PROBABILITY);
-            for &seed in &[7_u64, 11] {
+            for trial in 0..32_u64 {
+                let seed = splitmix64(0x1319_8A2E_0370_7344 ^ trial);
                 for (name, values) in &patterns {
                     let mut sketch = KllSketch::with_seed(k, seed).unwrap();
                     for &value in values {
@@ -787,11 +848,103 @@ mod tests {
                     }
 
                     let context = format!("pattern={name} k={k} seed={seed}");
-                    for &quantile in &[0.1, 0.5, 0.9] {
+                    for &quantile in &[0.01, 0.1, 0.5, 0.9, 0.99] {
                         assert_rank_error(&sketch, values, quantile, error_limit, &context);
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn compaction_rank_estimates_are_empirically_unbiased_across_many_seeds() {
+        const COUNT: usize = 8_192;
+        const TRIALS: usize = 512;
+        const K: usize = 64;
+        const MAX_NORMALIZED_MEAN_BIAS: f64 = 0.0005;
+        const EXACT_RANKS: [usize; 3] = [997, 3_761, 7_001];
+
+        let mut signed_error_sums = [0_i128; EXACT_RANKS.len()];
+        let mut positive_errors = [0_usize; EXACT_RANKS.len()];
+        let mut negative_errors = [0_usize; EXACT_RANKS.len()];
+
+        for trial in 0..TRIALS as u64 {
+            let seed = splitmix64(0x082E_FA98_EC4E_6C89 ^ trial);
+            let mut sketch = KllSketch::with_seed(K, seed).unwrap();
+            for value in 0..COUNT {
+                sketch.add(value as f64);
+            }
+
+            for (index, &exact_rank) in EXACT_RANKS.iter().enumerate() {
+                let threshold = exact_rank as f64 - 0.5;
+                let error = estimated_rank(&sketch, threshold) - exact_rank as i128;
+                signed_error_sums[index] += error;
+                positive_errors[index] += usize::from(error > 0);
+                negative_errors[index] += usize::from(error < 0);
+            }
+        }
+
+        for (index, &exact_rank) in EXACT_RANKS.iter().enumerate() {
+            let normalized_mean_bias =
+                signed_error_sums[index].unsigned_abs() as f64 / (TRIALS * COUNT) as f64;
+            assert!(
+                normalized_mean_bias <= MAX_NORMALIZED_MEAN_BIAS,
+                "rank={exact_rank} normalized_mean_bias={normalized_mean_bias} \
+                 positive_errors={} negative_errors={}",
+                positive_errors[index],
+                negative_errors[index]
+            );
+            assert!(
+                positive_errors[index] > 0 && negative_errors[index] > 0,
+                "rank={exact_rank} errors did not occur on both sides: positive={} negative={}",
+                positive_errors[index],
+                negative_errors[index]
+            );
+        }
+    }
+
+    #[test]
+    fn configured_single_query_failure_rate_is_empirically_respected() {
+        const COUNT: usize = 8_191;
+        const TRIALS: usize = 256;
+        const RANK_ERROR: f64 = 0.03;
+        const FAILURE_PROBABILITY: f64 = 0.10;
+        const QUANTILES: [f64; 5] = [0.01, 0.1, 0.5, 0.9, 0.99];
+
+        let mut failures = [0_usize; QUANTILES.len()];
+        for trial in 0..TRIALS {
+            let seed = splitmix64(0x4528_21E6_38D0_1377 ^ trial as u64);
+            let mut sketch = KllSketch::with_error_rate_and_failure_probability_and_seed(
+                RANK_ERROR,
+                FAILURE_PROBABILITY,
+                seed,
+            )
+            .unwrap();
+            // Hold the input fixed while varying only the compaction seed: the
+            // paper's probability is over the algorithm's random choices for
+            // one fixed stream and one fixed query.
+            const MULTIPLIER: usize = 4_099;
+            const OFFSET: usize = 2_731;
+            for index in 0..COUNT {
+                let value = (index * MULTIPLIER + OFFSET) % COUNT;
+                sketch.add(value as f64);
+            }
+
+            for (index, &quantile) in QUANTILES.iter().enumerate() {
+                let estimate = sketch.quantile(quantile).unwrap() as usize;
+                let target_rank = ((quantile * COUNT as f64).floor() as usize).min(COUNT - 1);
+                let error = estimate.abs_diff(target_rank) as f64 / COUNT as f64;
+                failures[index] += usize::from(error > RANK_ERROR);
+            }
+        }
+
+        let allowed_failures = (TRIALS as f64 * FAILURE_PROBABILITY).ceil() as usize;
+        for (index, &quantile) in QUANTILES.iter().enumerate() {
+            assert!(
+                failures[index] <= allowed_failures,
+                "q={quantile} failures={} allowed={allowed_failures}",
+                failures[index]
+            );
         }
     }
 
@@ -855,6 +1008,68 @@ mod tests {
                     error_limit,
                     &format!("merged k={k}"),
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_and_varied_merge_trees_meet_the_rank_error_contract() {
+        const COUNT: usize = 16_381;
+        const SHARDS: usize = 16;
+        const TRIALS: usize = 32;
+        const K: usize = 64;
+        const QUANTILES: [f64; 5] = [0.01, 0.1, 0.5, 0.9, 0.99];
+
+        let error_limit = rank_error_bound(K, DEFAULT_FAILURE_PROBABILITY);
+        for trial in 0..TRIALS {
+            let seed = splitmix64(0xBE54_66CF_34E9_0C6C ^ trial as u64);
+            let mut direct = KllSketch::with_seed(K, seed).unwrap();
+            let mut leaves: Vec<_> = (0..SHARDS)
+                .map(|shard| KllSketch::with_seed(K, splitmix64(seed ^ shard as u64)).unwrap())
+                .collect();
+            let multiplier = trial * 2 + 1;
+            let offset = splitmix64(seed) as usize % COUNT;
+
+            for index in 0..COUNT {
+                let value = (index * multiplier + offset) % COUNT;
+                direct.add(value as f64);
+                leaves[index % SHARDS].add(value as f64);
+            }
+
+            let mut left_fold = leaves[0].clone();
+            for leaf in &leaves[1..] {
+                left_fold.merge(leaf).unwrap();
+            }
+            let balanced = merge_balanced(leaves);
+
+            for (shape, sketch) in [
+                ("direct", &direct),
+                ("left-fold", &left_fold),
+                ("balanced", &balanced),
+            ] {
+                assert_eq!(sketch.count(), COUNT as u64, "shape={shape} trial={trial}");
+                assert_eq!(
+                    retained_weight(sketch),
+                    COUNT as u128,
+                    "shape={shape} trial={trial}"
+                );
+                for level in 0..sketch.levels.len() {
+                    assert!(
+                        sketch.levels[level].len() <= sketch.level_capacity(level),
+                        "shape={shape} trial={trial} level={level}"
+                    );
+                }
+
+                for &quantile in &QUANTILES {
+                    let estimate = sketch.quantile(quantile).unwrap() as usize;
+                    let target_rank = ((quantile * COUNT as f64).floor() as usize).min(COUNT - 1);
+                    let error = estimate.abs_diff(target_rank) as f64 / COUNT as f64;
+                    assert!(
+                        error <= error_limit,
+                        "shape={shape} trial={trial} q={quantile} estimate={estimate} \
+                         error={error} limit={error_limit}"
+                    );
+                }
             }
         }
     }
