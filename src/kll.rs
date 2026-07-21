@@ -250,7 +250,7 @@ impl KllSketch {
 
         self.levels[0].push(value);
         self.count = self.count.saturating_add(1);
-        self.compact_all_levels();
+        self.compact_after_add();
     }
 
     /// Returns the approximate quantile at `q` where `q` is in `[0, 1]`.
@@ -373,6 +373,32 @@ impl KllSketch {
         }
     }
 
+    fn compact_after_add(&mut self) {
+        let mut level = 0;
+        loop {
+            if self.levels[level].len() <= self.level_capacity(level) {
+                // Only level zero and levels reached by promotion can have
+                // changed. Once the promotion cascade stops, all higher levels
+                // still satisfy their existing capacities.
+                return;
+            }
+
+            let previous_height = self.levels.len();
+            self.compact_level(level);
+
+            if self.levels.len() > previous_height {
+                // Growing the hierarchy lowers every existing lower-level
+                // capacity. Reconsider the complete hierarchy under the new H.
+                self.compact_all_levels();
+                return;
+            }
+
+            // The compaction changed only the next level, so continue the
+            // overflow cascade there.
+            level += 1;
+        }
+    }
+
     fn compact_level(&mut self, level: usize) {
         if level + 1 == self.levels.len() {
             self.levels.push(Vec::new());
@@ -393,9 +419,20 @@ impl KllSketch {
             self.levels[level + 1].push(values[index]);
         }
 
+        values.clear();
         if let Some(value) = carry {
-            self.levels[level].push(value);
+            values.push(value);
         }
+
+        // Reuse the level's allocation across ordinary compactions. If a
+        // hierarchy growth has made this level much smaller, release excess
+        // historical capacity so allocated space continues to follow the
+        // varying-capacity hierarchy rather than retaining O(k) per level.
+        let required_capacity = self.level_capacity(level).saturating_add(1);
+        if values.capacity() > required_capacity.saturating_mul(2) {
+            values.shrink_to(required_capacity);
+        }
+        self.levels[level] = values;
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -496,6 +533,16 @@ mod tests {
         );
     }
 
+    fn add_with_full_scan(sketch: &mut KllSketch, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+
+        sketch.levels[0].push(value);
+        sketch.count = sketch.count.saturating_add(1);
+        sketch.compact_all_levels();
+    }
+
     #[test]
     fn constructor_validates_k() {
         assert!(KllSketch::new(1).is_err());
@@ -578,6 +625,34 @@ mod tests {
 
         for (level, old_capacity) in capacities.into_iter().enumerate() {
             assert!(sketch.level_capacity_for_height(level, height + 1) <= old_capacity);
+        }
+    }
+
+    #[test]
+    fn affected_level_compaction_matches_full_scan_scheduling() {
+        for &k in &[2_usize, 3, 8, 50, 200] {
+            let seed = 0xA409_3822_299F_31D0 ^ k as u64;
+            let mut affected_levels = KllSketch::with_seed(k, seed).unwrap();
+            let mut full_scan = KllSketch::with_seed(k, seed).unwrap();
+
+            for index in 0_u64..25_000 {
+                let value = index.wrapping_mul(104_729) % 100_003;
+                affected_levels.add(value as f64);
+                add_with_full_scan(&mut full_scan, value as f64);
+
+                assert_eq!(
+                    affected_levels.count, full_scan.count,
+                    "k={k} index={index}"
+                );
+                assert_eq!(
+                    affected_levels.rng_state, full_scan.rng_state,
+                    "k={k} index={index}"
+                );
+                assert_eq!(
+                    affected_levels.levels, full_scan.levels,
+                    "k={k} index={index}"
+                );
+            }
         }
     }
 

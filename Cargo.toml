@@ -18,3 +18,7 @@ harness = false
 [[bench]]
 name = "space_saving"
 harness = false
+
+[[bench]]
+name = "kll"
+harness = false
