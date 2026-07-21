@@ -31,10 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sketch.add(latency_ms as f64);
     }
 
-    // Query common quantiles.
-    let p50 = sketch.quantile(0.50)?;
-    let p95 = sketch.quantile(0.95)?;
-    let p99 = sketch.quantile(0.99)?;
+    // Query common quantiles in one batch so the retained values are sorted
+    // only once.
+    let quantiles = sketch.quantiles(&[0.50, 0.95, 0.99])?;
+    let (p50, p95, p99) = (quantiles[0], quantiles[1], quantiles[2]);
 
     println!("Estimated p50: {:.2} ms", p50);
     println!("Estimated p95: {:.2} ms", p95);

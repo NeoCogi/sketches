@@ -274,51 +274,67 @@ impl KllSketch {
     /// Returns [`SketchError::InvalidParameter`] for invalid `q` or empty
     /// sketches.
     pub fn quantile(&self, q: f64) -> Result<f64, SketchError> {
-        if !q.is_finite() || !(0.0..=1.0).contains(&q) {
-            return Err(SketchError::InvalidParameter(
-                "q must be finite and in [0, 1]",
-            ));
-        }
-        if self.count == 0 {
-            return Err(SketchError::InvalidParameter(
-                "quantile is undefined for an empty sketch",
-            ));
-        }
+        Self::validate_quantile(q)?;
+        self.validate_non_empty()?;
 
-        let mut weighted_values = Vec::new();
-        for (level, values) in self.levels.iter().enumerate() {
-            let weight = 1_u64
-                .checked_shl(level as u32)
-                .expect("KLL level exceeds the supported observation-count range");
-            for &value in values {
-                weighted_values.push((value, weight));
-            }
-        }
+        let weighted_values = self.sorted_weighted_values();
+        let total_weight = self.total_weight(&weighted_values);
+        let target_rank = Self::target_rank(q, total_weight);
 
-        weighted_values.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
-
-        let total_weight: u128 = weighted_values
-            .iter()
-            .map(|(_, weight)| *weight as u128)
-            .sum();
-        debug_assert_eq!(
-            total_weight, self.count as u128,
-            "retained KLL weight must equal the observation count"
-        );
-        let target_rank =
-            ((total_weight as f64 * q).floor() as u128).min(total_weight.saturating_sub(1));
-
-        let mut cumulative = 0_u128;
-        for (value, weight) in weighted_values {
-            cumulative = cumulative.saturating_add(weight as u128);
-            if cumulative > target_rank {
-                return Ok(value);
-            }
-        }
-
-        Err(SketchError::InvalidParameter(
+        Self::value_at_rank(&weighted_values, target_rank).ok_or(SketchError::InvalidParameter(
             "unable to compute quantile from current state",
         ))
+    }
+
+    /// Returns approximate quantiles for every query in `queries`.
+    ///
+    /// Results preserve the input query order, including duplicate and
+    /// unsorted queries. The retained weighted values are allocated and sorted
+    /// once, then all target ranks are answered in a single cumulative scan.
+    /// This is more efficient than calling [`Self::quantile`] repeatedly.
+    ///
+    /// An empty query slice returns an empty vector, including for an empty
+    /// sketch.
+    ///
+    /// # Errors
+    /// Returns [`SketchError::InvalidParameter`] when any query is non-finite or
+    /// outside `[0, 1]`, or when a non-empty query slice is used with an empty
+    /// sketch.
+    pub fn quantiles(&self, queries: &[f64]) -> Result<Vec<f64>, SketchError> {
+        for &query in queries {
+            Self::validate_quantile(query)?;
+        }
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_non_empty()?;
+
+        let weighted_values = self.sorted_weighted_values();
+        let total_weight = self.total_weight(&weighted_values);
+        let mut targets = Vec::with_capacity(queries.len());
+        for (index, &query) in queries.iter().enumerate() {
+            targets.push((Self::target_rank(query, total_weight), index));
+        }
+        targets.sort_unstable_by_key(|&(rank, _)| rank);
+
+        let mut results = vec![0.0; queries.len()];
+        let mut next_target = 0;
+        let mut cumulative = 0_u128;
+        for &(value, weight) in &weighted_values {
+            cumulative += weight as u128;
+            while next_target < targets.len() && cumulative > targets[next_target].0 {
+                results[targets[next_target].1] = value;
+                next_target += 1;
+            }
+        }
+
+        if next_target == targets.len() {
+            Ok(results)
+        } else {
+            Err(SketchError::InvalidParameter(
+                "unable to compute quantiles from current state",
+            ))
+        }
     }
 
     /// Merges another sketch into this one.
@@ -364,6 +380,66 @@ impl KllSketch {
         self.levels.clear();
         self.levels.push(Vec::new());
         self.count = 0;
+    }
+
+    fn validate_quantile(q: f64) -> Result<(), SketchError> {
+        if !q.is_finite() || !(0.0..=1.0).contains(&q) {
+            return Err(SketchError::InvalidParameter(
+                "q must be finite and in [0, 1]",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_non_empty(&self) -> Result<(), SketchError> {
+        if self.count == 0 {
+            return Err(SketchError::InvalidParameter(
+                "quantile is undefined for an empty sketch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sorted_weighted_values(&self) -> Vec<(f64, u64)> {
+        let retained = self.levels.iter().map(Vec::len).sum();
+        let mut weighted_values = Vec::with_capacity(retained);
+
+        for (level, values) in self.levels.iter().enumerate() {
+            let weight = 1_u64
+                .checked_shl(level as u32)
+                .expect("KLL level exceeds the supported observation-count range");
+            weighted_values.extend(values.iter().map(|&value| (value, weight)));
+        }
+
+        weighted_values.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        weighted_values
+    }
+
+    fn total_weight(&self, weighted_values: &[(f64, u64)]) -> u128 {
+        let total_weight = weighted_values
+            .iter()
+            .map(|(_, weight)| *weight as u128)
+            .sum();
+        debug_assert_eq!(
+            total_weight, self.count as u128,
+            "retained KLL weight must equal the observation count"
+        );
+        total_weight
+    }
+
+    fn target_rank(q: f64, total_weight: u128) -> u128 {
+        ((total_weight as f64 * q).floor() as u128).min(total_weight.saturating_sub(1))
+    }
+
+    fn value_at_rank(weighted_values: &[(f64, u64)], target_rank: u128) -> Option<f64> {
+        let mut cumulative = 0_u128;
+        for &(value, weight) in weighted_values {
+            cumulative += weight as u128;
+            if cumulative > target_rank {
+                return Some(value);
+            }
+        }
+        None
     }
 
     fn level_capacity(&self, level: usize) -> usize {
@@ -793,6 +869,36 @@ mod tests {
         let p50 = kll.quantile(0.5).unwrap();
         let p90 = kll.quantile(0.9).unwrap();
         assert!(p50 <= p90, "p50={p50} p90={p90}");
+    }
+
+    #[test]
+    fn batched_quantiles_match_scalar_queries_and_preserve_order() {
+        let mut sketch = KllSketch::with_seed(128, 4).unwrap();
+        for index in 0_u64..50_000 {
+            let value = index.wrapping_mul(104_729) % 100_003;
+            sketch.add(value as f64);
+        }
+
+        let queries = [1.0, 0.0, 0.5, 0.1, 0.5, 0.999, 0.75, 0.25];
+        let expected: Vec<_> = queries
+            .iter()
+            .map(|&query| sketch.quantile(query).unwrap())
+            .collect();
+
+        assert_eq!(sketch.quantiles(&queries).unwrap(), expected);
+    }
+
+    #[test]
+    fn batched_quantiles_validate_queries_and_empty_sketches() {
+        let empty = KllSketch::with_seed(128, 4).unwrap();
+        assert_eq!(empty.quantiles(&[]).unwrap(), Vec::<f64>::new());
+        assert!(empty.quantiles(&[0.5]).is_err());
+
+        let mut sketch = KllSketch::with_seed(128, 4).unwrap();
+        sketch.add(1.0);
+        assert!(sketch.quantiles(&[0.5, f64::NAN]).is_err());
+        assert!(sketch.quantiles(&[-0.1]).is_err());
+        assert!(sketch.quantiles(&[1.1]).is_err());
     }
 
     #[test]

@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use sketches::kll::KllSketch;
 
 const INSERTIONS: usize = 1_000_000;
-const QUERIES: usize = 20_000;
+const QUERY_BATCHES: usize = 5_000;
+const QUANTILES: [f64; 3] = [0.5, 0.95, 0.99];
 
 fn input_value(index: usize) -> f64 {
     ((index.wrapping_mul(104_729)) % 1_000_003) as f64
@@ -38,7 +39,7 @@ fn throughput(operations: usize, elapsed: Duration) -> f64 {
 
 fn main() {
     println!("KLL affected-level compaction benchmark");
-    println!("k\tinsert ops/s\tquery ops/s\tobservations");
+    println!("k\tinsert ops/s\tscalar q/s\tbatch q/s\tobservations");
 
     for k in [50, 200, 600] {
         let mut sketch = KllSketch::with_seed(k, 7).unwrap();
@@ -50,16 +51,25 @@ fn main() {
         let insertion_elapsed = started.elapsed();
 
         let started = Instant::now();
-        for index in 0..QUERIES {
-            let quantile = (index % 10_001) as f64 / 10_000.0;
-            black_box(sketch.quantile(black_box(quantile)).unwrap());
+        for _ in 0..QUERY_BATCHES {
+            for &quantile in &QUANTILES {
+                black_box(sketch.quantile(black_box(quantile)).unwrap());
+            }
         }
-        let query_elapsed = started.elapsed();
+        let scalar_query_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..QUERY_BATCHES {
+            black_box(sketch.quantiles(black_box(&QUANTILES)).unwrap());
+        }
+        let batch_query_elapsed = started.elapsed();
+        let quantile_count = QUERY_BATCHES * QUANTILES.len();
 
         println!(
-            "{k}\t{:.0}\t\t{:.0}\t\t{}",
+            "{k}\t{:.0}\t\t{:.0}\t\t{:.0}\t\t{}",
             throughput(INSERTIONS, insertion_elapsed),
-            throughput(QUERIES, query_elapsed),
+            throughput(quantile_count, scalar_query_elapsed),
+            throughput(quantile_count, batch_query_elapsed),
             sketch.count(),
         );
     }

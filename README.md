@@ -239,6 +239,11 @@ entries and batch-merged with the compressed centroids. Quantile queries merge
 those two ordered views while reading, so they neither clone nor sort the
 centroid state.
 
+KLL queries build a sorted weighted view of the retained samples. When several
+quantiles are needed from the same sketch, use `KllSketch::quantiles(&queries)`
+to allocate and sort that view once and answer every target rank in one scan.
+Results are returned in the same order as the input queries.
+
 ### KLL randomness and merging
 
 Each `KllSketch` owns its compaction random-number state. The crate does not use
