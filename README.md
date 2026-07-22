@@ -37,6 +37,7 @@ sketches = { path = "../sketches" }
 | HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable; target standard errors below `0.00203125` are unsupported |
 | UltraLogLog | `ultraloglog` | You want a more space-efficient mergeable distinct counter | One-byte registers; fast FGRA and accuracy-first MLE estimators |
 | MinCount Sketch | `mincount_sketch` | You need approximate non-negative frequency counts | Count-Min with conservative updates; estimates are one-sided upper bounds |
+| MinMax Sketch | `minmax_sketch` | You need to compress a fixed key-to-ordered-value mapping | Insert-min/query-max; estimates for inserted keys are one-sided lower bounds |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
 | Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
 | KLL Sketch | `kll` | You need general quantiles (median, p90, p99) | Good default quantile sketch |
@@ -62,6 +63,7 @@ If your primary goal is:
 - Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
 - Approximate frequency (non-negative): use `MinCountSketch`.
 - Approximate frequency (signed +/- updates): use `CountSketch`.
+- Compact ordered values such as quantile-bucket indices: use `MinMaxSketch`.
 - Heavy hitters / top-k: use `SpaceSaving`.
 - General quantiles: use `KllSketch`.
 - Tail-sensitive quantiles: use `TDigest`.
@@ -87,6 +89,42 @@ assert!(counts.estimate(&"GET /api/users") >= 10);
 Generic keys are fingerprinted once per operation. Applications that already
 have stable, distinct `u64` identifiers can use `add_u64` and `estimate_u64` to
 skip fingerprinting.
+
+## MinMax Sketch Value Compression
+
+`MinMaxSketch` implements the value-compression sketch from
+[SketchML](https://doi.org/10.1145/3183713.3196894). It stores the minimum
+ordered value mapped to each selected cell and returns the maximum selected
+cell on lookup. Consequently, an estimate for an inserted key cannot exceed
+the smallest value inserted for that key. Collisions can only lower it.
+
+The value type defaults to `u8`, which fits the paper's quantile-bucket use
+case, but any compact `Copy + Default + Ord` type can be used:
+
+```rust
+use sketches::minmax_sketch::MinMaxSketch;
+
+let seed = 0x3C6E_F372_FE94_F82B;
+let mut buckets = MinMaxSketch::<u8>::new(1_024, 4, seed)?;
+buckets.insert(&"feature:42", 17);
+assert_eq!(buckets.estimate(&"feature:42"), Some(17));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The width and depth are explicit capacity/accuracy tradeoffs; the paper uses
+multiple rows and sizes each row as a fraction of the number of mapped keys.
+Generic keys are fingerprinted once per operation, while `insert_u64` and
+`estimate_u64` accept stable identifiers directly. Compatible sketches merge
+by taking cell-wise minima.
+
+An empty selected cell makes `estimate` return `None`, which proves that a key
+was not inserted. An unknown key whose cells were all occupied by other keys
+can return a false-positive `Some` value, so MinMax is not a membership filter.
+Reinserting a key can lower its value but cannot raise it; rebuild the sketch
+when values need arbitrary replacement. Codes should increase away from the
+desired conservative value. As in SketchML, signed gradients should use
+separate positive and negative bucket mappings so underestimation cannot flip a
+sign or increase a negative value's magnitude.
 
 ## Count Sketch Parameters and Seeds
 
@@ -403,6 +441,7 @@ cargo run --example jacard
 cargo run --example minhash
 cargo run --example lsh_minhash
 cargo run --example mincount_sketch
+cargo run --example minmax_sketch
 cargo run --example count_sketch
 cargo run --example space_saving
 cargo run --example kll
