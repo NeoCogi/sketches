@@ -58,7 +58,7 @@ pub mod space_saving;
 pub mod tdigest;
 pub mod ultraloglog;
 
-/// Errors returned by sketch constructors and merge operations.
+/// Errors returned by sketch construction, update, query, and merge operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SketchError {
     /// Returned when a constructor receives an invalid argument.
@@ -68,6 +68,9 @@ pub enum SketchError {
     /// Returned when combining sketches would exceed the supported observation
     /// count.
     ObservationCountOverflow,
+    /// Returned when a Count Sketch update would exceed its exact signed
+    /// counter range.
+    CounterOverflow,
 }
 
 impl fmt::Display for SketchError {
@@ -77,6 +80,9 @@ impl fmt::Display for SketchError {
             Self::IncompatibleSketches(message) => write!(f, "incompatible sketches: {message}"),
             Self::ObservationCountOverflow => {
                 write!(f, "KLL observation count exceeds u64::MAX")
+            }
+            Self::CounterOverflow => {
+                write!(f, "Count Sketch counter update exceeds the exact i64 range")
             }
         }
     }

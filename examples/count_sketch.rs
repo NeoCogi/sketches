@@ -23,13 +23,20 @@
 use sketches::count_sketch::CountSketch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Build a Count Sketch tuned for moderate error/confidence.
-    let mut sketch = CountSketch::new(0.05, 0.01)?;
+    // The seed selects the complete hash family. A fixed value makes this
+    // example reproducible; production code should generate it independently
+    // of the stream. Shards that will be merged must share the same seed.
+    let seed = 0xA409_3822_299F_31D0;
+
+    // For each fixed query, this targets error at most 5% of the residual L2
+    // norm with failure probability at most 1% under the documented hashing
+    // model.
+    let mut sketch = CountSketch::new(0.05, 0.01, seed)?;
 
     // Simulate signed updates from a stream with increments and decrements.
-    sketch.add(&"GET /v1/users", 120);
-    sketch.add(&"GET /v1/health", 15);
-    sketch.add(&"GET /v1/users", -20);
+    sketch.add(&"GET /v1/users", 120)?;
+    sketch.add(&"GET /v1/health", 15)?;
+    sketch.add(&"GET /v1/users", -20)?;
 
     // Query the signed frequency estimate.
     let users_estimate = sketch.estimate(&"GET /v1/users");

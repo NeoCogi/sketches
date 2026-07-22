@@ -10,6 +10,7 @@ authors = ["Raja Lehtihet", "Wael El Oraiby"]
 repository = "https://github.com/NeoCogi/sketches"
 
 [dependencies]
+siphasher = "1.0.3"
 
 [[bench]]
 name = "tdigest"

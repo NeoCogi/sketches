@@ -67,6 +67,70 @@ If your primary goal is:
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
 
+## Count Sketch Parameters and Seeds
+
+`CountSketch::new(epsilon, delta, seed)` sizes a signed point-query sketch so
+that, for one fixed non-adaptive query, the estimated frequency differs from
+the true frequency by at most `epsilon * ||f without the queried item||_2` with
+failure probability at most `delta` under the documented independent-hashing
+model.
+
+The constructor uses a power-of-two width of at least `8 / epsilon^2` and an
+odd median depth derived from a Chernoff majority bound. Updates return a
+`Result`: Count Sketch must remain linear, so an update is rejected rather than
+clamped if a counter or its sign correction would exceed the exact `i64`
+range. Updates and merges preflight every affected counter, so an error leaves
+the sketch unchanged.
+
+The seed selects the fingerprint and all row hash functions. There is no global
+random generator or lock:
+
+```rust
+use sketches::count_sketch::CountSketch;
+
+// Fixed seeds are appropriate for reproducible examples and tests. In
+// production, draw this independently of the stream being summarized.
+let family_seed = 0xA409_3822_299F_31D0;
+let mut sketch = CountSketch::new(0.05, 0.01, family_seed)?;
+
+sketch.add(&"GET /v1/users", 120)?;
+sketch.add(&"GET /v1/users", -20)?;
+assert_eq!(sketch.estimate(&"GET /v1/users"), 100);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Separately populated shards must use the same seed and dimensions before they
+can be merged. Unrelated sketches should normally receive independently
+generated seeds so they do not repeat the same unlucky collision pattern. A
+seed is reproducibility/configuration data, not a secret cryptographic key.
+
+```rust
+use sketches::count_sketch::CountSketch;
+
+// The coordinating application generates this once and gives the same value
+// to every shard contributing to this aggregate.
+let shared_seed = 0x1319_8A2E_0370_7344;
+let mut first = CountSketch::new(0.05, 0.01, shared_seed)?;
+let mut second = CountSketch::new(0.05, 0.01, shared_seed)?;
+first.add(&"alpha", 40)?;
+second.add(&"alpha", 2)?;
+first.merge(&second)?;
+assert_eq!(first.estimate(&"alpha"), 42);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Applications with stable 64-bit item identifiers can use `add_u64` and
+`estimate_u64` to bypass generic `Hash` fingerprinting:
+
+```rust
+use sketches::count_sketch::CountSketch;
+
+let mut sketch = CountSketch::new(0.05, 0.01, 0x243F_6A88_85A3_08D3)?;
+sketch.add_u64(42, 7)?;
+assert_eq!(sketch.estimate_u64(42), 7);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Cuckoo Filter Parameters
 
 Automatic cuckoo filters use four-entry buckets, fingerprints from 6 through
