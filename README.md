@@ -105,11 +105,20 @@ case, but any compact `Copy + Default + Ord` type can be used:
 use sketches::minmax_sketch::MinMaxSketch;
 
 let seed = 0x3C6E_F372_FE94_F82B;
-let mut buckets = MinMaxSketch::<u8>::new(1_024, 4, seed)?;
-buckets.insert(&"feature:42", 17);
-assert_eq!(buckets.estimate(&"feature:42"), Some(17));
+// Width one deliberately forces a collision to expose the ordering rule.
+let mut buckets = MinMaxSketch::<u8>::new(1, 4, seed)?;
+buckets.insert(&"large", 17);
+buckets.insert(&"small", 4);
+
+// Each cell keeps min(17, 4), and lookup takes the maximum row candidate.
+assert_eq!(buckets.estimate(&"large"), Some(4));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+Production widths should be much larger than one. The example forces a
+collision only to make `Ord` observable: a collision retains the smaller value.
+Custom value types can define what “smaller” means through their `Ord`
+implementation.
 
 The width and depth are explicit capacity/accuracy tradeoffs; the paper uses
 multiple rows and sizes each row as a fraction of the number of mapped keys.

@@ -85,13 +85,14 @@ const OCCUPANCY_WORD_BITS: usize = u64::BITS as usize;
 /// ```rust
 /// use sketches::minmax_sketch::MinMaxSketch;
 ///
-/// // Values are quantile-bucket indices. A fixed seed makes this example
-/// // reproducible; production seeds should be chosen independently of keys.
-/// let mut sketch = MinMaxSketch::<u8>::new(64, 3, 0x3C6E_F372_FE94_F82B).unwrap();
-/// sketch.insert(&"feature:42", 17);
+/// // Width one deliberately forces a collision to show how Ord is used.
+/// // Production sketches should use wider rows.
+/// let mut sketch = MinMaxSketch::<u8>::new(1, 3, 0x3C6E_F372_FE94_F82B).unwrap();
+/// sketch.insert(&"large", 17);
+/// sketch.insert(&"small", 4);
 ///
-/// // A single inserted key has no collision noise.
-/// assert_eq!(sketch.estimate(&"feature:42"), Some(17));
+/// // Every selected cell retains min(17, 4), so the estimate is lowered.
+/// assert_eq!(sketch.estimate(&"large"), Some(4));
 /// ```
 ///
 /// # Representation and complexity
@@ -366,12 +367,27 @@ impl SeedStream {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::cmp::Reverse;
+    use std::fmt::Debug;
     use std::hash::{Hash, Hasher};
 
     use super::MinMaxSketch;
     use crate::SketchError;
 
     const SEED: u64 = 0x3C6E_F372_FE94_F82B;
+
+    fn assert_same_state<V>(left: &MinMaxSketch<V>, right: &MinMaxSketch<V>)
+    where
+        V: Copy + Debug + Default + Ord + PartialEq,
+    {
+        assert_eq!(left.width, right.width);
+        assert_eq!(left.values, right.values);
+        assert_eq!(left.occupied, right.occupied);
+        assert_eq!(left.occupied_cells, right.occupied_cells);
+        assert_eq!(left.row_seeds, right.row_seeds);
+        assert_eq!(left.family_seed, right.family_seed);
+        assert_eq!(left.fingerprint_keys, right.fingerprint_keys);
+    }
 
     #[test]
     fn constructor_retains_arbitrary_dimensions_and_seed() {
@@ -418,6 +434,105 @@ mod tests {
         for (key, &exact) in exact_minima.iter().enumerate() {
             assert!(sketch.estimate_u64(key as u64).unwrap() <= exact);
         }
+    }
+
+    #[test]
+    fn table_and_query_semantics_match_a_reference_across_configurations() {
+        const WIDTHS: [usize; 8] = [1, 2, 3, 7, 8, 31, 64, 65];
+        const DEPTHS: [usize; 3] = [1, 2, 5];
+        const SEEDS: [u64; 4] = [0, 1, SEED, u64::MAX];
+        const KEY_COUNT: usize = 41;
+
+        for width in WIDTHS {
+            for depth in DEPTHS {
+                for seed in SEEDS {
+                    let mut sketch = MinMaxSketch::<u8>::new(width, depth, seed).unwrap();
+                    let mut reference = vec![None; width * depth];
+                    let mut exact_minima: [Option<u8>; KEY_COUNT] = [None; KEY_COUNT];
+
+                    // Every key is revisited with values in a non-monotonic
+                    // order, exercising both replacing and no-op insertions.
+                    for operation in 0..512_u64 {
+                        let key = operation % KEY_COUNT as u64;
+                        let value = operation
+                            .wrapping_mul(73)
+                            .wrapping_add(key.wrapping_mul(19))
+                            as u8;
+
+                        for row in 0..depth {
+                            let index = sketch.location(row, key);
+                            let row_start = row * width;
+                            assert!(
+                                (row_start..row_start + width).contains(&index),
+                                "width={width} depth={depth} seed={seed} row={row} key={key}"
+                            );
+                            reference[index] = Some(
+                                reference[index].map_or(value, |current: u8| current.min(value)),
+                            );
+                        }
+                        exact_minima[key as usize] = Some(
+                            exact_minima[key as usize].map_or(value, |current| current.min(value)),
+                        );
+                        sketch.insert_u64(key, value);
+                    }
+
+                    for (index, expected) in reference.iter().copied().enumerate() {
+                        assert_eq!(sketch.is_occupied(index), expected.is_some());
+                        if let Some(expected) = expected {
+                            assert_eq!(sketch.values[index], expected);
+                        }
+                    }
+                    assert_eq!(
+                        sketch.occupied_cells(),
+                        reference.iter().filter(|value| value.is_some()).count()
+                    );
+
+                    for (key, exact) in exact_minima.iter().copied().enumerate() {
+                        let expected = (0..depth)
+                            .map(|row| reference[sketch.location(row, key as u64)].unwrap())
+                            .max();
+                        assert_eq!(sketch.estimate_u64(key as u64), expected);
+                        assert!(expected.unwrap() <= exact.unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_ord_controls_which_colliding_value_wins() {
+        let mut natural = MinMaxSketch::<u8>::new(1, 3, SEED).unwrap();
+        natural.insert_u64(1, 7);
+        natural.insert_u64(2, 200);
+        assert_eq!(natural.estimate_u64(1), Some(7));
+
+        // Reverse changes only the value ordering. Under Reverse, raw 200 is
+        // smaller than raw 7, so the same collision retains 200 instead.
+        let mut reversed = MinMaxSketch::<Reverse<u8>>::new(1, 3, SEED).unwrap();
+        reversed.insert_u64(1, Reverse(7));
+        reversed.insert_u64(2, Reverse(200));
+        assert_eq!(reversed.estimate_u64(1), Some(Reverse(200)));
+    }
+
+    #[test]
+    fn occupancy_bitmap_handles_word_boundaries() {
+        let mut sketch = MinMaxSketch::<u8>::new(65, 2, SEED).unwrap();
+        assert_eq!(sketch.values.len(), 130);
+        assert_eq!(sketch.occupied.len(), 3);
+
+        for index in 0..sketch.values.len() {
+            assert!(!sketch.is_occupied(index));
+        }
+        // Mark alternating indices first so both sides of the 63/64 and
+        // 127/128 word boundaries are exercised in a non-sequential pattern.
+        for index in (0..sketch.values.len())
+            .step_by(2)
+            .chain((1..sketch.values.len()).step_by(2))
+        {
+            sketch.mark_occupied(index);
+            assert!(sketch.is_occupied(index));
+        }
+        assert!((0..sketch.values.len()).all(|index| sketch.is_occupied(index)));
     }
 
     #[test]
@@ -519,6 +634,7 @@ mod tests {
         assert_eq!(left.occupied, direct.occupied);
         assert_eq!(left.occupied_cells, direct.occupied_cells);
 
+        let before_error = left.clone();
         let different_width = MinMaxSketch::<u8>::new(18, 5, SEED).unwrap();
         assert_eq!(
             left.merge(&different_width),
@@ -526,6 +642,7 @@ mod tests {
                 "width/depth must match for merge"
             ))
         );
+        assert_same_state(&left, &before_error);
 
         let different_seed = MinMaxSketch::<u8>::new(17, 5, SEED + 1).unwrap();
         assert_eq!(
@@ -534,6 +651,54 @@ mod tests {
                 "hash-family seeds must match for merge"
             ))
         );
+        assert_same_state(&left, &before_error);
+    }
+
+    #[test]
+    fn merge_is_commutative_associative_idempotent_and_has_an_empty_identity() {
+        let mut sketches: Vec<_> = (0_u64..3)
+            .map(|_| MinMaxSketch::<u16>::new(19, 4, SEED).unwrap())
+            .collect();
+        for (shard, sketch) in sketches.iter_mut().enumerate() {
+            for key in 0_u64..96 {
+                if key as usize % 3 == shard || key % 5 == 0 {
+                    let value = key
+                        .wrapping_mul(257)
+                        .wrapping_add((shard as u64).wrapping_mul(101))
+                        as u16;
+                    sketch.insert_u64(key, value);
+                }
+            }
+        }
+        let [first, second, third]: [MinMaxSketch<u16>; 3] =
+            sketches.try_into().expect("exactly three sketches");
+
+        let mut first_second = first.clone();
+        first_second.merge(&second).unwrap();
+        let mut second_first = second.clone();
+        second_first.merge(&first).unwrap();
+        assert_same_state(&first_second, &second_first);
+
+        let mut left_associative = first_second.clone();
+        left_associative.merge(&third).unwrap();
+        let mut second_third = second.clone();
+        second_third.merge(&third).unwrap();
+        let mut right_associative = first.clone();
+        right_associative.merge(&second_third).unwrap();
+        assert_same_state(&left_associative, &right_associative);
+
+        let mut idempotent = first.clone();
+        idempotent.merge(&first).unwrap();
+        assert_same_state(&idempotent, &first);
+
+        let empty = MinMaxSketch::<u16>::new(19, 4, SEED).unwrap();
+        let mut right_identity = first.clone();
+        right_identity.merge(&empty).unwrap();
+        assert_same_state(&right_identity, &first);
+
+        let mut left_identity = empty;
+        left_identity.merge(&first).unwrap();
+        assert_same_state(&left_identity, &first);
     }
 
     #[test]
