@@ -24,7 +24,7 @@ use sketches::reservoir_sampling::ReservoirSampling;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keep a uniform sample of 10 elements from a stream.
-    let mut reservoir = ReservoirSampling::new(10)?;
+    let mut reservoir = ReservoirSampling::new(10, 42)?;
 
     // Stream 1,000 sequential values.
     for value in 0_u64..1_000 {

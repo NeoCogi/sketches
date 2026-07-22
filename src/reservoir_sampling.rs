@@ -30,7 +30,7 @@ use crate::{SketchError, splitmix64};
 /// ```rust
 /// use sketches::reservoir_sampling::ReservoirSampling;
 ///
-/// let mut reservoir = ReservoirSampling::new(100).unwrap();
+/// let mut reservoir = ReservoirSampling::new(100, 42).unwrap();
 /// for value in 0_u64..10_000 {
 ///     reservoir.add(value);
 /// }
@@ -47,11 +47,15 @@ pub struct ReservoirSampling<T> {
 }
 
 impl<T> ReservoirSampling<T> {
-    /// Creates a reservoir with the given sample size.
+    /// Creates a reservoir with the given sample size and deterministic seed.
+    ///
+    /// Samplers constructed with the same capacity and seed make the same
+    /// choices for the same input stream. Use independently generated seeds
+    /// when independent samples are required.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] when `capacity == 0`.
-    pub fn new(capacity: usize) -> Result<Self, SketchError> {
+    pub fn new(capacity: usize, seed: u64) -> Result<Self, SketchError> {
         if capacity == 0 {
             return Err(SketchError::InvalidParameter(
                 "capacity must be greater than zero",
@@ -62,7 +66,7 @@ impl<T> ReservoirSampling<T> {
             capacity,
             samples: Vec::with_capacity(capacity),
             seen: 0,
-            rng_state: 0x94D0_49BB_1331_11EB,
+            rng_state: seed,
         })
     }
 
@@ -92,8 +96,15 @@ impl<T> ReservoirSampling<T> {
     }
 
     /// Adds one item from the stream.
+    ///
+    /// # Panics
+    /// Panics if the observation count is already `u64::MAX`.
     pub fn add(&mut self, item: T) {
-        self.seen = self.seen.saturating_add(1);
+        let new_seen = self
+            .seen
+            .checked_add(1)
+            .expect("reservoir observation count exceeds u64::MAX");
+        self.seen = new_seen;
 
         if self.samples.len() < self.capacity {
             self.samples.push(item);
@@ -107,6 +118,10 @@ impl<T> ReservoirSampling<T> {
     }
 
     /// Adds all items from an iterator.
+    ///
+    /// # Panics
+    /// Panics if adding the iterator's items would make the observation count
+    /// exceed `u64::MAX`.
     pub fn extend<I>(&mut self, items: I)
     where
         I: IntoIterator<Item = T>,
@@ -139,13 +154,13 @@ mod tests {
 
     #[test]
     fn constructor_validates_capacity() {
-        assert!(ReservoirSampling::<u64>::new(0).is_err());
-        assert!(ReservoirSampling::<u64>::new(10).is_ok());
+        assert!(ReservoirSampling::<u64>::new(0, 7).is_err());
+        assert!(ReservoirSampling::<u64>::new(10, 7).is_ok());
     }
 
     #[test]
     fn sample_size_never_exceeds_capacity() {
-        let mut reservoir = ReservoirSampling::new(64).unwrap();
+        let mut reservoir = ReservoirSampling::new(64, 7).unwrap();
         for value in 0_u64..10_000 {
             reservoir.add(value);
         }
@@ -155,7 +170,7 @@ mod tests {
 
     #[test]
     fn short_stream_keeps_all_values() {
-        let mut reservoir = ReservoirSampling::new(10).unwrap();
+        let mut reservoir = ReservoirSampling::new(10, 7).unwrap();
         reservoir.extend([1_u64, 2, 3, 4]);
         assert_eq!(reservoir.len(), 4);
         assert_eq!(reservoir.samples(), &[1, 2, 3, 4]);
@@ -163,8 +178,8 @@ mod tests {
 
     #[test]
     fn deterministic_for_same_input_stream() {
-        let mut left = ReservoirSampling::new(50).unwrap();
-        let mut right = ReservoirSampling::new(50).unwrap();
+        let mut left = ReservoirSampling::new(50, 7).unwrap();
+        let mut right = ReservoirSampling::new(50, 7).unwrap();
 
         for value in 0_u64..5_000 {
             left.add(value);
@@ -175,8 +190,29 @@ mod tests {
     }
 
     #[test]
+    fn different_seeds_select_different_samples() {
+        let mut left = ReservoirSampling::new(50, 7).unwrap();
+        let mut right = ReservoirSampling::new(50, 8).unwrap();
+
+        for value in 0_u64..5_000 {
+            left.add(value);
+            right.add(value);
+        }
+
+        assert_ne!(left.samples(), right.samples());
+    }
+
+    #[test]
+    #[should_panic(expected = "reservoir observation count exceeds u64::MAX")]
+    fn add_panics_when_observation_count_overflows() {
+        let mut reservoir = ReservoirSampling::new(1, 7).unwrap();
+        reservoir.seen = u64::MAX;
+        reservoir.add(1_u64);
+    }
+
+    #[test]
     fn clear_resets_state() {
-        let mut reservoir = ReservoirSampling::new(8).unwrap();
+        let mut reservoir = ReservoirSampling::new(8, 7).unwrap();
         reservoir.extend(0_u64..100);
         reservoir.clear();
         assert_eq!(reservoir.len(), 0);
