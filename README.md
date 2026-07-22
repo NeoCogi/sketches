@@ -36,7 +36,7 @@ sketches = { path = "../sketches" }
 | Cuckoo Filter | `cuckoo_filter` | You need membership checks and deletions | Delete only items known to have been inserted; inserts can fail at high load |
 | HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable; target standard errors below `0.00203125` are unsupported |
 | UltraLogLog | `ultraloglog` | You want a more space-efficient mergeable distinct counter | One-byte registers; fast FGRA and accuracy-first MLE estimators |
-| MinMax Sketch | `minmax_sketch` | You need approximate non-negative frequency counts | Conservative updates reduce overestimation |
+| MinCount Sketch | `mincount_sketch` | You need approximate non-negative frequency counts | Count-Min with conservative updates; estimates are one-sided upper bounds |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
 | Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
 | KLL Sketch | `kll` | You need general quantiles (median, p90, p99) | Good default quantile sketch |
@@ -60,12 +60,33 @@ If your primary goal is:
   below before using them.
 - Membership without delete: use `BloomFilter`.
 - Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
-- Approximate frequency (non-negative): use `MinMaxSketch`.
+- Approximate frequency (non-negative): use `MinCountSketch`.
 - Approximate frequency (signed +/- updates): use `CountSketch`.
 - Heavy hitters / top-k: use `SpaceSaving`.
 - General quantiles: use `KllSketch`.
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
+
+## MinCount Sketch Parameters and Seeds
+
+`MinCountSketch` is a Count-Min frequency sketch with conservative updates. It
+supports non-negative updates and returns a one-sided upper estimate. The seed
+selects the fingerprint and row-hash families; choose it independently of the
+stream and reuse it only for sketches that may later be merged:
+
+```rust
+use sketches::mincount_sketch::MinCountSketch;
+
+let seed = 0x510E_527F_ADE6_82D1;
+let mut counts = MinCountSketch::new(0.01, 0.01, seed)?;
+counts.add(&"GET /api/users", 10);
+assert!(counts.estimate(&"GET /api/users") >= 10);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Generic keys are fingerprinted once per operation. Applications that already
+have stable, distinct `u64` identifiers can use `add_u64` and `estimate_u64` to
+skip fingerprinting.
 
 ## Count Sketch Parameters and Seeds
 
@@ -381,7 +402,7 @@ cargo run --example hyperloglog
 cargo run --example jacard
 cargo run --example minhash
 cargo run --example lsh_minhash
-cargo run --example minmax_sketch
+cargo run --example mincount_sketch
 cargo run --example count_sketch
 cargo run --example space_saving
 cargo run --example kll

@@ -19,18 +19,19 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-//
-use sketches::minmax_sketch::MinMaxSketch;
+
+use sketches::mincount_sketch::MinCountSketch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut sketch = MinMaxSketch::new(0.01, 0.01)?;
+    let seed = 0x510E_527F_ADE6_82D1;
+    let mut sketch = MinCountSketch::new(0.01, 0.01, seed)?;
 
     sketch.add(&"GET /api/users", 10);
     sketch.add(&"GET /api/health", 2);
     sketch.increment(&"GET /api/users");
 
-    let (min_estimate, max_estimate) = sketch.estimate_interval(&"GET /api/users");
-    println!("GET /api/users estimated frequency range: {min_estimate}..={max_estimate}");
+    let estimate = sketch.estimate(&"GET /api/users");
+    println!("GET /api/users estimated frequency: {estimate}");
 
     Ok(())
 }

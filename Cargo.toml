@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "kll"
 harness = false
+
+[[bench]]
+name = "mincount"
+harness = false

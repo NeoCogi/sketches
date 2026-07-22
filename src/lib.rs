@@ -23,7 +23,8 @@
 //! Probabilistic data structures for scalable approximate analytics.
 //!
 //! The crate currently exposes:
-//! - [`minmax_sketch::MinMaxSketch`] for approximate frequency estimation.
+//! - [`mincount_sketch::MinCountSketch`] for approximate non-negative frequency
+//!   estimation.
 //! - [`hyperloglog::HyperLogLog`] for approximate cardinality estimation.
 //! - [`ultraloglog::UltraLogLog`] for more space-efficient approximate
 //!   cardinality estimation.
@@ -51,8 +52,8 @@ pub mod hyperloglog;
 pub mod jacard;
 pub mod kll;
 pub mod lsh_minhash;
+pub mod mincount_sketch;
 pub mod minhash;
-pub mod minmax_sketch;
 pub mod reservoir_sampling;
 pub mod space_saving;
 pub mod tdigest;
