@@ -1167,6 +1167,10 @@ mod tests {
             assert_eq!(sketch.state(), expected_state);
             assert_relative_eq(sketch.estimate(), expected_fgra, 2e-15);
             assert_relative_eq(sketch.estimate_mle(), expected_mle, 2e-15);
+            let restored = UltraLogLog::from_state(expected_state.to_vec()).unwrap();
+            assert_eq!(restored, sketch);
+            assert_relative_eq(restored.estimate(), expected_fgra, 2e-15);
+            assert_relative_eq(restored.estimate_mle(), expected_mle, 2e-15);
         }
     }
 
@@ -1348,6 +1352,203 @@ mod tests {
                     );
                 }
                 assert!(UltraLogLog::from_state(vec![invalid; length]).is_err());
+            }
+        }
+    }
+
+    /// Models reachable bytes using observation bits, independently of the
+    /// production validity predicate and pack/unpack routines. Only the
+    /// highest bit and its two predecessors survive in the byte encoding.
+    fn reachable_register_bytes(precision: u8) -> [bool; 256] {
+        let lowest_bit = precision - 1;
+        let forbidden_bits = (1_u64 << lowest_bit) - 1;
+        let mut reachable = [false; 256];
+        reachable[0] = true;
+        for highest in lowest_bit..=63 {
+            for flags in 0..4_u8 {
+                let observations = (1_u64 << highest)
+                    | (u64::from(flags >> 1) << (highest - 1))
+                    | (u64::from(flags & 1) << (highest - 2));
+                if observations & forbidden_bits == 0 {
+                    reachable[((highest << 2) | flags) as usize] = true;
+                }
+            }
+        }
+        reachable
+    }
+
+    #[test]
+    fn register_validity_matches_reachability_at_every_supported_precision() {
+        // Check 6,144 precision/byte combinations using fixed-size scratch
+        // storage, without allocating the large high-precision sketch states.
+        for precision in 3..=26 {
+            let reachable = reachable_register_bytes(precision);
+            for register in 0..=255_u8 {
+                assert_eq!(
+                    super::is_valid_register(register, precision),
+                    reachable[register as usize],
+                    "precision={precision}, byte={register}"
+                );
+            }
+        }
+    }
+
+    /// Returns a raw hash whose observation occupies `bit` in register zero.
+    /// Callers restrict `bit` to `[precision - 1, 63]`; the all-zero suffix
+    /// produces the terminal observation, while a single suffix bit selects
+    /// each other possible leading-zero count.
+    fn hash_for_observation_bit(bit: u8) -> u64 {
+        if bit == 63 { 0 } else { 1_u64 << (62 - bit) }
+    }
+
+    #[test]
+    fn state_import_matches_raw_hash_reachability_at_low_precisions() {
+        for precision in 3..=6 {
+            let lowest_bit = precision - 1;
+            let length = 1_usize << precision;
+            let mut reached = [false; 256];
+            reached[0] = true;
+            for highest in lowest_bit..=63 {
+                for flags in 0..4_u8 {
+                    let predecessors =
+                        [(highest - 1, flags & 2 != 0), (highest - 2, flags & 1 != 0)];
+                    if predecessors
+                        .iter()
+                        .any(|&(bit, set)| set && bit < lowest_bit)
+                    {
+                        continue;
+                    }
+                    let mut sketch = UltraLogLog::new(precision).unwrap();
+                    sketch.add_hash(hash_for_observation_bit(highest));
+                    for (bit, set) in predecessors {
+                        if set {
+                            sketch.add_hash(hash_for_observation_bit(bit));
+                        }
+                    }
+                    reached[sketch.state()[0] as usize] = true;
+                    assert!(sketch.state()[1..].iter().all(|&byte| byte == 0));
+                }
+            }
+            assert_eq!(reached, reachable_register_bytes(precision));
+            // Exercise the actual public parser for every byte, including
+            // canonical empty, boundary flags and all saturated encodings.
+            for register in 0..=255_u8 {
+                let restored = UltraLogLog::from_state(vec![register; length]);
+                assert_eq!(restored.is_ok(), reached[register as usize]);
+                if let Ok(sketch) = restored {
+                    assert_eq!(sketch.precision(), precision);
+                    assert!(sketch.state().iter().all(|&byte| byte == register));
+                    let estimates = [sketch.estimate(), sketch.estimate_mle()];
+                    if register == 0 {
+                        assert!(sketch.is_empty());
+                        assert_eq!(estimates, [0.0, 0.0]);
+                    } else if register == 255 {
+                        assert!(!sketch.is_empty());
+                        assert!(estimates.iter().all(|estimate| estimate.is_infinite()));
+                    } else {
+                        assert!(!sketch.is_empty());
+                        assert!(
+                            estimates
+                                .iter()
+                                .all(|estimate| estimate.is_finite() && *estimate > 0.0)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restored_estimates_are_invariant_under_register_permutation() {
+        for precision in 3..=6 {
+            let minimum = 4 * precision - 4;
+            let length = 1_usize << precision;
+            let boundary_bytes = [
+                0,
+                minimum,
+                minimum + 4,
+                minimum + 6,
+                minimum + 8,
+                minimum + 9,
+                minimum + 10,
+                minimum + 11,
+                252,
+                253,
+                254,
+                255,
+            ];
+            let mut states = Vec::new();
+            for register in boundary_bytes {
+                let mut state = vec![0; length];
+                state[0] = register;
+                states.push(state);
+            }
+            states.push(
+                (0..length)
+                    .map(|i| boundary_bytes[i % boundary_bytes.len()])
+                    .collect(),
+            );
+            states.push(vec![255; length]);
+            for mut state in states {
+                let original = UltraLogLog::from_state(state.clone()).unwrap();
+                let expected = [original.estimate(), original.estimate_mle()];
+                for _ in 1..length {
+                    state.rotate_left(1);
+                    let permuted = UltraLogLog::from_state(state.clone()).unwrap();
+                    assert_eq!(permuted.estimate(), expected[0]);
+                    assert_eq!(permuted.estimate_mle(), expected[1]);
+                }
+                state.reverse();
+                let reversed = UltraLogLog::from_state(state).unwrap();
+                assert_eq!(reversed.estimate(), expected[0]);
+                assert_eq!(reversed.estimate_mle(), expected[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn restored_state_remains_valid_through_updates_merges_reduction_and_clear() {
+        let high = UltraLogLog::from_state(vec![255; 1 << 6]).unwrap();
+        let mut low = UltraLogLog::from_state(vec![8, 12, 14, 16, 17, 18, 19, 0]).unwrap();
+        low.add_hash(hash_for_observation_bit(5));
+        assert_eq!(
+            UltraLogLog::from_state(low.clone().into_state()).unwrap(),
+            low
+        );
+        low.merge(&high).unwrap();
+        assert_eq!(
+            UltraLogLog::from_state(low.clone().into_state()).unwrap(),
+            low
+        );
+        let reduced = high.downsize(3).unwrap();
+        assert_eq!(
+            UltraLogLog::from_state(reduced.clone().into_state()).unwrap(),
+            reduced
+        );
+        let before = high.clone();
+        let mut incompatible = high.clone();
+        assert!(incompatible.merge(&low).is_err());
+        assert_eq!(incompatible, before);
+        low.clear();
+        assert_eq!(
+            UltraLogLog::from_state(low.into_state()).unwrap(),
+            UltraLogLog::new(3).unwrap()
+        );
+    }
+
+    #[test]
+    fn state_import_checks_length_and_precision_before_register_bytes() {
+        for length in [0_usize, 1, 2, 4, 7, 9] {
+            let expected = if length.is_power_of_two() {
+                "precision must be in the inclusive range [3, 26]"
+            } else {
+                "state length must be a power of two"
+            };
+            for byte in [0, 9, 255] {
+                assert_eq!(
+                    UltraLogLog::from_state(vec![byte; length]),
+                    Err(crate::SketchError::InvalidParameter(expected))
+                );
             }
         }
     }

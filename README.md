@@ -330,6 +330,30 @@ should automatically use the smaller precision. As with every hash-based
 distinct counter, raw values passed to `add_hash()` must be uniformly
 distributed high-quality 64-bit hashes.
 
+`state()` borrows the serialized bytes and `into_state()` transfers ownership.
+`from_state()` consumes an owned byte vector, infers precision from its length,
+and validates every register before constructing the sketch. The length must
+be `2^p` for `p` in `[3, 26]`. For `minimum = 4*p - 4`, the legal bytes are zero,
+`minimum`, `minimum + 4`, `minimum + 6`, and all bytes at least `minimum + 8`.
+Other bytes claim observations or predecessor flags below the smallest possible
+rank and return `SketchError::InvalidParameter`; valid bytes are preserved.
+For example, precision three accepts `0`, `8`, `12`, `14`, and `16..=255`,
+and rejects `9`, `10`, `11`, `13`, and `15`:
+
+```rust
+use sketches::ultraloglog::UltraLogLog;
+
+let restored = UltraLogLog::from_state(vec![14; 8])?;
+assert_eq!(restored.state(), &[14; 8]);
+assert!(UltraLogLog::from_state(vec![9; 8]).is_err());
+# Ok::<(), sketches::SketchError>(())
+```
+
+Import validation takes `O(register_count)` time and accepts legal saturated
+bytes. A fully saturated sketch can still return an infinite cardinality
+estimate. The [F2 fix record](docs/F2_ULTRALOGLOG_STATE_IMPORT_FIX.md) describes
+the import invariant and exhaustive reachability and estimator-order tests.
+
 UltraLogLog also implements `JacardIndex` and provides
 `intersection_estimate()` and `jaccard_index()`. These use the default FGRA
 cardinality estimator and inclusion-exclusion; they are not a specialized joint
