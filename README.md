@@ -10,6 +10,7 @@ This crate gives you memory-efficient sketches for:
 - set similarity (Jaccard),
 - heavy hitter detection,
 - quantiles,
+- streaming vector means, variances, and covariances,
 - and stream sampling.
 
 All sketches are designed for streaming workloads where exact data structures
@@ -45,6 +46,7 @@ sketches = { path = "../sketches" }
 | MinHash | `minhash` | You need Jaccard similarity between sets | Best default for similarity tasks |
 | MinHash LSH | `lsh_minhash` | You need fast near-duplicate/candidate lookup before reranking | Uses banding over MinHash signatures |
 | Reservoir Sampling | `reservoir_sampling` | You need a uniform sample from an unbounded stream | Fixed-size unbiased sample |
+| Vector Welford's Algorithm | `vector_welford` | You need streaming means, variances, and covariances of numeric vectors | Exact online moments in `O(d²)` space; mergeable |
 | Jaccard trait/helpers | `jacard` | You want a shared Jaccard API across sketches | Provides `JacardIndex` trait |
 
 ## Which Sketch Should I Use?
@@ -68,6 +70,33 @@ If your primary goal is:
 - General quantiles: use `KllSketch`.
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
+- Track vector means, variances, and covariances: use `VectorWelford`.
+
+## Vector Welford's Algorithm
+
+`VectorWelford` summarizes fixed-dimension vectors in one pass. It returns
+population moments (divided by `n`) or sample moments (divided by `n - 1`),
+including the full covariance matrix. Empty streams have no mean or moments;
+sample moments need at least two observations. Independently accumulated batches
+of the same dimension can be merged. Each observation must have the configured
+number of finite coordinates.
+
+```rust
+use sketches::vector_welford::VectorWelford;
+
+let mut stats = VectorWelford::new(2)?;
+for vector in [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]] {
+    stats.add(&vector)?;
+}
+assert_eq!(stats.mean(), Some(&[2.0, 4.0][..]));
+assert_eq!(stats.sample_variance(), Some(vec![1.0, 4.0]));
+assert_eq!(stats.sample_covariance().unwrap()[0][1], 2.0);
+# Ok::<(), sketches::SketchError>(())
+```
+
+The state uses `O(d²)` memory and each update costs `O(d²)` for `d` coordinates.
+Results follow ordinary `f64` arithmetic, so extreme finite coordinates may
+overflow intermediate calculations.
 
 ## MinCount Sketch Parameters and Seeds
 
@@ -456,6 +485,7 @@ cargo run --example space_saving
 cargo run --example kll
 cargo run --example tdigest
 cargo run --example reservoir_sampling
+cargo run --example vector_welford
 ```
 
 ## Validate

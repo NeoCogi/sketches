@@ -41,6 +41,7 @@
 //! - [`minhash::MinHash`] for approximate Jaccard estimation.
 //! - [`lsh_minhash::MinHashLshIndex`] for approximate nearest-neighbor lookup.
 //! - [`reservoir_sampling::ReservoirSampling`] for uniform stream sampling.
+//! - [`vector_welford::VectorWelford`] for exact streaming vector moments.
 
 use core::fmt;
 use std::collections::hash_map::DefaultHasher;
@@ -60,6 +61,7 @@ pub mod reservoir_sampling;
 pub mod space_saving;
 pub mod tdigest;
 pub mod ultraloglog;
+pub mod vector_welford;
 
 /// Errors returned by sketch construction, update, query, and merge operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +84,7 @@ impl fmt::Display for SketchError {
             Self::InvalidParameter(message) => write!(f, "invalid parameter: {message}"),
             Self::IncompatibleSketches(message) => write!(f, "incompatible sketches: {message}"),
             Self::ObservationCountOverflow => {
-                write!(f, "KLL observation count exceeds u64::MAX")
+                write!(f, "observation count exceeds u64::MAX")
             }
             Self::CounterOverflow => {
                 write!(f, "Count Sketch counter update exceeds the exact i64 range")
