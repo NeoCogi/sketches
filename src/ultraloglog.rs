@@ -151,6 +151,23 @@ fn validate_precision(precision: u8) -> Result<(), SketchError> {
     Ok(())
 }
 
+/// Checks whether a byte is reachable from observations at a validated precision.
+///
+/// Callers must first validate `precision` in `[3, 26]`. Observation bits begin
+/// at `precision - 1`; predecessor flags below that bit are impossible. For
+/// `minimum = 4 * precision - 4`, the first nonzero state has no flags, the next
+/// rank permits only its immediate predecessor, and all later ranks permit
+/// both flags. Zero is the only canonical empty byte. Saturated bytes remain
+/// valid. The predicate is independent of a register's index or its neighbors.
+fn is_valid_register(register: u8, precision: u8) -> bool {
+    let minimum = (precision << 2) - 4;
+    register == 0
+        || register == minimum
+        || register == minimum + 4
+        || register == minimum + 6
+        || register >= minimum + 8
+}
+
 /// Calculates an estimator's asymptotic relative standard error at a precision.
 fn relative_standard_error(precision: u8, estimator: UltraLogLogEstimator) -> f64 {
     estimator.relative_standard_error_factor() / ((1_usize << precision) as f64).sqrt()
@@ -172,7 +189,10 @@ fn relative_standard_error(precision: u8, estimator: UltraLogLogEstimator) -> f6
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UltraLogLog {
+    /// Validated address precision; determines register count and reachable bytes.
     precision: u8,
+    /// Owned precision-independent bytes, each reachable at this precision.
+    /// Import validates this invariant; updates and precision reduction preserve it.
     registers: Vec<u8>,
 }
 
@@ -243,12 +263,30 @@ impl UltraLogLog {
     /// Restores a sketch from its precision-independent register bytes.
     ///
     /// The state length must be a power of two corresponding to precision
-    /// `[3, 26]`. Nonzero registers are validated against the encoding's
-    /// precision-dependent minimum.
+    /// `[3, 26]`. Every byte must be reachable at that precision: zero is empty;
+    /// for `minimum = 4 * precision - 4`, legal nonzero bytes are `minimum`,
+    /// `minimum + 4`, `minimum + 6`, and every byte at least `minimum + 8`.
+    /// Other bytes encode ranks or predecessor flags below the smallest
+    /// possible observation. They are rejected rather than normalized.
+    ///
+    /// Validation takes `O(register_count)` time. On success the supplied vector
+    /// becomes the sketch's owned state without changing its bytes. Legal
+    /// saturated states are accepted and can have infinite cardinality estimates.
     ///
     /// # Errors
     ///
     /// Returns [`SketchError::InvalidParameter`] for an invalid length or byte.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sketches::ultraloglog::UltraLogLog;
+    ///
+    /// let restored = UltraLogLog::from_state(vec![14; 8])?;
+    /// assert_eq!(restored.precision(), 3);
+    /// assert!(UltraLogLog::from_state(vec![9; 8]).is_err());
+    /// # Ok::<(), sketches::SketchError>(())
+    /// ```
     pub fn from_state(registers: Vec<u8>) -> Result<Self, SketchError> {
         // State length encodes precision, so it must be an admissible power of
         // two before trailing zeros can be interpreted as `p`.
@@ -260,13 +298,11 @@ impl UltraLogLog {
 
         let precision = registers.len().trailing_zeros() as u8;
         validate_precision(precision)?;
-        // The precision-independent mapping reserves low byte values that
-        // cannot arise at this precision; rejecting them prevents later table
-        // indexing and shift invariants from being violated.
-        let minimum_nonzero_register = (precision << 2) - 4;
+        // Establish reachability before constructing the sketch. Estimator
+        // boundary cases assume bytes cannot contain impossible low-rank flags.
         if registers
             .iter()
-            .any(|&register| register != 0 && register < minimum_nonzero_register)
+            .any(|&register| !is_valid_register(register, precision))
         {
             return Err(SketchError::InvalidParameter(
                 "state contains a register that is invalid for its precision",
@@ -1289,6 +1325,31 @@ mod tests {
         let reverse = high.jaccard_index(&low).unwrap();
         assert_eq!(forward, reverse);
         assert!((0.15..0.55).contains(&forward));
+    }
+
+    // Rejects every impossible boundary flag in the positions that formerly
+    // selected different MLE zero-sum results, including all-invalid states.
+    #[test]
+    fn state_import_rejects_unreachable_predecessor_flags() {
+        for precision in 3..=6 {
+            let minimum = 4 * precision - 4;
+            let length = 1_usize << precision;
+            for offset in [1, 2, 3, 5, 7] {
+                let invalid = minimum + offset;
+                for position in [0, length - 1] {
+                    let mut state = vec![0; length];
+                    state[position] = invalid;
+                    assert!(
+                        matches!(
+                            UltraLogLog::from_state(state),
+                            Err(crate::SketchError::InvalidParameter(_))
+                        ),
+                        "precision={precision}, byte={invalid}, position={position}"
+                    );
+                }
+                assert!(UltraLogLog::from_state(vec![invalid; length]).is_err());
+            }
+        }
     }
 
     // Covers state serialization round-tripping and rejects malformed length
