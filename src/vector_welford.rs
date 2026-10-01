@@ -20,12 +20,19 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Online mean and covariance of fixed-dimension vectors using Welford's algorithm.
+//! Online mean and covariance using a multivariate extension of Welford's algorithm.
 //!
-//! This keeps exact streaming moments in `O(d²)` space for `d` dimensions.
-//! The estimates are subject only to floating-point rounding, unlike the
-//! approximate sketches elsewhere in this crate. Very large finite values can
-//! overflow `f64` intermediate calculations.
+//! This keeps streaming moments without sketch approximation in `O(d²)` space
+//! for `d` dimensions. Means and moments use ordinary `f64` arithmetic. Diagonal
+//! moments remain nonnegative while the calculations remain finite; underflow
+//! can round a positive variance to zero. Rounding does not guarantee that the
+//! full covariance matrix is positive semidefinite. Very large finite values can
+//! overflow intermediate calculations, eventually producing infinity or NaN.
+//!
+//! Covariance updates use the old-mean deviations on both sides of a symmetric
+//! rank-one correction, independently of the rounded updated means. Addition is
+//! the singleton case of the pairwise covariance formula in Philippe Pébay's
+//! [SAND2008-6212, equations (3.1) and (3.12)](https://digital.library.unt.edu/ark:/67531/metadc837537/m2/1/high_res_d/1028931.pdf#page=13).
 
 use crate::SketchError;
 
@@ -43,10 +50,14 @@ use crate::SketchError;
 /// ```
 #[derive(Debug, Clone)]
 pub struct VectorWelford {
+    /// Fixed coordinate count shared by the mean and each matrix row.
     dimension: usize,
+    /// Exact observation count, checked before any update mutates the state.
     count: u64,
+    /// Owned coordinate means; zeroed and unavailable when the count is zero.
     mean: Vec<f64>,
-    // Row-major sum of centered cross products.
+    /// Owned row-major centered cross-product sums with mirrored triangles.
+    /// Finite diagonal entries are nonnegative; full matrix PSD is not promised.
     m2: Vec<f64>,
 }
 
@@ -100,6 +111,12 @@ impl VectorWelford {
     }
 
     /// Adds one finite vector. A rejected observation leaves the state intact.
+    ///
+    /// Uses `delta = value - old_mean` and adds
+    /// `(old_count / new_count) * delta * deltaᵀ` to the centered moment matrix.
+    /// The means are updated separately, so mean rounding does not select one
+    /// coordinate's residual for a covariance correction. Finite input alone
+    /// does not guarantee finite intermediate calculations.
     pub fn add(&mut self, value: &[f64]) -> Result<(), SketchError> {
         if value.len() != self.dimension {
             return Err(SketchError::InvalidParameter("vector dimension must match"));
@@ -125,12 +142,13 @@ impl VectorWelford {
             .map(|(x, mean)| x - mean)
             .collect();
         let n = next_count as f64;
+        let correction = self.count as f64 / n;
         for (mean, difference) in self.mean.iter_mut().zip(&delta) {
             *mean += difference / n;
         }
         for i in 0..self.dimension {
             for j in i..self.dimension {
-                let cross_product = delta[i] * (value[j] - self.mean[j]);
+                let cross_product = weighted_cross_product(delta[i], delta[j], correction);
                 self.m2[i * self.dimension + j] += cross_product;
                 if i != j {
                     self.m2[j * self.dimension + i] = self.m2[i * self.dimension + j];
@@ -143,6 +161,12 @@ impl VectorWelford {
 
     /// Combines independent batches with the same vector dimension.
     /// A failed merge leaves the receiver unchanged.
+    ///
+    /// Adds both centered moment matrices and the symmetric correction
+    /// `(left_count * right_count / total_count) * delta * deltaᵀ`, where
+    /// `delta` is the difference between the original means. The same weighted
+    /// product ordering is used by [`Self::add`]; arbitrary batch partitions can
+    /// still differ through ordinary floating-point rounding.
     pub fn merge(&mut self, other: &Self) -> Result<(), SketchError> {
         if self.dimension != other.dimension {
             return Err(SketchError::IncompatibleSketches(
@@ -177,7 +201,8 @@ impl VectorWelford {
         for i in 0..self.dimension {
             for j in i..self.dimension {
                 let index = i * self.dimension + j;
-                self.m2[index] += other.m2[index] + delta[i] * delta[j] * correction;
+                self.m2[index] +=
+                    other.m2[index] + weighted_cross_product(delta[i], delta[j], correction);
                 if i != j {
                     self.m2[j * self.dimension + i] = self.m2[index];
                 }
@@ -232,9 +257,82 @@ impl VectorWelford {
     }
 }
 
+/// Evaluates a positively weighted cross product with coordinate-independent order.
+///
+/// Callers supply a positive finite weight derived from nonempty batch counts.
+/// A reducing weight scales the larger-magnitude operand first to avoid raw
+/// product overflow without prematurely underflowing the smaller operand.
+/// An increasing weight scales the smaller operand first to protect tiny raw
+/// products from premature underflow and avoid unnecessarily growing the larger
+/// operand. Equal-magnitude operands are interchangeable for finite products.
+/// This preserves nonnegative diagonal corrections, but does not eliminate
+/// rounding or overflow, including nonfinite deviations supplied by callers.
+fn weighted_cross_product(left: f64, right: f64, weight: f64) -> f64 {
+    let (larger, smaller) = if left.abs() >= right.abs() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if weight <= 1.0 {
+        (larger * weight) * smaller
+    } else {
+        larger * (smaller * weight)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_constant_pair_matches_singleton_merge_and_coordinate_permutation() {
+        let e = f64::EPSILON;
+        let expected = vec![vec![0.5, e / 2.0], vec![e / 2.0, e * e / 2.0]];
+        let mut direct = VectorWelford::new(2).unwrap();
+        let mut swapped = VectorWelford::new(2).unwrap();
+        let mut merged = VectorWelford::new(2).unwrap();
+        for value in [[0.0, 1.0], [1.0, 1.0 + e]] {
+            direct.add(&value).unwrap();
+            swapped.add(&[value[1], value[0]]).unwrap();
+            let mut singleton = VectorWelford::new(2).unwrap();
+            singleton.add(&value).unwrap();
+            merged.merge(&singleton).unwrap();
+        }
+
+        let covariance = direct.sample_covariance().unwrap();
+        assert_eq!(covariance, expected);
+        assert_eq!(merged.sample_covariance().unwrap(), expected);
+        let permuted = swapped.sample_covariance().unwrap();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_eq!(permuted[1 - i][1 - j], expected[i][j]);
+            }
+        }
+        let correlation = covariance[0][1] / (covariance[0][0] * covariance[1][1]).sqrt();
+        assert_eq!(correlation, 1.0);
+    }
+
+    #[test]
+    fn large_pair_correction_remains_finite_in_add_and_merge() {
+        let difference = 1.5e154_f64;
+        // Squaring first overflows, although the weighted centered moment fits.
+        assert!(!(difference * difference).is_finite());
+        let expected = (difference * 0.5) * difference;
+        assert!(expected.is_finite());
+
+        let mut direct = VectorWelford::new(1).unwrap();
+        direct.add(&[0.0]).unwrap();
+        direct.add(&[difference]).unwrap();
+        let mut merged = VectorWelford::new(1).unwrap();
+        merged.add(&[0.0]).unwrap();
+        let mut singleton = VectorWelford::new(1).unwrap();
+        singleton.add(&[difference]).unwrap();
+        merged.merge(&singleton).unwrap();
+
+        assert_eq!(direct.sample_variance().unwrap(), vec![expected]);
+        assert_eq!(merged.sample_variance().unwrap(), vec![expected]);
+        assert_eq!(merged.mean(), direct.mean());
+    }
 
     #[test]
     fn moments_match_a_known_two_dimensional_dataset() {
