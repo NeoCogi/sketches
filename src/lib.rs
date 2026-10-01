@@ -41,7 +41,7 @@
 //! - [`minhash::MinHash`] for approximate Jaccard estimation.
 //! - [`lsh_minhash::MinHashLshIndex`] for approximate nearest-neighbor lookup.
 //! - [`reservoir_sampling::ReservoirSampling`] for uniform stream sampling.
-//! - [`vector_welford::VectorWelford`] for exact streaming vector moments.
+//! - [`vector_welford::VectorWelford`] for streaming vector moments without sketch approximation.
 
 use core::fmt;
 use std::collections::hash_map::DefaultHasher;

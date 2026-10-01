@@ -46,7 +46,7 @@ sketches = { path = "../sketches" }
 | MinHash | `minhash` | You need Jaccard similarity between sets | Best default for similarity tasks |
 | MinHash LSH | `lsh_minhash` | You need fast near-duplicate/candidate lookup before reranking | Uses banding over MinHash signatures |
 | Reservoir Sampling | `reservoir_sampling` | You need a uniform sample from an unbounded stream | Fixed-size unbiased sample |
-| Vector Welford's Algorithm | `vector_welford` | You need streaming means, variances, and covariances of numeric vectors | Exact online moments in `O(d²)` space; mergeable |
+| Vector Welford's Algorithm | `vector_welford` | You need streaming means, variances, and covariances of numeric vectors | Online moments using `f64`, without sketch approximation; `O(d²)` space; mergeable |
 | Jaccard trait/helpers | `jacard` | You want a shared Jaccard API across sketches | Provides `JacardIndex` trait |
 
 ## Which Sketch Should I Use?
@@ -74,7 +74,8 @@ If your primary goal is:
 
 ## Vector Welford's Algorithm
 
-`VectorWelford` summarizes fixed-dimension vectors in one pass. It returns
+`VectorWelford` uses a multivariate extension of Welford's scalar variance
+recurrence to summarize fixed-dimension vectors in one pass. It returns
 population moments (divided by `n`) or sample moments (divided by `n - 1`),
 including the full covariance matrix. Empty streams have no mean or moments;
 sample moments need at least two observations. Independently accumulated batches
@@ -95,8 +96,22 @@ assert_eq!(stats.sample_covariance().unwrap()[0][1], 2.0);
 ```
 
 The state uses `O(d²)` memory and each update costs `O(d²)` for `d` coordinates.
-Results follow ordinary `f64` arithmetic, so extreme finite coordinates may
-overflow intermediate calculations.
+Covariance updates use `delta = observation - old_mean` on both sides of the
+symmetric correction `(old_count / new_count) * delta * deltaᵀ`. Means are
+updated separately, so the correction does not depend on a rounded new-mean
+residual. This is the singleton case of the pairwise covariance update in
+[Pébay, SAND2008-6212, equations (3.1) and (3.12)](https://digital.library.unt.edu/ark:/67531/metadc837537/m2/1/high_res_d/1028931.pdf#page=13).
+
+Results follow ordinary `f64` arithmetic. Variances remain nonnegative while
+the calculations remain finite; constant coordinates have zero variance, and
+underflow can round a positive variance to zero. Floating-point rounding does
+not guarantee a positive semidefinite full covariance matrix or identical
+results across arbitrary batch partitions. Extreme finite coordinates may
+overflow intermediate calculations, eventually producing infinity or NaN.
+The accumulator maintains moments without sketch approximation, but does not
+promise exact real arithmetic. The
+[F1 fix record](docs/F1_VECTOR_WELFORD_FIX.md) documents the repaired orientation
+dependence and its regression coverage.
 
 ## MinCount Sketch Parameters and Seeds
 
