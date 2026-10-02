@@ -173,11 +173,13 @@ where
     band_seeds: Vec<u64>,
     hash_family_seed: Option<u64>,
     tables: Vec<HashMap<u64, HashSet<EntryHandle>>>,
+    /// Canonical arena. Each vacant slot occurs exactly once in `free_entries`.
     entries: Vec<Option<Entry<Id>>>,
+    /// Vacant arena handles, reused in LIFO order. No live handle is present.
+    /// Together with `entries.len()`, its length determines the live item count.
     free_entries: Vec<EntryHandle>,
     id_hash_builder: RandomState,
     id_heads: HashMap<u64, EntryHandle>,
-    entry_count: usize,
 }
 
 impl<Id> MinHashLshIndex<Id>
@@ -252,7 +254,6 @@ where
             free_entries: Vec::new(),
             id_hash_builder: RandomState::new(),
             id_heads: HashMap::new(),
-            entry_count: 0,
         })
     }
 
@@ -380,14 +381,14 @@ where
         Ok((log_band_match / rows).exp())
     }
 
-    /// Returns the number of indexed items.
+    /// Returns the number of indexed items in constant time.
     pub fn len(&self) -> usize {
-        self.entry_count
+        self.entries.len() - self.free_entries.len()
     }
 
     /// Returns `true` when no items are indexed.
     pub fn is_empty(&self) -> bool {
-        self.entry_count == 0
+        self.len() == 0
     }
 
     /// Returns `true` when an id is currently indexed.
@@ -433,7 +434,6 @@ where
         let handle = self.allocate_entry(entry);
         self.id_heads.insert(id_hash, handle);
         self.add_handle_to_bands(handle);
-        self.entry_count += 1;
         Ok(())
     }
 
@@ -448,9 +448,9 @@ where
 
         self.remove_handle_from_bands(handle);
         self.unlink_id_handle(handle, id_hash);
+        // Record the vacant slot only after unlinking both lookup indices.
         self.entries[handle.0] = None;
         self.free_entries.push(handle);
-        self.entry_count -= 1;
         true
     }
 
@@ -560,7 +560,6 @@ where
         self.entries.clear();
         self.free_entries.clear();
         self.id_heads.clear();
-        self.entry_count = 0;
         for table in &mut self.tables {
             table.clear();
         }
@@ -629,6 +628,9 @@ where
         self.band_hash(signature, band)
     }
 
+    /// Moves a new canonical entry into one vacant slot or appends a live slot.
+    /// Consuming its free handle preserves the one-to-one vacancy invariant;
+    /// either path increases the derived live count by one.
     fn allocate_entry(&mut self, entry: Entry<Id>) -> EntryHandle {
         if let Some(handle) = self.free_entries.pop() {
             debug_assert!(self.entries[handle.0].is_none());
@@ -1176,6 +1178,105 @@ mod tests {
         assert!(index.remove(&10));
         assert!(!index.remove(&10));
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn derived_len_tracks_every_six_step_two_id_lifecycle() {
+        let signature = signature_for_range(0, 1, 1);
+        // Five operations: insert/replace either ID, remove either ID, clear.
+        // Enumerating all 5^6 histories covers repeated removals, all-hole arenas, reuse,
+        // replacement with/without holes, and clear from every reachable shape.
+        for encoded in 0..5_usize.pow(6) {
+            let mut operations = encoded;
+            let mut index = MinHashLshIndex::new(1, 1).unwrap();
+            let mut present = [false; 2];
+            for _ in 0..6 {
+                match operations % 5 {
+                    value @ 0..=1 => {
+                        index.insert(CollidingId(value as u64), &signature).unwrap();
+                        present[value] = true;
+                    }
+                    operation @ 2..=3 => {
+                        let value = operation - 2;
+                        assert_eq!(index.remove(&CollidingId(value as u64)), present[value]);
+                        present[value] = false;
+                    }
+                    _ => {
+                        index.clear();
+                        present = [false; 2];
+                    }
+                }
+                operations /= 5;
+                let live = present.iter().filter(|&&value| value).count();
+                assert_eq!(index.len(), live);
+                assert_eq!(index.is_empty(), live == 0);
+                let free: std::collections::HashSet<_> =
+                    index.free_entries.iter().copied().collect();
+                assert_eq!(free.len(), index.free_entries.len(), "no duplicate holes");
+                assert_eq!(
+                    index.entries.iter().filter(|entry| entry.is_some()).count(),
+                    live
+                );
+                for (slot, entry) in index.entries.iter().enumerate() {
+                    assert_eq!(free.contains(&super::EntryHandle(slot)), entry.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cloned_sparse_and_all_hole_arenas_reuse_slots_independently() {
+        let signature = signature_for_range(0, 100, 16);
+        let mut index = MinHashLshIndex::new(16, 4).unwrap();
+        for value in 0..4 {
+            index.insert(CollidingId(value), &signature).unwrap();
+        }
+        assert!(index.remove(&CollidingId(1)));
+        assert!(index.remove(&CollidingId(3)));
+        let mut copied = index.clone();
+        for value in [4, 5] {
+            copied.insert(CollidingId(value), &signature).unwrap();
+        }
+        assert_eq!(
+            copied.entries.len(),
+            4,
+            "consume cloned holes before growing"
+        );
+        assert_eq!(copied.len(), 4);
+        assert_eq!(index.len(), 2);
+        for value in [0, 2] {
+            assert!(index.remove(&CollidingId(value)));
+        }
+        assert!(index.is_empty());
+        assert_eq!(
+            index.entries.len(),
+            4,
+            "empty need not mean a zero-length arena"
+        );
+        assert_eq!(index.free_entries.len(), 4);
+
+        let mut empty_copy = index.clone();
+        empty_copy.insert(CollidingId(6), &signature).unwrap();
+        assert_eq!(empty_copy.entries.len(), 4);
+        assert_eq!(empty_copy.len(), 1);
+        assert!(index.is_empty());
+        let mut candidates: Vec<_> = copied
+            .query_candidates(&signature)
+            .unwrap()
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        candidates.sort_unstable();
+        assert_eq!(candidates, [0, 2, 4, 5]);
+        assert_eq!(
+            empty_copy.query_candidates(&signature).unwrap(),
+            [CollidingId(6)]
+        );
+        copied.clear();
+        copied.insert(CollidingId(7), &signature).unwrap();
+        assert_eq!(copied.entries.len(), 1);
+        assert_eq!(copied.len(), 1);
+        assert!(empty_copy.contains_id(&CollidingId(6)));
     }
 
     #[test]
