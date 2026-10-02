@@ -253,6 +253,12 @@ represented or reserved. Storage is reserved before an initialized sketch is
 returned. Reservoir uses the element type's actual container layout; zero-sized
 elements support capacities up to `usize::MAX` without a backing allocation.
 
+MinMax reserves its value table, occupancy bitmap and row seeds before calling
+the value type's `Default` implementation or filling the table. An internal
+reservation failure returns `SketchError::InvalidParameter` without performing
+value initialization, including for zero-sized value types. Successful
+construction retains the same layout, dimensions and seeded row family.
+
 Bloom's `optimal_bit_len` and `optimal_num_hashes` are nonallocating
 recommendations calculated with ordinary `f64` arithmetic. They return errors
 when their rounded formulas exceed `usize` and `u32`, respectively, rather than

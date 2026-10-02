@@ -124,6 +124,10 @@ impl<V: Copy + Default + Ord> MinMaxSketch<V> {
     /// that may later be merged and independently selected seeds for unrelated
     /// sketches.
     ///
+    /// Reserves value, occupancy and row-seed capacities before calling
+    /// `V::default()` or filling the value table. An internal reservation
+    /// failure therefore returns without performing value initialization.
+    ///
     /// # Errors
     ///
     /// Returns [`SketchError::InvalidParameter`] when a dimension is zero, the
@@ -149,27 +153,27 @@ impl<V: Copy + Default + Ord> MinMaxSketch<V> {
             ))?;
         let occupancy_words = table_len.div_ceil(OCCUPANCY_WORD_BITS);
 
-        // Reserve each allocation explicitly so capacity overflow and memory
-        // pressure are reported rather than panicking inside vec![...].
+        // Acquire every backing capacity before initialization. A later
+        // reservation failure must not discard a full table of cloned values,
+        // even for zero-sized values whose reservation needs no allocation.
         let mut values = Vec::new();
         values
             .try_reserve_exact(table_len)
             .map_err(|_| SketchError::InvalidParameter("value table is too large to allocate"))?;
-        values.resize(table_len, V::default());
-
         let mut occupied = Vec::new();
         occupied.try_reserve_exact(occupancy_words).map_err(|_| {
             SketchError::InvalidParameter("occupancy table is too large to allocate")
         })?;
-        occupied.resize(occupancy_words, 0);
-
-        // SplitMix expands the caller seed into one deterministic seed per row.
-        // Row mixing operates on the compact fingerprint, not the original key.
-        let mut seed_stream = SeedStream::new(seed ^ ROW_DOMAIN);
         let mut row_seeds = Vec::new();
         row_seeds
             .try_reserve_exact(depth)
             .map_err(|_| SketchError::InvalidParameter("depth is too large to allocate"))?;
+
+        values.resize(table_len, V::default());
+        occupied.resize(occupancy_words, 0);
+        // SplitMix expands the caller seed into one deterministic seed per row.
+        // Row mixing operates on the compact fingerprint, not the original key.
+        let mut seed_stream = SeedStream::new(seed ^ ROW_DOMAIN);
         row_seeds.extend((0..depth).map(|_| seed_stream.next_u64()));
 
         Ok(Self {

@@ -13,6 +13,7 @@ use std::ptr;
 use sketches::SketchError;
 use sketches::bloom_filter::BloomFilter;
 use sketches::cuckoo_filter::CuckooFilter;
+use sketches::minmax_sketch::MinMaxSketch;
 use sketches::reservoir_sampling::ReservoirSampling;
 use sketches::space_saving::SpaceSaving;
 
@@ -21,6 +22,52 @@ thread_local! {
     static ALLOCATION_BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
     /// Optional accounting restricted to the current operation and test thread.
     static REQUEST_ACCOUNTING: Cell<Option<AllocationRequests>> = const { Cell::new(None) };
+    /// Value callbacks are thread-local so concurrent tests cannot mix counts.
+    static VALUE_INITIALIZATION: Cell<InitializationCalls> = const {
+        Cell::new(InitializationCalls { defaults: 0, clones: 0 })
+    };
+}
+
+/// Observable work performed by MinMax's generic value initialization.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct InitializationCalls {
+    /// Calls to the value type's Default implementation.
+    defaults: usize,
+    /// Calls to Clone when filling additional value cells.
+    clones: usize,
+}
+
+/// Lawful value with either a zero-sized or allocated layout, instrumented only
+/// through test-thread counters. Its ordering and copied value are unchanged.
+#[derive(Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CountedValue<T: Copy>(T);
+
+impl<T: Copy + Default> Default for CountedValue<T> {
+    fn default() -> Self {
+        VALUE_INITIALIZATION.with(|counter| {
+            let mut calls = counter.get();
+            calls.defaults += 1;
+            counter.set(calls);
+        });
+        Self(T::default())
+    }
+}
+
+// The returned value is exactly *self as Copy requires. This test must observe
+// the otherwise redundant Clone calls made by Vec initialization.
+#[expect(
+    clippy::non_canonical_clone_impl,
+    reason = "counts value-fill callbacks"
+)]
+impl<T: Copy> Clone for CountedValue<T> {
+    fn clone(&self) -> Self {
+        VALUE_INITIALIZATION.with(|counter| {
+            let mut calls = counter.get();
+            calls.clones += 1;
+            counter.set(calls);
+        });
+        *self
+    }
 }
 
 /// Layout sizes requested through the allocator, including realloc destinations.
@@ -180,6 +227,135 @@ fn zero_sized_reservoir_needs_no_reservation_allocation() {
     reservoir.extend([(); 4]);
     assert_eq!(reservoir.capacity(), usize::MAX);
     assert_eq!(reservoir.len(), 4);
+}
+
+/// Walks every MinMax reservation boundary for an actual generic layout.
+/// Failure policies end before assertions, successful reuse and value updates.
+fn check_minmax_initialization_order<T: Copy + Default + Ord + std::fmt::Debug>() {
+    let errors = if size_of::<T>() == 0 {
+        &[
+            "occupancy table is too large to allocate",
+            "depth is too large to allocate",
+        ][..]
+    } else {
+        &[
+            "value table is too large to allocate",
+            "occupancy table is too large to allocate",
+            "depth is too large to allocate",
+        ][..]
+    };
+    let expected_requests = errors.len();
+    // Include both sides of occupancy-word boundaries and several row counts.
+    for width in [1, 63, 64, 65, 257] {
+        for depth in [1, 2, 3, 5] {
+            for (allowed, error) in errors
+                .iter()
+                .copied()
+                .map(Some)
+                .chain(std::iter::once(None))
+                .enumerate()
+            {
+                VALUE_INITIALIZATION.with(|counter| counter.set(InitializationCalls::default()));
+                let accounting = RequestScope::start();
+                let result = {
+                    let _failure = FailureScope::after(allowed);
+                    MinMaxSketch::<CountedValue<T>>::new(width, depth, 7)
+                };
+                let requests = accounting.finish();
+                let calls = VALUE_INITIALIZATION.with(Cell::get);
+                if let Some(error) = error {
+                    assert_eq!(result.unwrap_err(), SketchError::InvalidParameter(error));
+                    assert_eq!(requests.requests, allowed + 1);
+                    assert_eq!(
+                        calls,
+                        InitializationCalls::default(),
+                        "width={width} depth={depth} allowed={allowed}"
+                    );
+                } else {
+                    let sketch = result.unwrap();
+                    assert_eq!(requests.requests, expected_requests);
+                    assert_eq!(
+                        calls,
+                        InitializationCalls {
+                            defaults: 1,
+                            clones: width * depth - 1
+                        }
+                    );
+                    assert_eq!(
+                        (sketch.width(), sketch.depth(), sketch.seed()),
+                        (width, depth, 7)
+                    );
+                    assert!(sketch.is_empty());
+                }
+                // Failed and successful attempts leave allocation delegation
+                // usable. The resulting owner supports insert, merge and clear.
+                let mut receiver = MinMaxSketch::<CountedValue<T>>::new(width, depth, 7).unwrap();
+                let mut donor = MinMaxSketch::<CountedValue<T>>::new(width, depth, 7).unwrap();
+                let value = CountedValue(T::default());
+                donor.insert_u64(42, value);
+                receiver.merge(&donor).unwrap();
+                assert_eq!(receiver.estimate_u64(42), Some(value));
+                assert_eq!(donor.estimate_u64(42), Some(value));
+                assert_eq!(receiver.occupied_cells(), depth);
+                receiver.clear();
+                assert!(receiver.is_empty());
+                assert_eq!(receiver.estimate_u64(42), None);
+                receiver.insert_u64(43, value);
+                assert_eq!(receiver.estimate_u64(43), Some(value));
+            }
+        }
+    }
+}
+
+#[test]
+fn minmax_reserves_all_capacities_before_initializing_allocated_values() {
+    check_minmax_initialization_order::<u64>();
+}
+
+#[test]
+fn minmax_reserves_all_capacities_before_initializing_zero_sized_values() {
+    check_minmax_initialization_order::<()>();
+}
+
+#[test]
+fn minmax_invalid_shapes_return_before_reservation_or_value_initialization() {
+    for (width, depth) in [(0, 1), (1, 0), (usize::MAX, 2), (usize::MAX, 1)] {
+        VALUE_INITIALIZATION.with(|counter| counter.set(InitializationCalls::default()));
+        let accounting = RequestScope::start();
+        let result = {
+            let _failure = FailureScope::after(0);
+            MinMaxSketch::<CountedValue<u64>>::new(width, depth, 7)
+        };
+        let requests = accounting.finish();
+        assert!(matches!(result, Err(SketchError::InvalidParameter(_))));
+        assert_eq!(requests.requests, 0);
+        assert_eq!(
+            VALUE_INITIALIZATION.with(Cell::get),
+            InitializationCalls::default()
+        );
+    }
+}
+
+#[test]
+fn minmax_maximum_zero_sized_table_fails_before_initialization() {
+    // This actual ZST layout needs no value allocation. Deny the occupancy
+    // request through valid allocator storage, without permitting a huge fill.
+    VALUE_INITIALIZATION.with(|counter| counter.set(InitializationCalls::default()));
+    let accounting = RequestScope::start();
+    let result = {
+        let _failure = FailureScope::after(0);
+        MinMaxSketch::<CountedValue<()>>::new(usize::MAX, 1, 7)
+    };
+    let requests = accounting.finish();
+    assert_eq!(
+        result.unwrap_err(),
+        SketchError::InvalidParameter("occupancy table is too large to allocate")
+    );
+    assert_eq!(requests.requests, 1);
+    assert_eq!(
+        VALUE_INITIALIZATION.with(Cell::get),
+        InitializationCalls::default()
+    );
 }
 
 /// Owned public state used to compare a summary before and after an operation.
