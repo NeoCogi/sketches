@@ -80,11 +80,10 @@ use std::hash::{Hash, Hasher};
 
 use siphasher::sip::SipHasher13;
 
-use crate::{SketchError, splitmix64};
+use crate::{SeedStream, SketchError, splitmix64};
 
 const WIDTH_NUMERATOR: f64 = 8.0;
 const DEPTH_DENOMINATOR: f64 = 0.826_678_573_184_467_9; // ln(16 / 7)
-const SPLITMIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
 const FINGERPRINT_DOMAIN_A: u64 = 0x243F_6A88_85A3_08D3;
 const FINGERPRINT_DOMAIN_B: u64 = 0x1319_8A2E_0370_7344;
 const ROW_DOMAIN: u64 = 0xA409_3822_299F_31D0;
@@ -435,26 +434,6 @@ fn low_bits_mask(bits: u32) -> u128 {
     }
 }
 
-struct SeedStream {
-    state: u64,
-}
-
-impl SeedStream {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let value = splitmix64(self.state);
-        self.state = self.state.wrapping_add(SPLITMIX_INCREMENT);
-        value
-    }
-
-    fn next_u128(&mut self) -> u128 {
-        (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -464,6 +443,79 @@ mod tests {
     use crate::SketchError;
 
     const SEED: u64 = 0xA409_3822_299F_31D0;
+
+    #[test]
+    fn constructor_family_matches_pre_consolidation_known_answers() {
+        // Captured from a2eec95 before consolidating the three private streams.
+        // These pin domain selection, draw order, coefficient masking and
+        // fingerprint keys; they do not define a public persistence format.
+        for (seed, expected_keys, expected_rows) in [
+            (
+                0,
+                (3220344897584144929, 4302424893936767674),
+                [
+                    (
+                        19108690168469807670,
+                        19237451746714703926,
+                        15324865103565292533,
+                        2042613665800296623,
+                    ),
+                    (
+                        33435958910492608655,
+                        27688369821926676441,
+                        11148395104999164923,
+                        13087875648117700925,
+                    ),
+                    (
+                        24168417062028656287,
+                        33047794973241277459,
+                        4243447111275773229,
+                        8080610225221855973,
+                    ),
+                ],
+            ),
+            (
+                u64::MAX,
+                (5649827988209445395, 17859794324785438928),
+                [
+                    (
+                        384472861175468449,
+                        2790742174192706788,
+                        15934504733587706876,
+                        3448007411196329959,
+                    ),
+                    (
+                        17628243619096906956,
+                        24980025379806964523,
+                        11685109236504888230,
+                        7147721111957379027,
+                    ),
+                    (
+                        14027558704586611865,
+                        26084080940634866781,
+                        7653927699591953604,
+                        662482192770772849,
+                    ),
+                ],
+            ),
+        ] {
+            let sketch = CountSketch::with_dimensions(4, 3, seed).unwrap();
+            assert_eq!(sketch.fingerprint_keys, expected_keys);
+            let rows: Vec<_> = sketch
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.index_multiplier,
+                        row.index_offset,
+                        row.sign_multiplier,
+                        row.sign_offset,
+                    )
+                })
+                .collect();
+            assert_eq!(rows, expected_rows);
+        }
+    }
 
     #[test]
     fn constructor_uses_documented_point_query_bound() {

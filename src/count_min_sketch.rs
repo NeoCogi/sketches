@@ -73,9 +73,8 @@ use std::hash::{Hash, Hasher};
 
 use siphasher::sip::SipHasher13;
 
-use crate::{SketchError, splitmix64};
+use crate::{SeedStream, SketchError, splitmix64};
 
-const SPLITMIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
 const FINGERPRINT_DOMAIN_A: u64 = 0x3C6E_F372_FE94_F82B;
 const FINGERPRINT_DOMAIN_B: u64 = 0xA54F_F53A_5F1D_36F1;
 const ROW_DOMAIN: u64 = 0x510E_527F_ADE6_82D1;
@@ -400,29 +399,6 @@ fn low_bits_mask(bits: u32) -> u128 {
     }
 }
 
-struct SeedStream {
-    state: u64,
-}
-
-impl SeedStream {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        // SplitMix expands one caller seed into a reproducible stream of row
-        // coefficients; advancing the state keeps successive outputs distinct.
-        let value = splitmix64(self.state);
-        self.state = self.state.wrapping_add(SPLITMIX_INCREMENT);
-        value
-    }
-
-    fn next_u128(&mut self) -> u128 {
-        // Multiply-shift works in a domain wider than the 64-bit item ID.
-        (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -432,6 +408,42 @@ mod tests {
     use crate::SketchError;
 
     const SEED: u64 = 0x510E_527F_ADE6_82D1;
+
+    #[test]
+    fn constructor_family_matches_pre_consolidation_known_answers() {
+        // Captured from a2eec95 before consolidating the three private streams.
+        // These pin domain selection, draw order, coefficient masking and
+        // fingerprint keys; they do not define a public persistence format.
+        for (seed, expected_keys, expected_rows) in [
+            (
+                0,
+                (17911839290282890590, 10427329647735435559),
+                [
+                    (12492779109586369090, 32487691980639653829),
+                    (20702482342663171677, 11605361397275190994),
+                    (26159585752856796477, 23611974216041252907),
+                ],
+            ),
+            (
+                u64::MAX,
+                (2748217288011717306, 6687602602813525787),
+                [
+                    (11877971687017686117, 11242010266403128204),
+                    (36486938286563515253, 26388700371199942017),
+                    (32123658571175095933, 14168953691414170850),
+                ],
+            ),
+        ] {
+            let sketch = CountMinSketch::with_dimensions(4, 3, seed).unwrap();
+            assert_eq!(sketch.fingerprint_keys, expected_keys);
+            let rows: Vec<_> = sketch
+                .rows
+                .iter()
+                .map(|row| (row.multiplier, row.offset))
+                .collect();
+            assert_eq!(rows, expected_rows);
+        }
+    }
 
     #[test]
     fn constructor_uses_documented_point_query_bound() {

@@ -70,9 +70,8 @@ use std::hash::{Hash, Hasher};
 
 use siphasher::sip::SipHasher13;
 
-use crate::{SketchError, splitmix64};
+use crate::{SeedStream, SketchError, splitmix64};
 
-const SPLITMIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
 const FINGERPRINT_DOMAIN_A: u64 = 0x6A09_E667_F3BC_C908;
 const FINGERPRINT_DOMAIN_B: u64 = 0xBB67_AE85_84CA_A73B;
 const ROW_DOMAIN: u64 = 0x3C6E_F372_FE94_F82B;
@@ -352,22 +351,6 @@ impl<V: Copy + Default + Ord> MinMaxSketch<V> {
     }
 }
 
-struct SeedStream {
-    state: u64,
-}
-
-impl SeedStream {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let value = splitmix64(self.state);
-        self.state = self.state.wrapping_add(SPLITMIX_INCREMENT);
-        value
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -379,6 +362,37 @@ mod tests {
     use crate::SketchError;
 
     const SEED: u64 = 0x3C6E_F372_FE94_F82B;
+
+    #[test]
+    fn constructor_family_matches_pre_consolidation_known_answers() {
+        // Captured from a2eec95 before consolidating the three private streams.
+        // These pin domain selection, draw order, coefficient masking and
+        // fingerprint keys; they do not define a public persistence format.
+        for (seed, expected_keys, expected_rows) in [
+            (
+                0,
+                (1927618558350093866, 951868706457166525),
+                [
+                    17911839290282890590,
+                    8196980753821780235,
+                    8195237237126968761,
+                ],
+            ),
+            (
+                u64::MAX,
+                (17705017776107185199, 12206057320049235082),
+                [
+                    2748217288011717306,
+                    15719503542151743746,
+                    17519071339639777313,
+                ],
+            ),
+        ] {
+            let sketch = MinMaxSketch::<u16>::new(13, 3, seed).unwrap();
+            assert_eq!(sketch.fingerprint_keys, expected_keys);
+            assert_eq!(&*sketch.row_seeds, &expected_rows);
+        }
+    }
 
     fn assert_same_state<V>(left: &MinMaxSketch<V>, right: &MinMaxSketch<V>)
     where

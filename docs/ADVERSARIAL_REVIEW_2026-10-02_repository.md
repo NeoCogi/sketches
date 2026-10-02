@@ -21,7 +21,19 @@ line references and final-state appendix below describe the original
 | F1 | Addressed | Module, constructor, sizing helpers and README explicitly describe asymptotic sizing and finite probe correlation. Four new regressions exhaust all 512 `(32,22)` base-hash pairs, check an independent-probe control against 16 exhaustive small cases and exact reference values, bridge the model to production, and exercise 608,000 absent queries plus merge/clear/reuse over two identified key distributions. All 19 Bloom tests pass. Production dimensions/probes and the advisory contract remain unchanged; no finite target guarantee is added. |
 | D1 | Addressed | The private-helper reference is plain inline code. Public rustdoc passes with `rustdoc::private_intra_doc_links` denied; the rendered MinHash page retains the persistence/version caveat. The helper remains crate-private and hashing is unchanged. |
 | S1 | Addressed | MinMax reserves values, occupancy and row seeds before value initialization, preserving layouts, error categories and seeded behavior. Four new public allocation regressions cover 100 denied reservation boundaries across 20 shapes each for allocated/ZST values, successful reuse/merge/clear, invalid layouts, and a maximum-sized ZST table. The ordering regressions fail on the old code; 15 MinMax unit tests and all 10 reservation tests pass, and all four MinMax reservation regressions also pass optimized. This promises local reservation ordering, not arbitrary callback-panic rollback or universal OOM recovery. |
-| S2 | Pending | Consolidate constructor coefficient stepping without changing domains or draw order. |
+| S2 | Addressed | One documented crate-private `SeedStream` replaces all three copies and their duplicate increments. Domains, row algorithms, u128 high/low order and caller-owned lifetimes remain unchanged; MinHash and streaming RNG schedules are separate. Five new regressions pin literal words/wrapping, interleaved draw order, independent ownership, row coefficients and fingerprint keys captured before consolidation. Before/after family output and 19,200 public query rows over 60 seeded configurations match byte for byte, including direct-ID updates, merge, clear and reuse. No speed or binary-size improvement is claimed. |
+
+Fresh combined implementation verification: `cargo test --locked --offline`
+passes **292 unit, 25 integration and 22 doctests (339 total)**. All five new
+seed/family regressions and four MinMax reservation regressions pass optimized
+(nine selected release tests, not a complete release suite). All 13 README
+Rust snippets and the three shared-stream consumer examples pass; the Bloom
+example passed with F1. Native Clippy passes across all targets/features with
+warnings denied, public rustdoc passes with all warnings denied, and formatting
+and whitespace checks pass. wasm32 compilation across all targets/features
+passes; the pre-existing test-only `max_standard_error` unused import remains.
+Evidence is outside Cargo targets at `/tmp/sketches-fix-review-20261002/`.
+Each implementation commit is preceded and followed by `cargo clean`.
 
 The original review starts below. Its statement that no source changes were
 made applies to the review invocation only; the later implementation is recorded

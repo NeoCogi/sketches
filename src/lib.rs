@@ -126,12 +126,125 @@ pub(crate) fn seeded_hash64<T: Hash + ?Sized>(item: &T, seed: u64) -> u64 {
     hasher.finish()
 }
 
-/// SplitMix64 mixer used for deriving independent row/hash seeds.
+/// Odd state increment used by the SplitMix64 mixer and constructor stream.
+const SPLITMIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// SplitMix64 mixer used for deterministic row/hash seed derivation.
+///
+/// Adds one increment before mixing. Callers choose their own input schedule;
+/// this function neither owns nor advances any shared state.
 pub(crate) fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = x.wrapping_add(SPLITMIX_INCREMENT);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+/// Constructor-local coefficient stream for Count-Min, Count Sketch and MinMax.
+///
+/// Owns one caller-selected, domain-separated seed and performs no allocation,
+/// callbacks or fallible work. Consumers retain their distinct row algorithms,
+/// domains and coefficient draw order. MinHash's index-based schedule and the
+/// streaming RNGs in KLL/Reservoir deliberately use their own schedules.
+pub(crate) struct SeedStream {
+    /// Input to the next mixer call, advanced with wrapping u64 arithmetic.
+    state: u64,
+}
+
+impl SeedStream {
+    /// Starts at the supplied domain-separated seed without consuming a word.
+    pub(crate) fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Mixes the current input, then advances it by one SplitMix increment.
+    /// The first word is `splitmix64(seed)`; this preserves the original three
+    /// constructors' sequence, including wrapping at the u64 boundary.
+    pub(crate) fn next_u64(&mut self) -> u64 {
+        let value = splitmix64(self.state);
+        self.state = self.state.wrapping_add(SPLITMIX_INCREMENT);
+        value
+    }
+
+    /// Concatenates two successive words: first in the high 64 bits, then low.
+    /// Frequency sketches use this wider domain for multiply-shift coefficients.
+    pub(crate) fn next_u128(&mut self) -> u128 {
+        (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64())
+    }
+}
+
+#[cfg(test)]
+mod seed_stream_tests {
+    use super::SeedStream;
+
+    #[test]
+    fn literal_word_sequences_preserve_initial_phase_and_wrapping() {
+        // Independently evaluated with unsigned Python integer arithmetic,
+        // masking every multiply/add to 64 bits. The u64::MAX case wraps on
+        // the first advance; no production helper computes these expectations.
+        for (seed, words) in [
+            (
+                0,
+                [
+                    0xE220_A839_7B1D_CDAF,
+                    0x6E78_9E6A_A1B9_65F4,
+                    0x06C4_5D18_8009_454F,
+                    0xF88B_B8A8_724C_81EC,
+                    0x1B39_896A_51A8_749B,
+                    0x53CB_9F0C_747E_A2EA,
+                ],
+            ),
+            (
+                1,
+                [
+                    0x910A_2DEC_8902_5CC1,
+                    0xBEEB_8DA1_658E_EC67,
+                    0xF893_A2EE_FB32_555E,
+                    0x71C1_8690_EE42_C90B,
+                    0x71BB_54D8_D101_B5B9,
+                    0xC34D_0BFF_9015_0280,
+                ],
+            ),
+            (
+                u64::MAX,
+                [
+                    0xE4D9_7177_1B65_2C20,
+                    0xE99F_F867_DBF6_82C9,
+                    0x382F_F84C_B272_81E9,
+                    0x6D1D_B36C_CBA9_82D2,
+                    0xB4A0_472E_5780_69AE,
+                    0xD31D_ADBD_A438_BB33,
+                ],
+            ),
+        ] {
+            let mut stream = SeedStream::new(seed);
+            for word in words {
+                assert_eq!(stream.next_u64(), word, "seed={seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn wide_draws_preserve_word_order_consumption_and_independent_ownership() {
+        let mut stream = SeedStream::new(0);
+        let mut untouched = SeedStream::new(0);
+        assert_eq!(
+            stream.next_u128(),
+            0xE220_A839_7B1D_CDAF_6E78_9E6A_A1B9_65F4
+        );
+        assert_eq!(stream.next_u64(), 0x06C4_5D18_8009_454F);
+        assert_eq!(
+            stream.next_u128(),
+            0xF88B_B8A8_724C_81EC_1B39_896A_51A8_749B
+        );
+        assert_eq!(stream.next_u64(), 0x53CB_9F0C_747E_A2EA);
+        // Advancing another owner never changes the newly constructed stream.
+        assert_eq!(untouched.next_u64(), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(
+            untouched.next_u128(),
+            0x6E78_9E6A_A1B9_65F4_06C4_5D18_8009_454F
+        );
+    }
 }
 
 #[cfg(test)]
