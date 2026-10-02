@@ -25,7 +25,7 @@ name = "kll"
 harness = false
 
 [[bench]]
-name = "mincount"
+name = "count_min_sketch"
 harness = false
 
 [[bench]]

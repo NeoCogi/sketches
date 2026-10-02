@@ -22,7 +22,7 @@
 //
 //! Count-Min frequency sketch with conservative updates.
 //!
-//! [`MinCountSketch`] summarizes a non-negative frequency vector. A query
+//! [`CountMinSketch`] summarizes a non-negative frequency vector. A query
 //! returns the minimum of the counters selected by the queried item, so the
 //! result is a one-sided upper estimate of its frequency. Updates use the
 //! conservative rule: mapped counters are raised only as far as needed to make
@@ -30,7 +30,7 @@
 //!
 //! # Error guarantee
 //!
-//! [`MinCountSketch::new`] sizes the table for one fixed, non-adaptive point
+//! [`CountMinSketch::new`] sizes the table for one fixed, non-adaptive point
 //! query. Under the standard independent-hashing model, before counters
 //! saturate, an item's true frequency `f[x]` and estimate `estimate(x)` satisfy
 //!
@@ -50,8 +50,8 @@
 //! cryptographic guarantee.
 //!
 //! Generic [`Hash`] items are fingerprinted once with seed-keyed SipHash before
-//! applying the row functions. [`MinCountSketch::add_u64`] and
-//! [`MinCountSketch::estimate_u64`] avoid that layer when the application
+//! applying the row functions. [`CountMinSketch::add_u64`] and
+//! [`CountMinSketch::estimate_u64`] avoid that layer when the application
 //! already has stable, distinct 64-bit item identifiers.
 //!
 //! # Seeds and merging
@@ -91,17 +91,17 @@ struct RowHash {
 /// # Example
 ///
 /// ```rust
-/// use sketches::mincount_sketch::MinCountSketch;
+/// use sketches::count_min_sketch::CountMinSketch;
 ///
 /// // Choose production seeds independently of the stream. A fixed seed keeps
 /// // this example reproducible.
-/// let mut sketch = MinCountSketch::new(0.01, 0.01, 0x510E_527F_ADE6_82D1).unwrap();
+/// let mut sketch = CountMinSketch::new(0.01, 0.01, 0x510E_527F_ADE6_82D1).unwrap();
 /// sketch.add(&"cat", 2);
 /// sketch.increment(&"cat");
 /// assert!(sketch.estimate(&"cat") >= 3);
 /// ```
 #[derive(Debug, Clone)]
-pub struct MinCountSketch {
+pub struct CountMinSketch {
     width: usize,
     counters: Vec<u64>,
     rows: Box<[RowHash]>,
@@ -110,7 +110,7 @@ pub struct MinCountSketch {
     total_count: u64,
 }
 
-impl MinCountSketch {
+impl CountMinSketch {
     /// Builds a seeded sketch from point-query error parameters.
     ///
     /// `epsilon` and `delta` must be finite and strictly between zero and one.
@@ -428,14 +428,14 @@ mod tests {
     use std::cell::Cell;
     use std::hash::{Hash, Hasher};
 
-    use super::MinCountSketch;
+    use super::CountMinSketch;
     use crate::SketchError;
 
     const SEED: u64 = 0x510E_527F_ADE6_82D1;
 
     #[test]
     fn constructor_uses_documented_point_query_bound() {
-        let sketch = MinCountSketch::new(0.01, 0.01, SEED).unwrap();
+        let sketch = CountMinSketch::new(0.01, 0.01, SEED).unwrap();
         assert_eq!(sketch.width(), 512);
         assert_eq!(sketch.depth(), 5);
         assert!(std::f64::consts::E / sketch.width() as f64 <= 0.01);
@@ -444,29 +444,29 @@ mod tests {
 
     #[test]
     fn constructors_reject_invalid_or_unallocatable_parameters() {
-        assert!(MinCountSketch::new(0.0, 0.1, SEED).is_err());
-        assert!(MinCountSketch::new(0.1, 0.0, SEED).is_err());
-        assert!(MinCountSketch::new(1.0, 0.1, SEED).is_err());
-        assert!(MinCountSketch::new(0.1, 1.0, SEED).is_err());
-        assert!(MinCountSketch::new(f64::NAN, 0.1, SEED).is_err());
-        assert!(MinCountSketch::new(f64::MIN_POSITIVE, 0.5, SEED).is_err());
-        assert!(MinCountSketch::with_dimensions(0, 3, SEED).is_err());
-        assert!(MinCountSketch::with_dimensions(3, 3, SEED).is_err());
-        assert!(MinCountSketch::with_dimensions(4, 0, SEED).is_err());
-        assert!(MinCountSketch::with_dimensions(4, usize::MAX, SEED).is_err());
-        assert!(MinCountSketch::with_dimensions(1_usize << (usize::BITS - 1), 1, SEED).is_err());
+        assert!(CountMinSketch::new(0.0, 0.1, SEED).is_err());
+        assert!(CountMinSketch::new(0.1, 0.0, SEED).is_err());
+        assert!(CountMinSketch::new(1.0, 0.1, SEED).is_err());
+        assert!(CountMinSketch::new(0.1, 1.0, SEED).is_err());
+        assert!(CountMinSketch::new(f64::NAN, 0.1, SEED).is_err());
+        assert!(CountMinSketch::new(f64::MIN_POSITIVE, 0.5, SEED).is_err());
+        assert!(CountMinSketch::with_dimensions(0, 3, SEED).is_err());
+        assert!(CountMinSketch::with_dimensions(3, 3, SEED).is_err());
+        assert!(CountMinSketch::with_dimensions(4, 0, SEED).is_err());
+        assert!(CountMinSketch::with_dimensions(4, usize::MAX, SEED).is_err());
+        assert!(CountMinSketch::with_dimensions(1_usize << (usize::BITS - 1), 1, SEED).is_err());
     }
 
     #[test]
     fn constructor_handles_tiny_positive_delta_without_reciprocal_overflow() {
-        let sketch = MinCountSketch::new(0.9, f64::from_bits(1), SEED).unwrap();
+        let sketch = CountMinSketch::new(0.9, f64::from_bits(1), SEED).unwrap();
         assert_eq!(sketch.width(), 4);
         assert_eq!(sketch.depth(), 745);
     }
 
     #[test]
     fn one_item_stream_is_exact() {
-        let mut sketch = MinCountSketch::with_dimensions(128, 5, SEED).unwrap();
+        let mut sketch = CountMinSketch::with_dimensions(128, 5, SEED).unwrap();
         sketch.add(&"generic", 17);
         sketch.add_u64(42, 23);
         assert_eq!(sketch.estimate(&"generic"), 17);
@@ -476,8 +476,8 @@ mod tests {
 
     #[test]
     fn batched_update_matches_repeated_consecutive_updates() {
-        let mut batched = MinCountSketch::with_dimensions(32, 5, SEED).unwrap();
-        let mut repeated = MinCountSketch::with_dimensions(32, 5, SEED).unwrap();
+        let mut batched = CountMinSketch::with_dimensions(32, 5, SEED).unwrap();
+        let mut repeated = CountMinSketch::with_dimensions(32, 5, SEED).unwrap();
 
         batched.add_u64(7, 100);
         for _ in 0..100 {
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn estimates_never_fall_below_exact_counts_under_collisions() {
         for seed in 0..16 {
-            let mut sketch = MinCountSketch::with_dimensions(32, 5, seed).unwrap();
+            let mut sketch = CountMinSketch::with_dimensions(32, 5, seed).unwrap();
             let mut exact = [0_u64; 128];
             for operation in 0..20_000_u64 {
                 let item = operation.wrapping_mul(104_729) % exact.len() as u64;
@@ -520,7 +520,7 @@ mod tests {
 
         let calls = Cell::new(0);
         let item = CountedHash { calls: &calls };
-        let mut sketch = MinCountSketch::with_dimensions(128, 7, SEED).unwrap();
+        let mut sketch = CountMinSketch::with_dimensions(128, 7, SEED).unwrap();
         sketch.increment(&item);
         assert_eq!(calls.get(), 1);
         assert_eq!(sketch.estimate(&item), 1);
@@ -529,9 +529,9 @@ mod tests {
 
     #[test]
     fn seed_selects_reproducible_hash_families() {
-        let first = MinCountSketch::with_dimensions(128, 7, SEED).unwrap();
-        let second = MinCountSketch::with_dimensions(128, 7, SEED).unwrap();
-        let different = MinCountSketch::with_dimensions(128, 7, SEED + 1).unwrap();
+        let first = CountMinSketch::with_dimensions(128, 7, SEED).unwrap();
+        let second = CountMinSketch::with_dimensions(128, 7, SEED).unwrap();
+        let different = CountMinSketch::with_dimensions(128, 7, SEED + 1).unwrap();
 
         assert_eq!(first.seed(), SEED);
         assert_eq!(first.rows, second.rows);
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn clear_resets_counts_but_retains_configuration() {
-        let mut sketch = MinCountSketch::with_dimensions(64, 5, SEED).unwrap();
+        let mut sketch = CountMinSketch::with_dimensions(64, 5, SEED).unwrap();
         sketch.add_u64(7, 10);
         sketch.clear();
 
@@ -554,8 +554,8 @@ mod tests {
 
     #[test]
     fn merge_preserves_upper_bounds_and_checks_configuration() {
-        let mut left = MinCountSketch::with_dimensions(64, 5, SEED).unwrap();
-        let mut right = MinCountSketch::with_dimensions(64, 5, SEED).unwrap();
+        let mut left = CountMinSketch::with_dimensions(64, 5, SEED).unwrap();
+        let mut right = CountMinSketch::with_dimensions(64, 5, SEED).unwrap();
         left.add_u64(7, 10);
         right.add_u64(7, 15);
         right.add_u64(8, 4);
@@ -565,7 +565,7 @@ mod tests {
         assert!(left.estimate_u64(8) >= 4);
         assert_eq!(left.total_count(), 29);
 
-        let different_width = MinCountSketch::with_dimensions(128, 5, SEED).unwrap();
+        let different_width = CountMinSketch::with_dimensions(128, 5, SEED).unwrap();
         assert_eq!(
             left.merge(&different_width),
             Err(SketchError::IncompatibleSketches(
@@ -573,7 +573,7 @@ mod tests {
             ))
         );
 
-        let different_seed = MinCountSketch::with_dimensions(64, 5, SEED + 1).unwrap();
+        let different_seed = CountMinSketch::with_dimensions(64, 5, SEED + 1).unwrap();
         assert_eq!(
             left.merge(&different_seed),
             Err(SketchError::IncompatibleSketches(
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn arithmetic_saturates_instead_of_wrapping() {
-        let mut sketch = MinCountSketch::with_dimensions(32, 5, SEED).unwrap();
+        let mut sketch = CountMinSketch::with_dimensions(32, 5, SEED).unwrap();
         sketch.add_u64(7, u64::MAX);
         sketch.increment_u64(7);
 

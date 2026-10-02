@@ -23,7 +23,7 @@
 //! Probabilistic data structures for scalable approximate analytics.
 //!
 //! The crate currently exposes:
-//! - [`mincount_sketch::MinCountSketch`] for approximate non-negative frequency
+//! - [`count_min_sketch::CountMinSketch`] for approximate non-negative frequency
 //!   estimation.
 //! - [`minmax_sketch::MinMaxSketch`] for approximate ordered-value lookup.
 //! - [`hyperloglog::HyperLogLog`] for approximate cardinality estimation.
@@ -48,13 +48,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub mod bloom_filter;
+pub mod count_min_sketch;
 pub mod count_sketch;
 pub mod cuckoo_filter;
 pub mod hyperloglog;
 pub mod jacard;
 pub mod kll;
 pub mod lsh_minhash;
-pub mod mincount_sketch;
 pub mod minhash;
 pub mod minmax_sketch;
 pub mod reservoir_sampling;

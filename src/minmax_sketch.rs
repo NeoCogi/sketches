@@ -30,7 +30,7 @@
 //! `value`. It is exact when at least one selected cell has not collided with a
 //! smaller value.
 //!
-//! This is not a frequency sketch. Use [`crate::mincount_sketch::MinCountSketch`]
+//! This is not a frequency sketch. Use [`crate::count_min_sketch::CountMinSketch`]
 //! for non-negative frequency estimation.
 //!
 //! # Keys and values

@@ -20,11 +20,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use sketches::mincount_sketch::MinCountSketch;
+use sketches::count_min_sketch::CountMinSketch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seed = 0x510E_527F_ADE6_82D1;
-    let mut sketch = MinCountSketch::new(0.01, 0.01, seed)?;
+    let mut sketch = CountMinSketch::new(0.01, 0.01, seed)?;
 
     sketch.add(&"GET /api/users", 10);
     sketch.add(&"GET /api/health", 2);

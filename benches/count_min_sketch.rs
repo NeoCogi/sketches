@@ -23,7 +23,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use sketches::mincount_sketch::MinCountSketch;
+use sketches::count_min_sketch::CountMinSketch;
 
 const OPERATIONS: usize = 1_000_000;
 const WIDTH: usize = 8_192;
@@ -43,10 +43,10 @@ fn item_id(index: usize) -> u64 {
 
 fn main() {
     let items: Vec<u64> = (0..65_536).map(item_id).collect();
-    println!("MinCount conservative-update benchmark");
+    println!("Count-Min conservative-update benchmark");
     println!("operation\tops/s");
 
-    let mut generic = MinCountSketch::with_dimensions(WIDTH, DEPTH, SEED).unwrap();
+    let mut generic = CountMinSketch::with_dimensions(WIDTH, DEPTH, SEED).unwrap();
     let started = Instant::now();
     for operation in 0..OPERATIONS {
         generic.increment(black_box(&items[operation % items.len()]));
@@ -57,7 +57,7 @@ fn main() {
     );
     black_box(&generic);
 
-    let mut direct = MinCountSketch::with_dimensions(WIDTH, DEPTH, SEED).unwrap();
+    let mut direct = CountMinSketch::with_dimensions(WIDTH, DEPTH, SEED).unwrap();
     let started = Instant::now();
     for operation in 0..OPERATIONS {
         direct.increment_u64(black_box(items[operation % items.len()]));

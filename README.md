@@ -37,7 +37,7 @@ sketches = { path = "../sketches" }
 | Cuckoo Filter | `cuckoo_filter` | You need membership checks and deletions | Delete only items known to have been inserted; inserts can fail at high load |
 | HyperLogLog | `hyperloglog` | You need approximate distinct counts (`COUNT(DISTINCT ...)`) | Mergeable; target standard errors below `0.00203125` are unsupported |
 | UltraLogLog | `ultraloglog` | You want a more space-efficient mergeable distinct counter | One-byte registers; fast FGRA and accuracy-first MLE estimators |
-| MinCount Sketch | `mincount_sketch` | You need approximate non-negative frequency counts | Count-Min with conservative updates; estimates are one-sided upper bounds |
+| Count-Min Sketch | `count_min_sketch` | You need approximate non-negative frequency counts | Count-Min with conservative updates; estimates are one-sided upper bounds |
 | MinMax Sketch | `minmax_sketch` | You need to compress a fixed key-to-ordered-value mapping | Insert-min/query-max; estimates for inserted keys are one-sided lower bounds |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
 | Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
@@ -63,7 +63,7 @@ If your primary goal is:
   below before using them.
 - Membership without delete: use `BloomFilter`.
 - Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
-- Approximate frequency (non-negative): use `MinCountSketch`.
+- Approximate frequency (non-negative): use `CountMinSketch`.
 - Approximate frequency (signed +/- updates): use `CountSketch`.
 - Compact ordered values such as quantile-bucket indices: use `MinMaxSketch`.
 - Heavy hitters / top-k: use `SpaceSaving`.
@@ -111,18 +111,18 @@ overflow intermediate calculations, eventually producing infinity or NaN.
 The accumulator maintains moments without sketch approximation, but does not
 promise exact real arithmetic.
 
-## MinCount Sketch Parameters and Seeds
+## Count-Min Sketch Parameters and Seeds
 
-`MinCountSketch` is a Count-Min frequency sketch with conservative updates. It
+`CountMinSketch` is a Count-Min frequency sketch with conservative updates. It
 supports non-negative updates and returns a one-sided upper estimate. The seed
 selects the fingerprint and row-hash families; choose it independently of the
 stream and reuse it only for sketches that may later be merged:
 
 ```rust
-use sketches::mincount_sketch::MinCountSketch;
+use sketches::count_min_sketch::CountMinSketch;
 
 let seed = 0x510E_527F_ADE6_82D1;
-let mut counts = MinCountSketch::new(0.01, 0.01, seed)?;
+let mut counts = CountMinSketch::new(0.01, 0.01, seed)?;
 counts.add(&"GET /api/users", 10);
 assert!(counts.estimate(&"GET /api/users") >= 10);
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -640,7 +640,7 @@ cargo run --example hyperloglog
 cargo run --example jacard
 cargo run --example minhash
 cargo run --example lsh_minhash
-cargo run --example mincount_sketch
+cargo run --example count_min_sketch
 cargo run --example minmax_sketch
 cargo run --example count_sketch
 cargo run --example space_saving
