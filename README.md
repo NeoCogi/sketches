@@ -249,11 +249,11 @@ assert_eq!(sketch.estimate_u64(42), 7);
 
 ## Constructor Sizing and Reservations
 
-Bloom, Cuckoo and Reservoir constructors return `SketchError::InvalidParameter`
-when their requested backing storage cannot be represented or reserved. Storage
-is reserved before an initialized sketch is returned. Reservoir uses the
-element type's actual container layout; zero-sized elements support capacities
-up to `usize::MAX` without a backing allocation.
+Bloom, Cuckoo, Reservoir and Space-Saving constructors return
+`SketchError::InvalidParameter` when their requested backing storage cannot be
+represented or reserved. Storage is reserved before an initialized sketch is
+returned. Reservoir uses the element type's actual container layout; zero-sized
+elements support capacities up to `usize::MAX` without a backing allocation.
 
 Bloom's `optimal_bit_len` and `optimal_num_hashes` are nonallocating
 recommendations calculated with ordinary `f64` arithmetic. They return errors
@@ -262,6 +262,13 @@ clipping the dimensions. A representable recommendation does not establish that
 its backing storage fits available memory; construction performs that separate
 reservation. The target false-positive rate retains its existing statistical
 sizing meaning.
+
+Space-Saving also reserves every temporary and rebuilt buffer in `merge`
+fallibly. Reservation errors leave both summaries unchanged; the replacement
+is committed only after reconstruction succeeds. Its constructor reserves the
+lookup table and counter arena, while later insertions grow count buckets and
+allocate items. Other operations, including cloning and materialized queries,
+retain their existing allocation behavior.
 
 ## Cuckoo Filter Parameters
 

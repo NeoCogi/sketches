@@ -66,7 +66,8 @@ pub mod vector_welford;
 /// Errors returned by sketch construction, update, query, and merge operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SketchError {
-    /// Returned when a constructor receives an invalid argument.
+    /// Returned for invalid arguments or unsupported dimensions/storage at
+    /// operations that document fallible sizing and reservation.
     InvalidParameter(&'static str),
     /// Returned when combining two sketches that are not shape-compatible.
     IncompatibleSketches(&'static str),

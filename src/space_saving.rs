@@ -150,8 +150,12 @@ where
 {
     /// Creates a sketch with the given number of tracked counters.
     ///
+    /// Reserves the lookup table and counter arena before returning an owner.
+    /// Count-bucket storage and item allocations grow during later insertions.
+    ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] when `capacity == 0`.
+    /// Returns [`SketchError::InvalidParameter`] when `capacity == 0` or the
+    /// initial lookup/counter storage cannot be represented or reserved.
     pub fn new(capacity: usize) -> Result<Self, SketchError> {
         if capacity == 0 {
             return Err(SketchError::InvalidParameter(
@@ -159,7 +163,7 @@ where
             ));
         }
 
-        Ok(Self::empty_with_capacity(capacity))
+        Self::empty_with_capacity(capacity)
     }
 
     /// Returns the maximum number of tracked counters.
@@ -294,10 +298,14 @@ where
     /// eight stable counting passes order the retained `u64` estimates without
     /// introducing an `O(capacity * log(capacity))` comparison sort. The total
     /// stream length is combined separately and saturates at [`u64::MAX`]. The
-    /// receiver remains unchanged if compatibility validation fails.
+    /// receiver remains unchanged if compatibility validation or any internal
+    /// storage reservation fails. The donor is always borrowed immutably.
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when capacities differ.
+    /// Returns [`SketchError::InvalidParameter`] when the temporary or rebuilt
+    /// storage cannot be represented or reserved. Hashing/equality and item
+    /// destructors retain their caller-defined behavior.
     ///
     /// [parallel Space-Saving construction]: https://arxiv.org/pdf/1401.0702
     pub fn merge(&mut self, other: &Self) -> Result<(), SketchError> {
@@ -309,7 +317,13 @@ where
 
         let self_min = self.untracked_upper_bound();
         let other_min = other.untracked_upper_bound();
-        let mut combined = Vec::with_capacity(self.lookup.len().saturating_add(other.lookup.len()));
+        let combined_len = self.lookup.len().checked_add(other.lookup.len()).ok_or(
+            SketchError::InvalidParameter("combined entry count exceeds usize"),
+        )?;
+        let mut combined = Vec::new();
+        combined.try_reserve_exact(combined_len).map_err(|_| {
+            SketchError::InvalidParameter("combined entries cannot be represented or reserved")
+        })?;
 
         for (item, &self_counter) in &self.lookup {
             let self_entry = self.counter_entry(self_counter);
@@ -349,21 +363,35 @@ where
         }
 
         let total_count = self.total_count.saturating_add(other.total_count);
-        *self = Self::from_entries(self.capacity, total_count, &combined);
+        // Commit only after every reservation and reconstruction succeeds;
+        // all preceding mutations are confined to independent temporary state.
+        let replacement = Self::from_entries(self.capacity, total_count, &combined)?;
+        *self = replacement;
         Ok(())
     }
 
-    fn empty_with_capacity(capacity: usize) -> Self {
-        Self {
+    /// Builds an empty owner with all lookup and counter capacity reserved.
+    /// Callers validate positive capacity. Reservation errors discard only
+    /// local storage; bucket arenas remain lazy for ordinary ingestion.
+    fn empty_with_capacity(capacity: usize) -> Result<Self, SketchError> {
+        let mut lookup = HashMap::new();
+        lookup.try_reserve(capacity).map_err(|_| {
+            SketchError::InvalidParameter("lookup storage cannot be represented or reserved")
+        })?;
+        let mut counters = Vec::new();
+        counters.try_reserve_exact(capacity).map_err(|_| {
+            SketchError::InvalidParameter("counter storage cannot be represented or reserved")
+        })?;
+        Ok(Self {
             capacity,
-            lookup: HashMap::with_capacity(capacity),
-            counters: Vec::with_capacity(capacity),
+            lookup,
+            counters,
             buckets: Vec::new(),
             free_buckets: Vec::new(),
             minimum_bucket: None,
             maximum_bucket: None,
             total_count: 0,
-        }
+        })
     }
 
     fn insert_new_counter(&mut self, item: T) {
@@ -565,10 +593,32 @@ where
             .expect("active bucket handle points to a bucket")
     }
 
-    fn from_entries(capacity: usize, total_count: u64, entries: &[(Arc<T>, CounterEntry)]) -> Self {
-        let mut summary = Self::empty_with_capacity(capacity);
+    /// Reconstructs a separate owner from at most capacity retained entries.
+    /// All entries have distinct keys. Existing immutable item allocations
+    /// are shared through Arc; counter/bucket links belong only to the new owner.
+    /// Every required storage reservation succeeds before linking begins.
+    fn from_entries(
+        capacity: usize,
+        total_count: u64,
+        entries: &[(Arc<T>, CounterEntry)],
+    ) -> Result<Self, SketchError> {
+        debug_assert!(entries.len() <= capacity);
+        let mut summary = Self::empty_with_capacity(capacity)?;
         summary.total_count = total_count;
-        let order = Self::radix_order(entries);
+        let order = Self::radix_order(entries)?;
+        // Reserve only the distinct count groups, rather than one bucket per
+        // entry. Building the ordered list then requires no further allocation.
+        let bucket_count = usize::from(!order.is_empty())
+            + order
+                .windows(2)
+                .filter(|pair| entries[pair[0]].1.count != entries[pair[1]].1.count)
+                .count();
+        summary
+            .buckets
+            .try_reserve_exact(bucket_count)
+            .map_err(|_| {
+                SketchError::InvalidParameter("bucket storage cannot be represented or reserved")
+            })?;
         let mut current_bucket = None;
         let mut current_count = None;
 
@@ -596,15 +646,24 @@ where
             summary.lookup.insert(Arc::clone(item), counter);
         }
 
-        summary
+        Ok(summary)
     }
 
     /// Returns entry indices ordered by their `u64` counts. Eight byte-wise
     /// stable counting passes keep Stream-Summary reconstruction linear in the
     /// number of retained counters.
-    fn radix_order(entries: &[(Arc<T>, CounterEntry)]) -> Vec<usize> {
-        let mut order: Vec<_> = (0..entries.len()).collect();
-        let mut scratch = vec![0; entries.len()];
+    /// Reserves both index buffers fallibly before the counting passes.
+    fn radix_order(entries: &[(Arc<T>, CounterEntry)]) -> Result<Vec<usize>, SketchError> {
+        let mut order = Vec::new();
+        order.try_reserve_exact(entries.len()).map_err(|_| {
+            SketchError::InvalidParameter("radix order cannot be represented or reserved")
+        })?;
+        order.extend(0..entries.len());
+        let mut scratch = Vec::new();
+        scratch.try_reserve_exact(entries.len()).map_err(|_| {
+            SketchError::InvalidParameter("radix scratch cannot be represented or reserved")
+        })?;
+        scratch.resize(entries.len(), 0);
 
         for shift in (0..u64::BITS).step_by(8) {
             let mut counts = [0_usize; 256];
@@ -629,7 +688,7 @@ where
             std::mem::swap(&mut order, &mut scratch);
         }
 
-        order
+        Ok(order)
     }
 }
 
@@ -639,7 +698,90 @@ mod tests {
     use std::fmt::Debug;
     use std::hash::Hash;
 
-    use super::SpaceSaving;
+    use super::{CounterEntry, SpaceSaving};
+    use crate::SketchError;
+    use std::sync::Arc;
+
+    #[test]
+    fn impossible_initial_and_rebuilt_layouts_return_errors() {
+        let item = Arc::new(7_u64);
+        let entries = [(Arc::clone(&item), CounterEntry { count: 3, error: 1 })];
+        for capacity in [1usize << (usize::BITS - 1), usize::MAX] {
+            assert!(matches!(
+                SpaceSaving::<u64>::new(capacity),
+                Err(SketchError::InvalidParameter(_))
+            ));
+            assert!(matches!(
+                SpaceSaving::from_entries(capacity, 3, &entries),
+                Err(SketchError::InvalidParameter(_))
+            ));
+            assert_eq!(Arc::strong_count(&item), 2);
+        }
+    }
+
+    #[test]
+    fn reconstruction_groups_every_u64_byte_and_preserves_shared_items() {
+        let counts = [
+            2,
+            1,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            1_u64 << 24,
+            1_u64 << 32,
+            1_u64 << 40,
+            1_u64 << 48,
+            1_u64 << 56,
+            u64::MAX,
+        ];
+        let entries: Vec<_> = counts
+            .into_iter()
+            .rev()
+            .enumerate()
+            .flat_map(|(index, count)| {
+                // Two distinct keys at every count exercise shared buckets
+                // while the unsorted counts cross all eight radix passes.
+                (0..2).map(move |copy| {
+                    (
+                        Arc::new((index * 2 + copy) as u64),
+                        CounterEntry {
+                            count,
+                            error: count / 2,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let mut summary = SpaceSaving::from_entries(entries.len(), u64::MAX, &entries).unwrap();
+        assert_stream_summary_invariants(&summary);
+        assert_eq!(summary.buckets.len(), counts.len());
+        assert_eq!(summary.total_count(), u64::MAX);
+        for (item, entry) in &entries {
+            assert_eq!(
+                summary.estimate_with_error(item),
+                Some((entry.count, entry.error))
+            );
+            assert_eq!(Arc::strong_count(item), 3);
+        }
+        summary.clear();
+        assert_stream_summary_invariants(&summary);
+        assert!(entries.iter().all(|(item, _)| Arc::strong_count(item) == 1));
+        summary.insert(100);
+        assert_eq!(summary.estimate(&100), Some(1));
+        assert_stream_summary_invariants(&summary);
+    }
+
+    #[test]
+    fn empty_reconstruction_retains_capacity_and_supports_ingestion() {
+        let mut summary = SpaceSaving::<u64>::from_entries(3, 0, &[]).unwrap();
+        assert_eq!(summary.capacity(), 3);
+        assert!(summary.is_empty());
+        assert_stream_summary_invariants(&summary);
+        summary.insert(7);
+        assert_eq!(summary.estimate(&7), Some(1));
+        assert_stream_summary_invariants(&summary);
+    }
 
     fn insert_repeated<T>(sketch: &mut SpaceSaving<T>, item: T, count: u64)
     where
