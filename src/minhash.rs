@@ -133,6 +133,17 @@ impl MinHash {
     /// Returns [`SketchError::InvalidParameter`] when `max_standard_error` is
     /// non-finite, non-positive, or requires an unrepresentable or unallocatable
     /// signature. Width validation finishes before sketch allocation.
+    ///
+    /// # Example
+    /// ```rust
+    /// use sketches::minhash::MinHash;
+    ///
+    /// let target = f64::from_bits(0x3FBE_2B7D_DDFE_FA66);
+    /// let sketch = MinHash::with_error_rate(target)?;
+    /// assert_eq!(sketch.num_hashes(), 19);
+    /// assert!(sketch.worst_case_standard_error() <= target);
+    /// # Ok::<(), sketches::SketchError>(())
+    /// ```
     pub fn with_error_rate(max_standard_error: f64) -> Result<Self, SketchError> {
         let num_hashes = required_hashes_for_max_standard_error(max_standard_error)?;
         Self::new(num_hashes)
@@ -288,7 +299,7 @@ fn max_standard_error(num_hashes: usize) -> f64 {
 
 /// Selects a representable width satisfying the reported error target.
 ///
-/// The floating inverse gives an initial conservative candidate; its rounded
+/// The floating inverse gives an initial candidate; its rounded
 /// ceiling can still undersize a boundary, so verify the shared error calculation
 /// and use checked increments before allocating. This promises the rounded
 /// accessor postcondition, not exact-real minimality or a fixed correction count.
@@ -326,8 +337,11 @@ impl JacardIndex for MinHash {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_HASH_FAMILY_SEED, MinHash};
-    use crate::splitmix64;
+    use super::{
+        DEFAULT_HASH_FAMILY_SEED, MinHash, max_standard_error,
+        required_hashes_for_max_standard_error,
+    };
+    use crate::{SketchError, splitmix64};
 
     fn sketch_for_range(start: u64, end: u64, num_hashes: usize) -> MinHash {
         let mut sketch = MinHash::new(num_hashes).unwrap();
@@ -408,6 +422,164 @@ mod tests {
             sketch.worst_case_standard_error()
         );
         assert_eq!(sketch.num_hashes(), 19);
+    }
+
+    #[test]
+    fn error_rate_constructor_checks_every_small_width_boundary() {
+        for width in 1..=512 {
+            let edge = 0.5 / (width as f64).sqrt();
+            let targets = [
+                f64::from_bits(edge.to_bits() - 1),
+                edge,
+                f64::from_bits(edge.to_bits() + 1),
+            ];
+            for (index, target) in targets.into_iter().enumerate() {
+                let sketch = MinHash::with_error_rate(target).unwrap();
+                assert!(
+                    sketch.worst_case_standard_error() <= target,
+                    "width={width}, target={target:?}, selected={}",
+                    sketch.num_hashes()
+                );
+                assert!(sketch.num_hashes() >= width);
+                if index == 0 {
+                    // The target is strictly below the reported error for this
+                    // width; allowing that width would repeat the original bug.
+                    assert!(sketch.num_hashes() > width);
+                }
+                assert_eq!(sketch.component_seeds.len(), sketch.num_hashes());
+                assert!(sketch.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn error_rate_constructor_allows_conservative_rounded_widths() {
+        let target = f64::from_bits(0x3FD6_A09E_667F_3BCC);
+        let explicit = MinHash::new(2).unwrap();
+        assert_eq!(explicit.worst_case_standard_error(), target);
+
+        // The rounded inverse squares to slightly above two. Convenience
+        // sizing preserves that ceiling instead of promising a minimal width
+        // under either exact-real or rounded-accessor arithmetic.
+        let sketch = MinHash::with_error_rate(target).unwrap();
+        assert_eq!(sketch.num_hashes(), 3);
+        assert!(sketch.worst_case_standard_error() <= target);
+    }
+
+    #[test]
+    fn error_sizing_covers_every_binary_exponent_without_large_allocations() {
+        let invalid =
+            SketchError::InvalidParameter("standard error must be finite and greater than zero");
+        for target in [
+            0.0,
+            -0.0,
+            -f64::from_bits(1),
+            -1.0,
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                required_hashes_for_max_standard_error(target),
+                Err(invalid.clone())
+            );
+            assert_eq!(MinHash::with_error_rate(target).unwrap_err(), invalid);
+        }
+
+        for exponent in -1074_i32..=1023 {
+            let target = if exponent < -1022 {
+                f64::from_bits(1_u64 << (exponent + 1074))
+            } else {
+                f64::from_bits(((exponent + 1023) as u64) << 52)
+            };
+            // For an exact power-of-two target, k = 2^(-2*exponent-2).
+            // Derive expected dimensions with integer exponents, not inversion
+            // or square roots. Test the pure owner to avoid enormous storage.
+            let width_exponent = -2 * exponent - 2;
+            let expected = if width_exponent <= 0 {
+                Ok(1)
+            } else if width_exponent < usize::BITS as i32 {
+                Ok(1_usize << width_exponent)
+            } else {
+                Err(SketchError::InvalidParameter(
+                    "requested standard error requires too many hashes",
+                ))
+            };
+            assert_eq!(
+                required_hashes_for_max_standard_error(target),
+                expected,
+                "exponent={exponent}, target={target:?}"
+            );
+        }
+
+        for target in [0.5, f64::from_bits(0.5_f64.to_bits() + 1), 1.0, f64::MAX] {
+            let sketch = MinHash::with_error_rate(target).unwrap();
+            assert_eq!(sketch.num_hashes(), 1);
+            assert!(sketch.worst_case_standard_error() <= target);
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn error_sizing_repeats_correction_across_large_float_plateaus() {
+        let target = f64::from_bits(0x3E1E_2B7D_DDFE_FA66);
+        let initial = 81_064_793_292_668_912_usize;
+        assert!(max_standard_error(initial) > target);
+        assert!(max_standard_error(initial + 1) > target);
+
+        let selected = required_hashes_for_max_standard_error(target).unwrap();
+        assert!(selected >= initial + 2);
+        assert!(max_standard_error(selected) <= target);
+        // This checks representable dimensions only, without constructing a
+        // signature whose memory requirement is far above available storage.
+    }
+
+    #[test]
+    fn corrected_width_preserves_owned_signatures_and_lifecycle() {
+        let target = f64::from_bits(0x3FBE_2B7D_DDFE_FA66);
+        let mut sized = MinHash::with_error_rate(target).unwrap();
+        let mut explicit = MinHash::new(19).unwrap();
+        assert_eq!(sized.component_seeds, explicit.component_seeds);
+        assert_ne!(
+            sized.component_seeds.as_ptr(),
+            explicit.component_seeds.as_ptr()
+        );
+        for value in [0_u64, 1, 7, 19, u64::MAX, 1, 19] {
+            sized.add(&value);
+            explicit.add(&value);
+        }
+        assert_eq!(sized.signature(), explicit.signature());
+        assert_eq!(sized.estimate_jaccard(&explicit), Ok(1.0));
+
+        let mut donor = MinHash::new(19).unwrap();
+        for value in 19_u64..33 {
+            donor.add(&value);
+            explicit.add(&value);
+        }
+        let donor_before = donor.clone();
+        sized.merge(&donor).unwrap();
+        assert_eq!(sized.signature(), explicit.signature());
+        assert_eq!(donor.signature(), donor_before.signature());
+        assert_eq!(donor.component_seeds, donor_before.component_seeds);
+
+        let before = sized.clone();
+        assert!(matches!(
+            sized.merge(&MinHash::new(18).unwrap()),
+            Err(SketchError::IncompatibleSketches(_))
+        ));
+        assert_eq!(sized.signature(), before.signature());
+        assert_eq!(sized.component_seeds, before.component_seeds);
+        assert_eq!(sized.observed_any, before.observed_any);
+
+        sized.clear();
+        assert!(sized.is_empty());
+        assert_eq!(sized.signature(), &[u64::MAX; 19]);
+        assert_eq!(sized.component_seeds, before.component_seeds);
+        sized.add(&7_u64);
+        let mut fresh = MinHash::new(19).unwrap();
+        fresh.add(&7_u64);
+        assert_eq!(sized.signature(), fresh.signature());
     }
 
     #[test]
