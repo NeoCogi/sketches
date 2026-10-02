@@ -527,6 +527,29 @@ Different seeds prevent independently built shards from making correlated
 compaction choices. A shared RNG, if desired, is used only by the caller to
 produce initial seeds; sketches never share an RNG while processing values.
 
+## Reservoir Sampling Contract
+
+`ReservoirSampling::new(capacity, seed)` implements Algorithm R with an owned
+sample buffer and random stream. Under the independent uniform random-word
+model, each stream position has inclusion probability
+`min(1, capacity / observations_seen)`. Repeated values are separate stream
+positions. This is the usual pseudorandom sampling model; choose seeds
+independently when independent samples are needed.
+
+Once the reservoir is full, replacement uses rejection sampling to draw a
+uniform integer in `0..observations_seen`. It discards the incomplete prefix of
+the `u64` range before reducing modulo the bound, removing the bias of direct
+modulo reduction. This takes fewer than two random words on average under the
+model, with `O(capacity)` retained storage. The same seed and input reproduce
+the same sample, though rejection can change samples produced by the older
+modulo-only implementation.
+
+The observation count is exact up to `u64::MAX`; a further `add` panics before
+changing the counter, sample or RNG. `extend` commits each item in order, so
+an overflow preserves its completed prefix. `clear` drops retained items and
+resets the count while continuing the existing random stream. Construct a new
+sampler with the original seed to replay that stream from the beginning.
+
 ## Quick Examples
 
 Approximate distinct counting:

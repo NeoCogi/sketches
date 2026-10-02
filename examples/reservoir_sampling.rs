@@ -23,7 +23,9 @@
 use sketches::reservoir_sampling::ReservoirSampling;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Keep a uniform sample of 10 elements from a stream.
+    // Keep 10 stream positions using unbiased bounded replacement draws.
+    // This fixed seed makes the example reproducible; choose independent seeds
+    // when independent samples are required.
     let mut reservoir = ReservoirSampling::new(10, 42)?;
 
     // Stream 1,000 sequential values.
