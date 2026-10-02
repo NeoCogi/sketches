@@ -68,8 +68,13 @@ impl<T> ReservoirSampling<T> {
     /// when independent samples are required. Rejection sampling can consume
     /// several random words for one replacement decision.
     ///
+    /// Storage for the complete sample is reserved before construction
+    /// succeeds. Zero-sized items require no backing allocation and retain
+    /// their container-supported capacities, including `usize::MAX`.
+    ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] when `capacity == 0`.
+    /// Returns [`SketchError::InvalidParameter`] when `capacity == 0` or the
+    /// sample storage cannot be represented or reserved.
     pub fn new(capacity: usize, seed: u64) -> Result<Self, SketchError> {
         if capacity == 0 {
             return Err(SketchError::InvalidParameter(
@@ -77,9 +82,14 @@ impl<T> ReservoirSampling<T> {
             ));
         }
 
+        let mut samples = Vec::new();
+        samples.try_reserve_exact(capacity).map_err(|_| {
+            SketchError::InvalidParameter("sample storage cannot be represented or reserved")
+        })?;
+
         Ok(Self {
             capacity,
-            samples: Vec::with_capacity(capacity),
+            samples,
             seen: 0,
             rng_state: seed,
         })
@@ -192,7 +202,40 @@ impl<T> ReservoirSampling<T> {
 #[cfg(test)]
 mod tests {
     use super::ReservoirSampling;
+    use crate::SketchError;
     use crate::splitmix64;
+
+    #[test]
+    fn impossible_nonzero_sized_reservoir_layouts_return_errors() {
+        for capacity in [isize::MAX as usize + 1, usize::MAX] {
+            assert!(matches!(
+                ReservoirSampling::<u8>::new(capacity, 7),
+                Err(SketchError::InvalidParameter(_))
+            ));
+        }
+        let first_invalid_u64_capacity = isize::MAX as usize / size_of::<u64>() + 1;
+        for capacity in [first_invalid_u64_capacity, usize::MAX] {
+            assert!(matches!(
+                ReservoirSampling::<u64>::new(capacity, 7),
+                Err(SketchError::InvalidParameter(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_sized_reservoir_supports_maximum_capacity_and_reuse() {
+        let mut reservoir = ReservoirSampling::<()>::new(usize::MAX, 7).unwrap();
+        assert_eq!(reservoir.capacity(), usize::MAX);
+        assert_eq!(reservoir.seen(), 0);
+        reservoir.extend([(); 8]);
+        assert_eq!(reservoir.samples(), &[(); 8]);
+        assert_eq!(reservoir.seen(), 8);
+        assert_eq!(reservoir.rng_state, 7);
+        reservoir.clear();
+        reservoir.add(());
+        assert_eq!(reservoir.len(), 1);
+        assert_eq!(reservoir.seen(), 1);
+    }
 
     /// Inverts the bijective word generator to force its first output in tests.
     ///

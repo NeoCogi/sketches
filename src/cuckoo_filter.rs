@@ -149,6 +149,9 @@ struct PackedBuckets {
 }
 
 impl PackedBuckets {
+    /// Reserves and zeroes the packed bytes, including the decoding suffix.
+    /// Rejects integer overflow, impossible vector layouts and failed
+    /// reservations before returning any storage owner.
     fn new(bucket_count: usize, fingerprint_bits: u8) -> Result<Self, SketchError> {
         let bits_per_bucket = BUCKET_SIZE * usize::from(fingerprint_bits);
         let bytes_per_bucket = bits_per_bucket.div_ceil(8);
@@ -166,8 +169,16 @@ impl PackedBuckets {
                 "packed bucket storage size overflows usize",
             ))?;
 
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(allocation_len).map_err(|_| {
+            SketchError::InvalidParameter("packed bucket storage cannot be represented or reserved")
+        })?;
+        // Checked usize arithmetic above does not establish a valid Vec byte
+        // layout. Reservation validates that separate boundary before filling.
+        bytes.resize(allocation_len, 0);
+
         Ok(Self {
-            bytes: vec![0; allocation_len],
+            bytes,
             bucket_count,
             bytes_per_bucket,
             fingerprint_bits,
@@ -324,7 +335,7 @@ impl CuckooFilter {
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid inputs or when the
     /// requested false-positive rate would require fingerprints wider than 16
-    /// bits.
+    /// bits, or when the bucket storage cannot be represented or reserved.
     pub fn new(expected_items: usize, false_positive_rate: f64) -> Result<Self, SketchError> {
         if expected_items == 0 {
             return Err(SketchError::InvalidParameter(
@@ -360,7 +371,8 @@ impl CuckooFilter {
     /// rollback work for fewer early failures near capacity.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid values.
+    /// Returns [`SketchError::InvalidParameter`] for invalid values or when
+    /// the padded bucket storage cannot be represented or reserved.
     pub fn with_parameters(
         bucket_count: usize,
         fingerprint_bits: u8,
@@ -592,6 +604,37 @@ mod tests {
         MIN_FINGERPRINT_BITS, PackedBuckets, bucket_count_for_expected_items,
         fingerprint_collision_probability, full_bucket_false_positive_rate_bound,
     };
+    use crate::SketchError;
+
+    #[test]
+    fn impossible_packed_layouts_return_errors_at_every_public_width() {
+        // Every case below fails before requesting an allocation: the bytes
+        // overflow usize or exceed Vec's maximum representable byte length.
+        for fingerprint_bits in MIN_FINGERPRINT_BITS..=MAX_FINGERPRINT_BITS {
+            for bucket_count in [1usize << (usize::BITS - 2), 1usize << (usize::BITS - 1)] {
+                assert!(matches!(
+                    CuckooFilter::with_parameters(bucket_count, fingerprint_bits, 1),
+                    Err(SketchError::InvalidParameter(_))
+                ));
+            }
+        }
+        assert!(matches!(
+            CuckooFilter::new(usize::MAX, 0.01),
+            Err(SketchError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn packed_layout_rejects_suffix_overflow_and_suffix_crossing_isize_limit() {
+        // Private storage can exercise exact byte boundaries independently of
+        // the public power-of-two bucket count. Two-bit buckets use one byte.
+        for storage_len in [isize::MAX as usize - 6, usize::MAX - 6] {
+            assert!(matches!(
+                PackedBuckets::new(storage_len, 2),
+                Err(SketchError::InvalidParameter(_))
+            ));
+        }
+    }
 
     #[test]
     fn packed_buckets_roundtrip_every_encodable_width() {

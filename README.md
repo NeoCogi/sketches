@@ -247,6 +247,22 @@ assert_eq!(sketch.estimate_u64(42), 7);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Constructor Sizing and Reservations
+
+Bloom, Cuckoo and Reservoir constructors return `SketchError::InvalidParameter`
+when their requested backing storage cannot be represented or reserved. Storage
+is reserved before an initialized sketch is returned. Reservoir uses the
+element type's actual container layout; zero-sized elements support capacities
+up to `usize::MAX` without a backing allocation.
+
+Bloom's `optimal_bit_len` and `optimal_num_hashes` are nonallocating
+recommendations calculated with ordinary `f64` arithmetic. They return errors
+when their rounded formulas exceed `usize` and `u32`, respectively, rather than
+clipping the dimensions. A representable recommendation does not establish that
+its backing storage fits available memory; construction performs that separate
+reservation. The target false-positive rate retains its existing statistical
+sizing meaning.
+
 ## Cuckoo Filter Parameters
 
 Automatic cuckoo filters use four-entry buckets, fingerprints from 6 through

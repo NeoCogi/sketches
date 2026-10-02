@@ -59,7 +59,8 @@ impl BloomFilter {
     /// target false-positive rate.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid input values.
+    /// Returns [`SketchError::InvalidParameter`] for invalid input values,
+    /// unrepresentable recommended dimensions, or a failed bitmap reservation.
     pub fn new(expected_items: usize, false_positive_rate: f64) -> Result<Self, SketchError> {
         let bit_len = Self::optimal_bit_len(expected_items, false_positive_rate)?;
         let num_hashes = Self::optimal_num_hashes(bit_len, expected_items)?;
@@ -69,7 +70,8 @@ impl BloomFilter {
     /// Creates a Bloom filter from explicit bit length and hash count.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] when values are zero.
+    /// Returns [`SketchError::InvalidParameter`] when values are zero or the
+    /// bitmap storage cannot be represented or reserved.
     pub fn with_size(bit_len: usize, num_hashes: u32) -> Result<Self, SketchError> {
         if bit_len == 0 {
             return Err(SketchError::InvalidParameter(
@@ -83,9 +85,16 @@ impl BloomFilter {
         }
 
         let word_len = bit_len.div_ceil(64);
+        let mut words = Vec::new();
+        words.try_reserve_exact(word_len).map_err(|_| {
+            SketchError::InvalidParameter("bitmap storage cannot be represented or reserved")
+        })?;
+        // The complete reservation precedes initialization, so filling the
+        // bitmap cannot require another allocation.
+        words.resize(word_len, 0);
         Ok(Self {
             bit_len,
-            words: vec![0; word_len],
+            words,
             num_hashes,
             inserted_items: 0,
         })
@@ -94,10 +103,13 @@ impl BloomFilter {
     /// Returns the recommended bit length for an expected number of distinct
     /// items and a target rate.
     ///
-    /// Formula: `m = -n * ln(p) / (ln(2)^2)`.
+    /// Formula: `m = -n * ln(p) / (ln(2)^2)`, rounded upward using ordinary
+    /// `f64` arithmetic. This recommendation does not allocate or guarantee
+    /// that its bitmap fits available memory.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid parameters.
+    /// Returns [`SketchError::InvalidParameter`] for invalid parameters or a
+    /// rounded recommendation outside the `usize` range.
     pub fn optimal_bit_len(
         expected_items: usize,
         false_positive_rate: f64,
@@ -119,17 +131,27 @@ impl BloomFilter {
         let n = expected_items as f64;
         let numerator = -n * false_positive_rate.ln();
         let denominator = std::f64::consts::LN_2.powi(2);
-        let bits = (numerator / denominator).ceil() as usize;
-        Ok(bits.max(1))
+        let bits = (numerator / denominator).ceil();
+        // Use the exclusive power-of-two bound: usize::MAX rounds to 2^64
+        // when converted to f64 on a 64-bit target.
+        let exclusive_limit = 2.0_f64.powi(usize::BITS as i32);
+        if !bits.is_finite() || bits >= exclusive_limit {
+            return Err(SketchError::InvalidParameter(
+                "recommended bit length exceeds usize",
+            ));
+        }
+        Ok((bits as usize).max(1))
     }
 
     /// Returns the recommended number of hash functions for a bit length and
     /// expected number of distinct items.
     ///
-    /// Formula: `k = (m / n) * ln(2)`.
+    /// Formula: `k = (m / n) * ln(2)`, rounded to the nearest integer using
+    /// ordinary `f64` arithmetic, with a minimum of one hash probe.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid parameters.
+    /// Returns [`SketchError::InvalidParameter`] for invalid parameters or a
+    /// rounded recommendation outside the `u32` range.
     pub fn optimal_num_hashes(bit_len: usize, expected_items: usize) -> Result<u32, SketchError> {
         if bit_len == 0 {
             return Err(SketchError::InvalidParameter(
@@ -142,8 +164,13 @@ impl BloomFilter {
             ));
         }
 
-        let k = ((bit_len as f64 / expected_items as f64) * std::f64::consts::LN_2).round() as u32;
-        Ok(k.max(1))
+        let k = ((bit_len as f64 / expected_items as f64) * std::f64::consts::LN_2).round();
+        if !k.is_finite() || k > f64::from(u32::MAX) {
+            return Err(SketchError::InvalidParameter(
+                "recommended hash count exceeds u32",
+            ));
+        }
+        Ok((k as u32).max(1))
     }
 
     /// Returns the number of addressable bits.
@@ -251,6 +278,122 @@ impl BloomFilter {
 #[cfg(test)]
 mod tests {
     use super::BloomFilter;
+    use crate::SketchError;
+
+    #[test]
+    fn oversized_bit_recommendation_is_rejected_before_construction() {
+        for result in [
+            BloomFilter::optimal_bit_len(usize::MAX, 0.01),
+            BloomFilter::new(usize::MAX, 0.01).map(|filter| filter.bit_len()),
+        ] {
+            assert_eq!(
+                result,
+                Err(SketchError::InvalidParameter(
+                    "recommended bit length exceeds usize"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn bit_recommendations_respect_integer_range_across_binary_rates() {
+        // Enumerate every positive binary power below one, including all
+        // subnormals. A wider integer compares the rounded formula with the
+        // actual usize maximum, independently of a rounded float bound.
+        for exponent in 1..=1074 {
+            let rate = if exponent <= 1022 {
+                f64::from_bits((1023 - exponent) << 52)
+            } else {
+                f64::from_bits(1 << (1074 - exponent))
+            };
+            for count in [1, 2, 1024, usize::MAX / 2, usize::MAX] {
+                let rounded =
+                    (-(count as f64) * rate.ln() / std::f64::consts::LN_2.powi(2)).ceil() as u128;
+                let result = BloomFilter::optimal_bit_len(count, rate);
+                if rounded > usize::MAX as u128 {
+                    assert!(matches!(result, Err(SketchError::InvalidParameter(_))));
+                } else {
+                    assert_eq!(result.unwrap() as u128, rounded.max(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bit_recommendations_cover_both_sides_of_the_usize_boundary() {
+        let boundary_rate = (-std::f64::consts::LN_2.powi(2)).exp();
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for bits in boundary_rate.to_bits() - 8..=boundary_rate.to_bits() + 8 {
+            let rate = f64::from_bits(bits);
+            let rounded =
+                (-(usize::MAX as f64) * rate.ln() / std::f64::consts::LN_2.powi(2)).ceil() as u128;
+            let result = BloomFilter::optimal_bit_len(usize::MAX, rate);
+            if rounded > usize::MAX as u128 {
+                assert!(matches!(result, Err(SketchError::InvalidParameter(_))));
+                rejected += 1;
+            } else {
+                assert_eq!(result.unwrap() as u128, rounded);
+                accepted += 1;
+            }
+        }
+        assert!(accepted > 0 && rejected > 0);
+    }
+
+    #[test]
+    fn sizing_preserves_small_dimensions_and_rejects_nonfinite_rates() {
+        let near_one = f64::from_bits(1.0_f64.to_bits() - 1);
+        assert_eq!(BloomFilter::optimal_bit_len(1, near_one), Ok(1));
+        assert_eq!(BloomFilter::optimal_num_hashes(1, usize::MAX), Ok(1));
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            assert!(matches!(
+                BloomFilter::optimal_bit_len(1, rate),
+                Err(SketchError::InvalidParameter(_))
+            ));
+        }
+        let filter = BloomFilter::new(1, f64::from_bits(1)).unwrap();
+        assert!(filter.bit_len() > 1000);
+        assert!(filter.num_hashes() > 1000);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn hash_recommendations_cover_both_sides_of_the_u32_boundary() {
+        let boundary = ((f64::from(u32::MAX) + 0.5) / std::f64::consts::LN_2).ceil() as usize;
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for bit_len in boundary - 3..=boundary + 3 {
+            let rounded = (bit_len as f64 * std::f64::consts::LN_2).round() as u64;
+            let result = BloomFilter::optimal_num_hashes(bit_len, 1);
+            if rounded > u64::from(u32::MAX) {
+                assert!(matches!(result, Err(SketchError::InvalidParameter(_))));
+                rejected += 1;
+            } else {
+                assert_eq!(u64::from(result.unwrap()), rounded);
+                accepted += 1;
+            }
+        }
+        assert!(accepted > 0 && rejected > 0);
+        assert!(matches!(
+            BloomFilter::optimal_num_hashes(usize::MAX, 1),
+            Err(SketchError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_bitmaps_preserve_word_boundaries_and_reuse() {
+        for bit_len in [1, 63, 64, 65, 127, 128, 129] {
+            let mut filter = BloomFilter::with_size(bit_len, 1).unwrap();
+            assert_eq!(filter.words.len(), bit_len.div_ceil(64));
+            assert!(filter.words.iter().all(|&word| word == 0));
+            filter.insert(&7_u64);
+            assert!(filter.contains(&7_u64));
+            filter.clear();
+            assert!(filter.words.iter().all(|&word| word == 0));
+            filter.insert(&11_u64);
+            assert!(filter.contains(&11_u64));
+        }
+    }
 
     #[test]
     fn constructor_from_rate_creates_positive_shape() {
