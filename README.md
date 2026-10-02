@@ -188,7 +188,11 @@ failure probability at most `delta` under the documented independent-hashing
 model.
 
 The constructor uses a power-of-two width of at least `8 / epsilon^2` and an
-odd median depth derived from a Chernoff majority bound. Updates return a
+odd median depth derived from a Chernoff majority bound. Sizing uses
+`-ln(delta)` and checks that bound in the log domain, accepting positive
+subnormal probabilities when the dimensions and allocation fit. For example,
+`epsilon = 0.9` and `delta = f64::from_bits(1)` select width 16 and depth 1803.
+Sizing uses ordinary `f64` rounding. Updates return a
 `Result`: Count Sketch must remain linear, so an update is rejected rather than
 clamped if a counter or its sign correction would exceed the exact `i64`
 range. Updates and merges preflight every affected counter, so an error leaves

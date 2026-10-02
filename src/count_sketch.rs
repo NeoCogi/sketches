@@ -41,6 +41,9 @@
 //! odd integer at least `2 * ln(1 / delta) / ln(16 / 7)`, obtained by applying
 //! the Chernoff/KL majority bound to the median. A simultaneous guarantee for
 //! `q` predetermined queries requires constructing with `delta / q`.
+//! Sizing evaluates `ln(1 / delta)` as `-ln(delta)` and checks the majority
+//! bound in the log domain, so positive subnormal probabilities do not require
+//! a representable reciprocal. These calculations use ordinary `f64` rounding.
 //!
 //! The integer row functions use Thorup's [strongly universal
 //! multiply-shift][multiply-shift] construction. The caller-owned seed is
@@ -127,6 +130,9 @@ impl CountSketch {
     /// The selected width is a power of two and the selected depth is odd, as
     /// required by the strongly universal multiply-shift family and an
     /// unambiguous median majority.
+    /// Positive subnormal `delta` values are supported: sizing and boundary
+    /// checks use logarithms directly, subject to ordinary `f64` rounding and
+    /// the dimension/allocation limits below.
     ///
     /// The seed selects the fingerprint and row-hash families. Choose it
     /// independently of the input. Use the same seed for shards that will be
@@ -161,7 +167,9 @@ impl CountSketch {
             SketchError::InvalidParameter("epsilon requires an unrepresentable width"),
         )?;
 
-        let minimum_depth = 2.0 * (1.0 / delta).ln() / DEPTH_DENOMINATOR;
+        // The logarithm stays finite even when the reciprocal would overflow.
+        let log_delta = delta.ln();
+        let minimum_depth = -2.0 * log_delta / DEPTH_DENOMINATOR;
         if !minimum_depth.is_finite() || minimum_depth > usize::MAX as f64 {
             return Err(SketchError::InvalidParameter(
                 "delta requires an unrepresentable depth",
@@ -173,7 +181,9 @@ impl CountSketch {
                 "delta requires an unrepresentable depth",
             ))?;
         }
-        while (-(depth as f64) * DEPTH_DENOMINATOR / 2.0).exp() > delta {
+        // Correct a rounded-down candidate without exponentiating a bound
+        // that can underflow at the smallest supported probabilities.
+        while -(depth as f64) * DEPTH_DENOMINATOR / 2.0 > log_delta {
             depth = depth.checked_add(2).ok_or(SketchError::InvalidParameter(
                 "delta requires an unrepresentable depth",
             ))?;
@@ -467,6 +477,95 @@ mod tests {
     }
 
     #[test]
+    fn constructor_sizes_tiny_probabilities_and_majority_boundaries() {
+        // Literal answers calculated at 100-digit precision from the exact
+        // f64 inputs and 2 * -ln(delta) / ln(16/7), then rounded to odd depth.
+        // Include both reciprocal-overflow boundaries, the normal/subnormal
+        // transition, and values on either side of several majority thresholds.
+        for (probability_bits, expected_depth) in [
+            (0x0000_0000_0000_0001, 1_803),
+            (0x0000_0000_0000_0002, 1_801),
+            (0x0000_0000_0000_0003, 1_799),
+            (0x0000_0000_0000_0004, 1_799),
+            (0x000f_ffff_ffff_ffff, 1_715),
+            (0x0010_0000_0000_0000, 1_715),
+            (0x0010_0000_0000_0001, 1_715),
+            (0x0003_ffff_ffff_ffff, 1_719),
+            (0x0004_0000_0000_0000, 1_719),
+            (0x0004_0000_0000_0001, 1_719),
+            (0x0007_ffff_ffff_ffff, 1_717),
+            (0x0008_0000_0000_0000, 1_717),
+            (0x0008_0000_0000_0001, 1_717),
+            (0x0007_30d6_7819_e8d2, 1_717), // 1e-308
+            (0x01a5_6e1f_c2f8_f359, 1_673), // 1e-300
+            (0x3f84_7ae1_47ae_147b, 13),    // 0.01
+            (0x3fe0_0000_0000_0000, 3),     // 0.5
+            (0x3fef_ffff_ffff_ffff, 1),     // Immediately below one
+            (0x3fe5_2a7f_a9d2_f4ea, 3),
+            (0x3fe5_2a7f_a9d2_fcea, 1),
+            (0x3fd2_852f_b498_95cd, 5),
+            (0x3fd2_852f_b498_9dcd, 3),
+            (0x3f72_ff97_fbe6_3665, 15),
+            (0x3f72_ff97_fbe6_3e65, 13),
+            (0x3c2b_4fae_3b97_fd92, 103),
+            (0x3c2b_4fae_3b98_0592, 101),
+            (0x0009_e560_546b_2ba6, 1_717),
+            (0x0009_e560_546b_33a6, 1_715),
+        ] {
+            let delta = f64::from_bits(probability_bits);
+            let sketch = CountSketch::new(0.9, delta, SEED).unwrap();
+            assert_eq!(sketch.width(), 16, "delta={delta:e}");
+            assert_eq!(sketch.depth(), expected_depth, "delta={delta:e}");
+        }
+    }
+
+    #[test]
+    fn constructor_accepts_every_binary_probability_exponent() {
+        let mut previous_depth = 0;
+        // Every representable 2^-exponent in (0,1), including all 52 subnormal
+        // powers. Exercise public allocation and monotonic sizing, not just ln.
+        for exponent in 1..=1_074 {
+            let bits = if exponent <= 1_022 {
+                (1_023 - exponent) << 52
+            } else {
+                1_u64 << (1_074 - exponent)
+            };
+            let delta = f64::from_bits(bits);
+            let sketch = CountSketch::new(0.9, delta, SEED).unwrap();
+            assert_eq!(sketch.width(), 16);
+            assert!(sketch.depth() >= previous_depth, "exponent={exponent}");
+            assert!(sketch.depth() <= 1_803);
+            assert!(!sketch.depth().is_multiple_of(2));
+            previous_depth = sketch.depth();
+        }
+        assert_eq!(previous_depth, 1_803);
+    }
+
+    #[test]
+    fn tiny_probability_preserves_seeded_updates_merging_and_clear() {
+        let delta = f64::from_bits(1);
+        let mut automatic = CountSketch::new(0.9, delta, SEED).unwrap();
+        let mut explicit = CountSketch::with_dimensions(16, 1_803, SEED).unwrap();
+        let mut shard = CountSketch::new(0.9, delta, SEED).unwrap();
+        assert_eq!(automatic.rows, explicit.rows);
+        assert_eq!(automatic.fingerprint_keys, explicit.fingerprint_keys);
+
+        automatic.add_u64(7, 19).unwrap();
+        shard.add_u64(7, -4).unwrap();
+        automatic.merge(&shard).unwrap();
+        explicit.add_u64(7, 15).unwrap();
+        assert_eq!(automatic.counters, explicit.counters);
+        assert_eq!(automatic.estimate_u64(7), 15);
+
+        automatic.clear();
+        assert_eq!(automatic.estimate_u64(7), 0);
+        assert_eq!(automatic.seed(), SEED);
+        assert_eq!(automatic.rows, explicit.rows);
+        automatic.add_u64(7, -11).unwrap();
+        assert_eq!(automatic.estimate_u64(7), -11);
+    }
+
+    #[test]
     fn constructors_reject_invalid_or_unallocatable_parameters() {
         assert!(CountSketch::new(0.0, 0.1, SEED).is_err());
         assert!(CountSketch::new(0.1, 0.0, SEED).is_err());
@@ -474,6 +573,26 @@ mod tests {
         assert!(CountSketch::new(0.1, 1.0, SEED).is_err());
         assert!(CountSketch::new(f64::NAN, 0.1, SEED).is_err());
         assert!(CountSketch::new(f64::MIN_POSITIVE, 0.5, SEED).is_err());
+        for delta in [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            -0.1,
+            -0.0,
+            0.0,
+            1.0,
+            f64::INFINITY,
+        ] {
+            assert_eq!(
+                CountSketch::new(0.9, delta, SEED).unwrap_err(),
+                SketchError::InvalidParameter("delta must be finite and strictly between 0 and 1"),
+            );
+        }
+        for epsilon in [f64::MIN_POSITIVE, f64::from_bits(1)] {
+            assert_eq!(
+                CountSketch::new(epsilon, f64::from_bits(1), SEED).unwrap_err(),
+                SketchError::InvalidParameter("epsilon requires an unrepresentable width"),
+            );
+        }
         assert!(CountSketch::with_dimensions(0, 3, SEED).is_err());
         assert!(CountSketch::with_dimensions(3, 3, SEED).is_err());
         assert!(CountSketch::with_dimensions(4, 0, SEED).is_err());
