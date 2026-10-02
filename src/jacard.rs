@@ -32,15 +32,19 @@
 //! inaccurate when the true Jaccard index is small. Clamping the result to
 //! `[0, 1]` does not correct this statistical error. See the extensive warnings
 //! on each implementation and [Ertl 2017].
+//! These relations require finite cardinalities for both inputs and their
+//! union. A nonfinite required estimate returns [`SketchError::EstimateUnavailable`],
+//! including saturated self-comparisons and comparisons with an empty sketch.
 //!
 //! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 
 use crate::SketchError;
 
-/// Shared result of an inclusion-exclusion set-relation calculation.
+/// Successful result of a finite-cardinality inclusion-exclusion calculation.
 ///
 /// Keeping both outputs together ensures that cardinality-based sketches use
-/// exactly the same clamping and empty-union convention.
+/// exactly the same clamping and empty-union convention. Nonfinite required
+/// cardinalities are rejected before either result is constructed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct InclusionExclusionEstimates {
     /// Intersection estimate clamped to the feasible cardinality range.
@@ -53,12 +57,21 @@ pub(crate) struct InclusionExclusionEstimates {
 ///
 /// This helper centralizes mechanics only; it does not make inclusion-exclusion
 /// statistically reliable for small intersections. The two-empty-set convention
-/// is Jaccard `1.0`.
+/// is Jaccard `1.0`. Callers supply nonnegative cardinality estimates.
+///
+/// # Errors
+/// Returns [`SketchError::EstimateUnavailable`] if any required cardinality is
+/// nonfinite, before arithmetic or empty-union handling. Valid saturation is
+/// therefore reported as an unavailable relation instead of a clamped zero.
 pub(crate) fn inclusion_exclusion_estimates(
     left: f64,
     right: f64,
     union: f64,
-) -> InclusionExclusionEstimates {
+) -> Result<InclusionExclusionEstimates, SketchError> {
+    if !left.is_finite() || !right.is_finite() || !union.is_finite() {
+        return Err(SketchError::EstimateUnavailable);
+    }
+
     // Estimator noise can produce a negative intersection or one larger than
     // either input, so restrict the subtraction to its mathematically feasible
     // interval.
@@ -72,10 +85,10 @@ pub(crate) fn inclusion_exclusion_estimates(
         (intersection / union).clamp(0.0, 1.0)
     };
 
-    InclusionExclusionEstimates {
+    Ok(InclusionExclusionEstimates {
         intersection,
         jaccard,
-    }
+    })
 }
 
 /// Common API for sketches that can estimate Jaccard similarity.
@@ -88,14 +101,17 @@ pub(crate) fn inclusion_exclusion_estimates(
 /// approximate implementation can reliably prove disjointness or identity.
 /// In particular, consult the implementation-specific limitations before using
 /// approximate zero or near-zero results as classification thresholds.
+/// Cardinality-based implementations can return
+/// [`SketchError::EstimateUnavailable`] for valid saturated states.
 ///
 /// # Example
 /// ```rust
+/// use sketches::SketchError;
 /// use sketches::jacard::JacardIndex;
 /// use sketches::minhash::MinHash;
 ///
-/// fn compare<S: JacardIndex>(left: &S, right: &S) -> f64 {
-///     left.jaccard_index(right).unwrap()
+/// fn compare<S: JacardIndex>(left: &S, right: &S) -> Result<f64, SketchError> {
+///     left.jaccard_index(right)
 /// }
 ///
 /// let mut left = MinHash::new(128).unwrap();
@@ -107,7 +123,7 @@ pub(crate) fn inclusion_exclusion_estimates(
 ///     right.add(&value);
 /// }
 ///
-/// let similarity = compare(&left, &right);
+/// let similarity = compare(&left, &right).unwrap();
 /// assert!(similarity > 0.20 && similarity < 0.60);
 /// ```
 pub trait JacardIndex {
@@ -116,6 +132,9 @@ pub trait JacardIndex {
     /// # Errors
     /// Implementations return [`SketchError::IncompatibleSketches`] when two
     /// sketches are not compatible for comparison.
+    /// Cardinality-based implementations return [`SketchError::EstimateUnavailable`]
+    /// when a required cardinality is nonfinite. See implementation-specific
+    /// documentation for supported estimate boundaries.
     fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError>;
 }
 
@@ -132,17 +151,54 @@ mod tests {
     // clamps independently of a particular sketch implementation.
     #[test]
     fn inclusion_exclusion_helper_clamps_noisy_estimates() {
-        let empty = inclusion_exclusion_estimates(0.0, 0.0, 0.0);
+        let empty = inclusion_exclusion_estimates(0.0, 0.0, 0.0).unwrap();
         assert_eq!(empty.intersection, 0.0);
         assert_eq!(empty.jaccard, 1.0);
 
-        let negative = inclusion_exclusion_estimates(100.0, 100.0, 250.0);
+        let negative = inclusion_exclusion_estimates(100.0, 100.0, 250.0).unwrap();
         assert_eq!(negative.intersection, 0.0);
         assert_eq!(negative.jaccard, 0.0);
 
-        let oversized = inclusion_exclusion_estimates(40.0, 60.0, 20.0);
+        let oversized = inclusion_exclusion_estimates(40.0, 60.0, 20.0).unwrap();
         assert_eq!(oversized.intersection, 40.0);
         assert_eq!(oversized.jaccard, 1.0);
+    }
+
+    #[test]
+    fn saturated_ultraloglog_self_comparison_reports_unavailable() {
+        let saturated = UltraLogLog::from_state(vec![255; 8]).unwrap();
+        assert!(saturated.estimate().is_infinite());
+        let before = saturated.clone();
+        assert_eq!(
+            saturated.intersection_estimate(&saturated),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(
+            saturated.jaccard_index(&saturated),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(
+            JacardIndex::jaccard_index(&saturated, &saturated),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(saturated, before);
+    }
+
+    #[test]
+    fn inclusion_exclusion_rejects_each_nonfinite_cardinality() {
+        for unavailable in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            for estimates in [
+                [unavailable, 3.0, 4.0],
+                [2.0, unavailable, 4.0],
+                [2.0, 3.0, unavailable],
+            ] {
+                assert_eq!(
+                    inclusion_exclusion_estimates(estimates[0], estimates[1], estimates[2]),
+                    Err(crate::SketchError::EstimateUnavailable),
+                    "estimates={estimates:?}"
+                );
+            }
+        }
     }
 
     // Exercises HyperLogLog through the shared trait rather than its inherent

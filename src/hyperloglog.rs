@@ -55,6 +55,10 @@
 //! primary workload. Ertl's joint maximum-likelihood method is the appropriate
 //! HLL-specific alternative when substantially better set-operation estimates
 //! are required.
+//! Intersection and Jaccard require finite estimates of both inputs and their
+//! union. Valid saturation returns [`SketchError::EstimateUnavailable`] for
+//! these relations, including self and empty/saturated comparisons. Cardinality
+//! and union estimates retain their supported infinite result.
 //!
 //! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 
@@ -254,6 +258,9 @@ impl HyperLogLog {
     /// assert!(union > 9_000.0 && union < 11_000.0);
     /// ```
     ///
+    /// Valid saturation can produce an infinite estimate in `Ok`. Intersection
+    /// and Jaccard report an unavailable estimate when they need that scale.
+    ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when precision differs.
     pub fn union_estimate(&self, other: &Self) -> Result<f64, SketchError> {
@@ -304,12 +311,15 @@ impl HyperLogLog {
     /// ```
     ///
     /// # Errors
-    /// Returns [`SketchError::IncompatibleSketches`] when precision differs.
+    /// Returns [`SketchError::IncompatibleSketches`] when precision differs,
+    /// checked before cardinality availability. Returns
+    /// [`SketchError::EstimateUnavailable`] when an input or union cardinality
+    /// is nonfinite, including saturated self and empty/saturated comparisons.
     pub fn intersection_estimate(&self, other: &Self) -> Result<f64, SketchError> {
         let union = self.union_estimate(other)?;
         let a = self.estimate();
         let b = other.estimate();
-        Ok(inclusion_exclusion_estimates(a, b, union).intersection)
+        Ok(inclusion_exclusion_estimates(a, b, union)?.intersection)
     }
 
     /// Returns the estimated Jaccard index `|A ∩ B| / |A ∪ B|`.
@@ -360,12 +370,15 @@ impl HyperLogLog {
     /// ```
     ///
     /// # Errors
-    /// Returns [`SketchError::IncompatibleSketches`] when precision differs.
+    /// Returns [`SketchError::IncompatibleSketches`] when precision differs,
+    /// checked before cardinality availability. Returns
+    /// [`SketchError::EstimateUnavailable`] when an input or union cardinality
+    /// is nonfinite, including saturated self and empty/saturated comparisons.
     pub fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError> {
         let union = self.union_estimate(other)?;
         let a = self.estimate();
         let b = other.estimate();
-        Ok(inclusion_exclusion_estimates(a, b, union).jaccard)
+        Ok(inclusion_exclusion_estimates(a, b, union)?.jaccard)
     }
 
     /// Returns the rank of the first set bit in the suffix (1-indexed).
@@ -702,6 +715,33 @@ mod tests {
         let left = HyperLogLog::new(12).unwrap();
         let right = HyperLogLog::new(12).unwrap();
         assert_eq!(left.jaccard_index(&right).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn saturated_relations_report_unavailable_and_preserve_cardinality() {
+        let mut saturated = HyperLogLog::new(4).unwrap();
+        // All registers at the legal maximum rank represent the existing MLE
+        // saturation boundary. Construct valid internal storage; the public
+        // item-hashing API cannot cheaply target these rare raw hash ranks.
+        saturated.registers.fill(61);
+        let before = saturated.clone();
+        assert!(saturated.estimate().is_infinite());
+        assert_eq!(saturated.count(), u64::MAX);
+        assert_eq!(saturated.union_estimate(&saturated), Ok(f64::INFINITY));
+        assert_eq!(
+            saturated.intersection_estimate(&saturated),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(
+            saturated.jaccard_index(&saturated),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(
+            crate::jacard::JacardIndex::jaccard_index(&saturated, &saturated),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(saturated.precision, before.precision);
+        assert_eq!(saturated.registers, before.registers);
     }
 
     #[test]

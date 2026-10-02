@@ -363,6 +363,26 @@ helps but does not fix the subtraction instability described below: small
 intersections can still be dominated by error from the much larger input and
 union estimates.
 
+ULL and HLL intersection and Jaccard methods return `Result`. They require
+finite cardinalities for both inputs and their union at the comparison
+precision; otherwise they return `SketchError::EstimateUnavailable`. This
+includes saturated self-comparisons and empty/saturated comparisons. Use
+`intersection_estimate(&other)?` to propagate comparison errors. Cardinality and
+union estimates can still return infinity for legal saturated states. Finite
+empty-set conventions and feasibility clamping are unchanged.
+
+```rust
+use sketches::{SketchError, ultraloglog::UltraLogLog};
+
+let saturated = UltraLogLog::from_state(vec![255; 8])?;
+assert!(saturated.estimate().is_infinite());
+assert_eq!(
+    saturated.intersection_estimate(&saturated),
+    Err(SketchError::EstimateUnavailable),
+);
+# Ok::<(), SketchError>(())
+```
+
 ## HyperLogLog Intersection and Jaccard Limitations
 
 **HyperLogLog only supports union natively.** Merging takes the register-wise

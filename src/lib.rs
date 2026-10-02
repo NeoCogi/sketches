@@ -76,6 +76,11 @@ pub enum SketchError {
     /// Returned when a Count Sketch update would exceed its exact signed
     /// counter range.
     CounterOverflow,
+    /// Returned when a set-relation query requires a nonfinite cardinality.
+    ///
+    /// Saturated cardinality sketches are valid, but their infinite estimates
+    /// cannot supply the finite scale needed for inclusion-exclusion.
+    EstimateUnavailable,
 }
 
 impl fmt::Display for SketchError {
@@ -88,6 +93,9 @@ impl fmt::Display for SketchError {
             }
             Self::CounterOverflow => {
                 write!(f, "Count Sketch counter update exceeds the exact i64 range")
+            }
+            Self::EstimateUnavailable => {
+                write!(f, "set-relation estimate requires finite cardinalities")
             }
         }
     }

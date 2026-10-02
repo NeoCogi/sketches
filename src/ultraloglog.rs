@@ -49,6 +49,11 @@
 //! instability. Clamping prevents impossible values; it does not make zero a
 //! proof of disjointness or make a positive result proof of overlap. Prefer
 //! [`crate::minhash::MinHash`] when similarity is the primary workload.
+//! Relations require finite estimates of both inputs and their union at the
+//! comparison precision. Saturation can make these estimates infinite; such
+//! queries return [`SketchError::EstimateUnavailable`], including self and
+//! empty/saturated comparisons. Cardinality and union estimates retain their
+//! supported infinite result.
 //!
 //! [Ertl 2024]: https://arxiv.org/abs/2308.16862
 //! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
@@ -515,6 +520,9 @@ impl UltraLogLog {
     }
 
     /// Returns the estimated union cardinality at the smaller input precision.
+    ///
+    /// Valid saturation can produce infinity. Intersection and Jaccard queries
+    /// report an unavailable estimate when they require such a cardinality.
     pub fn union_estimate(&self, other: &Self) -> f64 {
         self.merged(other).estimate()
     }
@@ -535,9 +543,28 @@ impl UltraLogLog {
     /// error. Zero does not prove disjointness, and a positive estimate does
     /// not prove overlap. See [Ertl 2017].
     ///
+    /// # Example
+    /// ```rust
+    /// use sketches::{SketchError, ultraloglog::UltraLogLog};
+    ///
+    /// let empty = UltraLogLog::new(3)?;
+    /// let saturated = UltraLogLog::from_state(vec![255; 8])?;
+    /// assert!(saturated.union_estimate(&empty).is_infinite());
+    /// assert_eq!(
+    ///     saturated.intersection_estimate(&empty),
+    ///     Err(SketchError::EstimateUnavailable),
+    /// );
+    /// # Ok::<(), SketchError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`SketchError::EstimateUnavailable`] when an input or union
+    /// cardinality at the smaller precision is nonfinite. This includes
+    /// saturated self-comparisons and empty/saturated comparisons.
+    ///
     /// [Ertl 2017]: https://arxiv.org/pdf/1702.01284
-    pub fn intersection_estimate(&self, other: &Self) -> f64 {
-        self.relation_estimates(other).intersection
+    pub fn intersection_estimate(&self, other: &Self) -> Result<f64, SketchError> {
+        Ok(self.relation_estimates(other)?.intersection)
     }
 
     /// Returns the estimated Jaccard index `|A ∩ B| / |A ∪ B|`.
@@ -558,13 +585,14 @@ impl UltraLogLog {
     ///
     /// # Errors
     ///
-    /// UltraLogLog states created by this crate are always comparable, so this
-    /// implementation currently returns `Ok`. The `Result` preserves the shared
-    /// [`JacardIndex`] trait contract.
+    /// Returns [`SketchError::EstimateUnavailable`] when an input or union
+    /// cardinality at the smaller precision is nonfinite. This includes
+    /// saturated self-comparisons and empty/saturated comparisons. Different
+    /// precisions remain comparable through reduction to the smaller one.
     ///
     /// [Ertl 2017]: https://arxiv.org/pdf/1702.01284
     pub fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError> {
-        Ok(self.relation_estimates(other).jaccard)
+        Ok(self.relation_estimates(other)?.jaccard)
     }
 
     /// Computes shared inclusion-exclusion outputs at a common precision.
@@ -573,7 +601,9 @@ impl UltraLogLog {
     /// keeps all three estimates on the same register partition and avoids
     /// combining a high-resolution operand estimate with a lower-resolution
     /// union estimate.
-    fn relation_estimates(&self, other: &Self) -> InclusionExclusionEstimates {
+    /// Nonfinite aligned cardinalities propagate the shared unavailable error;
+    /// neither operand is mutated on success or failure.
+    fn relation_estimates(&self, other: &Self) -> Result<InclusionExclusionEstimates, SketchError> {
         // Reduce the higher-precision side exactly once, then keep the complete
         // relation calculation on that shared partition.
         if self.precision == other.precision {
@@ -592,11 +622,11 @@ impl UltraLogLog {
     }
 
     /// Calculates cardinality relations for two already aligned register
-    /// partitions.
+    /// partitions, propagating the shared finite-cardinality requirement.
     fn relation_estimates_at_common_precision(
         left: &Self,
         right: &Self,
-    ) -> InclusionExclusionEstimates {
+    ) -> Result<InclusionExclusionEstimates, SketchError> {
         debug_assert_eq!(left.precision, right.precision);
 
         // Estimating all three cardinalities from aligned partitions preserves
@@ -1282,14 +1312,14 @@ mod tests {
     fn jaccard_handles_empty_and_identical_sketches() {
         let empty = UltraLogLog::new(12).unwrap();
         assert_eq!(empty.jaccard_index(&empty).unwrap(), 1.0);
-        assert_eq!(empty.intersection_estimate(&empty), 0.0);
+        assert_eq!(empty.intersection_estimate(&empty).unwrap(), 0.0);
 
         let mut populated = UltraLogLog::new(12).unwrap();
         for value in 0_u64..10_000 {
             populated.add(&value);
         }
         assert_eq!(empty.jaccard_index(&populated).unwrap(), 0.0);
-        assert_eq!(empty.intersection_estimate(&populated), 0.0);
+        assert_eq!(empty.intersection_estimate(&populated).unwrap(), 0.0);
         assert_eq!(populated.jaccard_index(&populated).unwrap(), 1.0);
     }
 
@@ -1306,7 +1336,7 @@ mod tests {
             right.add(&value);
         }
 
-        let intersection = left.intersection_estimate(&right);
+        let intersection = left.intersection_estimate(&right).unwrap();
         let jaccard = left.jaccard_index(&right).unwrap();
         assert!((4_000.0..6_000.0).contains(&intersection));
         assert!((0.25..0.42).contains(&jaccard));
