@@ -1108,6 +1108,148 @@ mod tests {
         (0..count).map(|index| crate::splitmix64(0x0123_4567_89AB_CDEF + index as u64))
     }
 
+    /// Reaches legal saturation using public raw-hash updates at every index.
+    /// These chosen boundary hashes do not model ordinary uniform input.
+    fn saturated_from_raw_hashes(precision: u8) -> UltraLogLog {
+        let mut sketch = UltraLogLog::new(precision).unwrap();
+        for index in 0_u64..(1_u64 << precision) {
+            for suffix in [0_u64, 1, 2] {
+                sketch.add_hash((index << (64 - precision)) | suffix);
+            }
+        }
+        assert!(sketch.state().iter().all(|&register| register == 255));
+        assert!(sketch.estimate().is_infinite());
+        assert!(sketch.estimate_mle().is_infinite());
+        sketch
+    }
+
+    #[test]
+    fn relations_check_saturation_across_states_and_precisions() {
+        let mut cases = Vec::new();
+        for precision in [3, 4, 5, 8] {
+            let register_count = 1_usize << precision;
+            cases.push(UltraLogLog::new(precision).unwrap());
+            let mut ordinary = UltraLogLog::new(precision).unwrap();
+            for hash in reference_hashes(64) {
+                ordinary.add_hash(hash);
+            }
+            cases.push(ordinary);
+            for parity in [0, 1] {
+                let state = (0..register_count)
+                    .map(|index| if index % 2 == parity { 255 } else { 0 })
+                    .collect();
+                cases.push(UltraLogLog::from_state(state).unwrap());
+            }
+            cases.push(UltraLogLog::from_state(vec![255; register_count]).unwrap());
+            cases.push(saturated_from_raw_hashes(precision));
+        }
+        assert_eq!(cases.len(), 24);
+        for (i, left) in cases.iter().enumerate() {
+            for (j, right) in cases.iter().enumerate() {
+                let left_before = left.clone();
+                let right_before = right.clone();
+                let precision = left.precision().min(right.precision());
+                let aligned_left = left.downsize(precision).unwrap();
+                let aligned_right = right.downsize(precision).unwrap();
+                let union = aligned_left.union_estimate(&aligned_right);
+                let a = aligned_left.estimate();
+                let b = aligned_right.estimate();
+                assert_eq!(left.union_estimate(right).to_bits(), union.to_bits());
+
+                let intersection = left.intersection_estimate(right);
+                let jaccard = left.jaccard_index(right);
+                let trait_jaccard = crate::jacard::JacardIndex::jaccard_index(left, right);
+                if [a, b, union].iter().any(|value| !value.is_finite()) {
+                    assert_eq!(intersection, Err(crate::SketchError::EstimateUnavailable));
+                    assert_eq!(jaccard, Err(crate::SketchError::EstimateUnavailable));
+                    assert_eq!(trait_jaccard, Err(crate::SketchError::EstimateUnavailable));
+                } else {
+                    let intersection = intersection.unwrap();
+                    let jaccard = jaccard.unwrap();
+                    assert!(intersection.is_finite(), "cases={i},{j}");
+                    assert!(0.0 <= intersection && intersection <= a.min(b));
+                    assert!(jaccard.is_finite() && (0.0..=1.0).contains(&jaccard));
+                    assert_eq!(trait_jaccard, Ok(jaccard));
+                    if a == 0.0 || b == 0.0 {
+                        assert_eq!(intersection, 0.0);
+                        assert_eq!(jaccard, if union == 0.0 { 1.0 } else { 0.0 });
+                    }
+                }
+                assert_eq!(*left, left_before);
+                assert_eq!(*right, right_before);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_ull_operands_can_have_an_unavailable_saturated_union() {
+        let left = UltraLogLog::from_state(vec![255, 0, 255, 0, 255, 0, 255, 0]).unwrap();
+        let right = UltraLogLog::from_state(vec![0, 255, 0, 255, 0, 255, 0, 255]).unwrap();
+        assert!(left.estimate().is_finite());
+        assert!(right.estimate().is_finite());
+        assert!(left.union_estimate(&right).is_infinite());
+        for (a, b) in [(&left, &right), (&right, &left)] {
+            assert_eq!(
+                a.intersection_estimate(b),
+                Err(crate::SketchError::EstimateUnavailable)
+            );
+            assert_eq!(
+                a.jaccard_index(b),
+                Err(crate::SketchError::EstimateUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn ull_availability_is_checked_after_precision_reduction() {
+        let mut high = UltraLogLog::new(4).unwrap();
+        for index in 0_u64..8 {
+            for suffix in [0_u64, 1, 2] {
+                high.add_hash((index << 61) | suffix);
+            }
+        }
+        let low = UltraLogLog::new(3).unwrap();
+        assert!(high.estimate().is_finite());
+        assert_eq!(low.estimate(), 0.0);
+        let reduced = high.downsize(3).unwrap();
+        assert_eq!(reduced.state(), &[255; 8]);
+        assert!(reduced.estimate().is_infinite());
+        let before = high.clone();
+        for (a, b) in [(&low, &high), (&high, &low)] {
+            assert_eq!(
+                a.intersection_estimate(b),
+                Err(crate::SketchError::EstimateUnavailable)
+            );
+            assert_eq!(
+                a.jaccard_index(b),
+                Err(crate::SketchError::EstimateUnavailable)
+            );
+        }
+        assert_eq!(high, before);
+        // The unchanged higher-precision partition still supports a finite
+        // self-comparison; availability is determined at comparison precision.
+        assert_eq!(high.jaccard_index(&high), Ok(1.0));
+    }
+
+    #[test]
+    fn clearing_saturated_ull_restores_finite_relations_and_reuse() {
+        let mut sketch = saturated_from_raw_hashes(3);
+        let empty = UltraLogLog::new(3).unwrap();
+        assert_eq!(
+            sketch.jaccard_index(&empty),
+            Err(crate::SketchError::EstimateUnavailable)
+        );
+        assert_eq!(sketch.count(), u64::MAX);
+        sketch.clear();
+        assert_eq!(sketch.intersection_estimate(&empty), Ok(0.0));
+        assert_eq!(sketch.jaccard_index(&empty), Ok(1.0));
+        sketch.add(&42_u64);
+        assert!(sketch.estimate().is_finite());
+        assert_eq!(sketch.jaccard_index(&sketch), Ok(1.0));
+        assert_eq!(sketch.intersection_estimate(&sketch), Ok(sketch.estimate()));
+        assert!(empty.is_empty());
+    }
+
     // Covers both constructor bounds and minimal precision selection for an
     // error-rate request.
     #[test]

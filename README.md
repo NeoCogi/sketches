@@ -383,6 +383,9 @@ assert_eq!(
 # Ok::<(), SketchError>(())
 ```
 
+The [F4 fix record](docs/F4_CARDINALITY_RELATIONS_FIX.md) documents the
+availability policy, precision boundaries and regression coverage.
+
 ## HyperLogLog Intersection and Jaccard Limitations
 
 **HyperLogLog only supports union natively.** Merging takes the register-wise

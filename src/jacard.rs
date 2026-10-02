@@ -201,6 +201,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inclusion_exclusion_checks_all_nonfinite_class_combinations() {
+        // The first three entries are finite. The others exercise both
+        // infinities, quiet NaNs with different signs/payloads and a signaling
+        // NaN. Classify by fixture index independently of the production guard.
+        let values = [
+            0.0,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::from_bits(0xfff8_0000_0000_0042),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+        ];
+        let mut rejected = 0;
+        for (i, &left) in values.iter().enumerate() {
+            for (j, &right) in values.iter().enumerate() {
+                for (k, &union) in values.iter().enumerate() {
+                    let result = inclusion_exclusion_estimates(left, right, union);
+                    if i >= 3 || j >= 3 || k >= 3 {
+                        assert_eq!(result, Err(crate::SketchError::EstimateUnavailable));
+                        rejected += 1;
+                    } else {
+                        let result = result.unwrap();
+                        assert!(result.intersection.is_finite());
+                        assert!(0.0 <= result.intersection);
+                        assert!(result.intersection <= left.min(right));
+                        assert!(result.jaccard.is_finite());
+                        assert!((0.0..=1.0).contains(&result.jaccard));
+                    }
+                }
+            }
+        }
+        assert_eq!(rejected, 485);
+    }
+
     // Exercises HyperLogLog through the shared trait rather than its inherent
     // method, guarding the trait delegation.
     #[test]

@@ -745,6 +745,111 @@ mod tests {
     }
 
     #[test]
+    fn hll_relations_preserve_availability_and_compatibility_order() {
+        let mut cases = Vec::new();
+        for precision in [4, 5, 6] {
+            let empty = HyperLogLog::new(precision).unwrap();
+            cases.push(empty);
+            let mut ordinary = HyperLogLog::new(precision).unwrap();
+            for value in 0_u64..64 {
+                ordinary.add(&value);
+            }
+            cases.push(ordinary);
+            for parity in [0, 1] {
+                let mut partial = HyperLogLog::new(precision).unwrap();
+                let maximum_rank = 65 - precision;
+                for (index, register) in partial.registers.iter_mut().enumerate() {
+                    if index % 2 == parity {
+                        *register = maximum_rank;
+                    }
+                }
+                cases.push(partial);
+            }
+            let mut saturated = HyperLogLog::new(precision).unwrap();
+            saturated.registers.fill(65 - precision);
+            cases.push(saturated);
+        }
+        assert_eq!(cases.len(), 15);
+        for left in &cases {
+            for right in &cases {
+                let left_before = left.clone();
+                let right_before = right.clone();
+                let intersection = left.intersection_estimate(right);
+                let jaccard = left.jaccard_index(right);
+                let trait_jaccard = crate::jacard::JacardIndex::jaccard_index(left, right);
+                if left.precision != right.precision {
+                    for result in [
+                        left.union_estimate(right),
+                        intersection,
+                        jaccard,
+                        trait_jaccard,
+                    ] {
+                        assert!(matches!(
+                            result,
+                            Err(crate::SketchError::IncompatibleSketches(_))
+                        ));
+                    }
+                } else {
+                    let union = left.union_estimate(right).unwrap();
+                    let a = left.estimate();
+                    let b = right.estimate();
+                    if [a, b, union].iter().any(|value| !value.is_finite()) {
+                        assert_eq!(intersection, Err(crate::SketchError::EstimateUnavailable));
+                        assert_eq!(jaccard, Err(crate::SketchError::EstimateUnavailable));
+                        assert_eq!(trait_jaccard, Err(crate::SketchError::EstimateUnavailable));
+                    } else {
+                        let intersection = intersection.unwrap();
+                        let jaccard = jaccard.unwrap();
+                        assert!(intersection.is_finite());
+                        assert!(0.0 <= intersection && intersection <= a.min(b));
+                        assert!(jaccard.is_finite() && (0.0..=1.0).contains(&jaccard));
+                        assert_eq!(trait_jaccard, Ok(jaccard));
+                        if a == 0.0 || b == 0.0 {
+                            assert_eq!(intersection, 0.0);
+                            assert_eq!(jaccard, if union == 0.0 { 1.0 } else { 0.0 });
+                        }
+                    }
+                }
+                assert_eq!(left.precision, left_before.precision);
+                assert_eq!(left.registers, left_before.registers);
+                assert_eq!(right.precision, right_before.precision);
+                assert_eq!(right.registers, right_before.registers);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_hll_operands_can_have_an_unavailable_saturated_union() {
+        let mut left = HyperLogLog::new(4).unwrap();
+        let mut right = HyperLogLog::new(4).unwrap();
+        for (index, (a, b)) in left
+            .registers
+            .iter_mut()
+            .zip(&mut right.registers)
+            .enumerate()
+        {
+            if index % 2 == 0 {
+                *a = 61;
+            } else {
+                *b = 61;
+            }
+        }
+        assert!(left.estimate().is_finite());
+        assert!(right.estimate().is_finite());
+        assert_eq!(left.union_estimate(&right), Ok(f64::INFINITY));
+        for (a, b) in [(&left, &right), (&right, &left)] {
+            assert_eq!(
+                a.intersection_estimate(b),
+                Err(crate::SketchError::EstimateUnavailable)
+            );
+            assert_eq!(
+                a.jaccard_index(b),
+                Err(crate::SketchError::EstimateUnavailable)
+            );
+        }
+    }
+
+    #[test]
     fn set_relation_helpers_reject_mismatched_precision() {
         let left = HyperLogLog::new(10).unwrap();
         let right = HyperLogLog::new(11).unwrap();
