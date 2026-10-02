@@ -42,6 +42,7 @@
 //! - [`minhash_lsh_index::MinHashLshIndex`] for approximate nearest-neighbor lookup.
 //! - [`reservoir_sampling::ReservoirSampling`] for uniform stream sampling.
 //! - [`vector_welford::VectorWelford`] for streaming vector moments without sketch approximation.
+//! - [`rv_coefficient::RvCoefficient`] for streaming RV coefficient matrix correlation.
 
 use core::fmt;
 use std::collections::hash_map::DefaultHasher;
@@ -58,6 +59,7 @@ pub mod minhash;
 pub mod minhash_lsh_index;
 pub mod minmax_sketch;
 pub mod reservoir_sampling;
+pub mod rv_coefficient;
 pub mod space_saving;
 pub mod tdigest;
 pub mod ultraloglog;

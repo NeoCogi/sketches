@@ -330,10 +330,9 @@ impl JaccardIndex for MinHash {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_HASH_FAMILY_SEED, MinHash, max_standard_error,
-        required_hashes_for_max_standard_error,
-    };
+    #[cfg(target_pointer_width = "64")]
+    use super::max_standard_error;
+    use super::{DEFAULT_HASH_FAMILY_SEED, MinHash, required_hashes_for_max_standard_error};
     use crate::{SketchError, splitmix64};
 
     fn sketch_for_range(start: u64, end: u64, num_hashes: usize) -> MinHash {
