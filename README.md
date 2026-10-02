@@ -22,12 +22,43 @@ This crate was designed by humans, but coded with AI.
 
 ## Add To A Project
 
-This repository is currently consumed as a local crate:
+Add the 0.2 release to your project with Cargo:
+
+```sh
+cargo add sketches@0.2
+```
+
+Or add it directly to your `Cargo.toml`:
+
+```toml
+[dependencies]
+sketches = "0.2"
+```
+
+Import a sketch from its module:
+
+```rust
+use sketches::hyperloglog::HyperLogLog;
+
+fn main() -> Result<(), sketches::SketchError> {
+    let mut distinct = HyperLogLog::new(12)?;
+    for user in ["alice", "bob", "alice"] {
+        distinct.add(&user);
+    }
+    println!("Estimated distinct users: {}", distinct.count());
+    Ok(())
+}
+```
+
+For an unpublished checkout or local development, use a path dependency instead:
 
 ```toml
 [dependencies]
 sketches = { path = "../sketches" }
 ```
+
+This crate uses Rust edition 2024. See [CHANGELOG.md](CHANGELOG.md) for the
+0.2 migration notes and [RELEASING.md](RELEASING.md) for publication steps.
 
 ## What Is Included
 
