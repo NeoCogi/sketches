@@ -45,7 +45,8 @@
 //!
 //! # Complexity
 //!
-//! Let `m` be the number of tracked counters and `k` the requested result size.
+//! Let `C` be the configured counter capacity, `m` the number of currently
+//! tracked counters (`m <= C`), and `k` the requested result size.
 //! The expected bounds assume expected `O(1)` hash-table operations and treat
 //! hashing, equality, and cloning one item as `O(1)`.
 //!
@@ -54,11 +55,15 @@
 //! | [`SpaceSaving::insert`] | expected `O(1)` | `O(1)` | One hash lookup and a constant number of link changes |
 //! | [`SpaceSaving::estimate`] / [`SpaceSaving::estimate_with_error`] / [`SpaceSaving::lower_bound`] | expected `O(1)` | `O(1)` | One hash lookup |
 //! | [`SpaceSaving::top_k`] | `O(min(k, m))` | `O(min(k, m))` | Traverses buckets from largest to smallest and clones only returned items |
-//! | [`SpaceSaving::merge`] | expected `O(m)` | `O(m)` | Hash combination, linear selection, and fixed-pass radix reconstruction |
+//! | [`SpaceSaving::merge`] | expected `O(C)` | `O(C)` | Combines counters and reconstructs an independently reserved full-capacity owner |
 //! | [`SpaceSaving::clear`] | `O(m)` | `O(1)` | Drops all tracked items and bucket links |
 //! | Other accessors | `O(1)` | `O(1)` | Read stored fields |
 //!
-//! The retained representation itself uses `O(capacity)` space.
+//! The retained representation itself uses `O(C)` space. Merge additionally
+//! reserves a replacement lookup table and counter arena for `C` counters,
+//! even when the inputs are empty or underfull. Existing inputs remain live
+//! until reconstruction succeeds; the replacement is then committed. The
+//! live-entry buffers and fixed-pass radix ordering also fit within `O(C)`.
 //!
 //! For a tracked item, the stored estimate is an upper bound and
 //! `estimate - error` is a lower bound on its frequency, provided the exact
@@ -296,7 +301,9 @@ where
     /// The operation uses `O(capacity)` temporary memory and expected
     /// `O(capacity)` time. Reconstructing the ordered Stream-Summary is linear:
     /// eight stable counting passes order the retained `u64` estimates without
-    /// introducing an `O(capacity * log(capacity))` comparison sort. The total
+    /// introducing an `O(capacity * log(capacity))` comparison sort. The new
+    /// lookup table and counter arena reserve the full configured capacity,
+    /// including for empty or underfull inputs. The total
     /// stream length is combined separately and saturates at [`u64::MAX`]. The
     /// receiver remains unchanged if compatibility validation or any internal
     /// storage reservation fails. The donor is always borrowed immutably.

@@ -304,6 +304,14 @@ only from `count` to `count + 1`. Equal counters share a bucket, count buckets
 stay linked in sorted order, and `top_k(k)` walks down from the largest bucket
 without sorting every retained counter.
 
+`merge` combines the estimates and error bounds, retaining at most the configured
+counter capacity. It uses expected `O(capacity)` time and `O(capacity)` additional
+storage: reconstruction reserves a separate lookup table and counter arena for
+the full capacity, including for empty or underfull inputs. The current number
+of tracked items can be much smaller than that reservation. The replacement is
+committed after reconstruction succeeds, preserving both summaries on an
+internal reservation error.
+
 For example:
 
 ```rust

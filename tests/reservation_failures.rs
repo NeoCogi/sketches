@@ -3,6 +3,8 @@
 //! The failure budget belongs to the current test thread. Allocator callbacks
 //! cannot borrow a caller-owned counter, so a thread-local Cell provides that
 //! narrowly scoped callback state without affecting concurrently running tests.
+//! Allocation-request accounting uses the same callback boundary; it records
+//! requested bytes, not allocator overhead, resident memory or peak live bytes.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -17,12 +19,34 @@ use sketches::space_saving::SpaceSaving;
 thread_local! {
     /// Remaining successful allocation requests; None delegates normally.
     static ALLOCATION_BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Optional accounting restricted to the current operation and test thread.
+    static REQUEST_ACCOUNTING: Cell<Option<AllocationRequests>> = const { Cell::new(None) };
+}
+
+/// Layout sizes requested through the allocator, including realloc destinations.
+#[derive(Clone, Copy, Default, Debug)]
+struct AllocationRequests {
+    /// Number of allocation requests; deallocations do not contribute.
+    requests: usize,
+    /// Sum of requested layout sizes; this is not a peak-memory measurement.
+    bytes: usize,
 }
 
 /// Delegates memory ownership to System while allowing a scoped null result.
 struct FailingAllocator;
 
 impl FailingAllocator {
+    /// Records a request without allocating, borrowing or changing ownership.
+    fn record_request(bytes: usize) {
+        let _ = REQUEST_ACCOUNTING.try_with(|accounting| {
+            if let Some(mut requests) = accounting.get() {
+                requests.requests = requests.requests.saturating_add(1);
+                requests.bytes = requests.bytes.saturating_add(bytes);
+                accounting.set(Some(requests));
+            }
+        });
+    }
+
     /// Consumes one request on the current thread without allocating itself.
     fn should_fail() -> bool {
         ALLOCATION_BUDGET
@@ -42,6 +66,7 @@ impl FailingAllocator {
 // and pointer ownership. Failure returns null, as required by GlobalAlloc.
 unsafe impl GlobalAlloc for FailingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        Self::record_request(layout.size());
         if Self::should_fail() {
             ptr::null_mut()
         } else {
@@ -51,6 +76,7 @@ unsafe impl GlobalAlloc for FailingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        Self::record_request(layout.size());
         if Self::should_fail() {
             ptr::null_mut()
         } else {
@@ -60,6 +86,7 @@ unsafe impl GlobalAlloc for FailingAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        Self::record_request(new_size);
         if Self::should_fail() {
             ptr::null_mut()
         } else {
@@ -96,6 +123,31 @@ impl FailureScope {
 impl Drop for FailureScope {
     fn drop(&mut self) {
         ALLOCATION_BUDGET.with(|budget| budget.set(None));
+    }
+}
+
+/// Ends operation-local accounting before assertion formatting can allocate.
+struct RequestScope;
+
+impl RequestScope {
+    /// Begins a non-nested accounting scope without modifying failure policy.
+    fn start() -> Self {
+        REQUEST_ACCOUNTING.with(|accounting| {
+            assert!(accounting.get().is_none(), "request scopes cannot nest");
+            accounting.set(Some(AllocationRequests::default()));
+        });
+        Self
+    }
+
+    /// Takes the measurements; Drop restores normal delegation on every path.
+    fn finish(self) -> AllocationRequests {
+        REQUEST_ACCOUNTING.with(|accounting| accounting.get().unwrap())
+    }
+}
+
+impl Drop for RequestScope {
+    fn drop(&mut self) {
+        REQUEST_ACCOUNTING.with(|accounting| accounting.set(None));
     }
 }
 
@@ -181,7 +233,22 @@ fn space_saving_constructor_reports_each_failed_initial_reservation() {
 
 #[test]
 fn space_saving_merge_reservation_failures_preserve_both_summaries_and_reuse() {
-    for (capacity, left_len, right_len) in [(1, 0, 0), (1, 1, 1), (3, 1, 2), (3, 3, 3), (8, 8, 8)] {
+    for (capacity, left_len, right_len) in [
+        (1, 0, 0),
+        (1, 1, 1),
+        (3, 1, 2),
+        (3, 3, 3),
+        (8, 8, 8),
+        (64, 0, 0),
+        (64, 1, 0),
+        (64, 0, 1),
+        (64, 1, 1),
+        (64, 1, 2),
+        (64, 63, 64),
+        (64, 64, 64),
+        (1024, 1, 1),
+        (4096, 0, 0),
+    ] {
         let mut original = SpaceSaving::new(capacity).unwrap();
         let mut donor = SpaceSaving::new(capacity).unwrap();
         for index in 0..left_len {
@@ -235,6 +302,76 @@ fn space_saving_merge_reservation_failures_preserve_both_summaries_and_reuse() {
         eprintln!(
             "capacity={capacity} left={left_len} right={right_len}: {failures} reservation failures verified"
         );
+    }
+}
+
+#[test]
+fn space_saving_sparse_merge_requests_capacity_sized_replacement_storage() {
+    for (left_len, right_len, overlap) in [
+        (0, 0, false),
+        (1, 0, false),
+        (0, 1, false),
+        (1, 1, true),
+        (1, 1, false),
+    ] {
+        let mut previous_bytes = None;
+        for capacity in [64, 256, 1024, 4096] {
+            let mut receiver = SpaceSaving::<u64>::new(capacity).unwrap();
+            let mut donor = SpaceSaving::<u64>::new(capacity).unwrap();
+            for _ in 0..left_len * 3 {
+                receiver.insert(7);
+            }
+            let donor_item = if overlap { 7 } else { 11 };
+            for _ in 0..right_len * 5 {
+                donor.insert(donor_item);
+            }
+            let before = summary_snapshot(&donor);
+            let scope = RequestScope::start();
+            let result = receiver.merge(&donor);
+            let requests = scope.finish();
+            result.unwrap();
+            assert_eq!(summary_snapshot(&donor), before);
+            assert_eq!(receiver.capacity(), capacity);
+            assert_eq!(
+                receiver.total_count(),
+                (left_len * 3 + right_len * 5) as u64
+            );
+            let expected_items = left_len + right_len - usize::from(overlap);
+            assert_eq!(receiver.tracked_items(), expected_items);
+            if left_len > 0 {
+                assert_eq!(
+                    receiver.estimate_with_error(&7),
+                    Some((3 + if overlap { 5 } else { 0 }, 0))
+                );
+            }
+            if right_len > 0 {
+                assert_eq!(
+                    receiver.estimate_with_error(&donor_item),
+                    Some((5 + if overlap { 3 } else { 0 }, 0))
+                );
+            }
+            // No internal layout coefficients are pinned. The fixed occupancy
+            // cases must request capacity-sized storage, including empty merge;
+            // quadrupling C should scale the measured requests approximately
+            // fourfold, with slack for table rounding and fixed bookkeeping.
+            assert!(requests.requests >= 2);
+            assert!(requests.bytes >= capacity * size_of::<u64>());
+            if let Some(previous) = previous_bytes {
+                assert!((3 * previous..=5 * previous).contains(&requests.bytes));
+            }
+            previous_bytes = Some(requests.bytes);
+            eprintln!(
+                "capacity={capacity} left={left_len} right={right_len} overlap={overlap}: {requests:?}"
+            );
+            // The rebuilt owner still supports growth up to its logical bound.
+            for item in 100..100 + capacity as u64 {
+                receiver.insert(item);
+            }
+            assert_eq!(receiver.tracked_items(), capacity);
+            receiver.clear();
+            receiver.insert(99);
+            assert_eq!(receiver.estimate_with_error(&99), Some((1, 0)));
+        }
     }
 }
 
