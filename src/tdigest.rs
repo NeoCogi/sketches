@@ -110,7 +110,7 @@ pub struct TDigest {
     compression: f64,
     /// Fully merged centroids, always ordered by mean.
     centroids: Vec<Centroid>,
-    /// Pending centroids ordered for allocation-free read-only queries.
+    /// Pending positive integer weights, ordered for read-only queries.
     buffered: BTreeMap<BufferedKey, u64>,
     /// Next tie-breaking key, reset when the pending buffer is compressed.
     next_sequence: u64,
@@ -504,7 +504,9 @@ impl TDigest {
 
 /// Borrowed merge of the compressed array and pending integer-weight buffer.
 struct OrderedCentroids<'a> {
+    /// Borrowed compressed means with exact integer weights.
     merged: std::iter::Peekable<std::slice::Iter<'a, Centroid>>,
+    /// Borrowed pending means and positive integer weights.
     buffered: std::iter::Peekable<std::collections::btree_map::Iter<'a, BufferedKey, u64>>,
 }
 
@@ -588,7 +590,7 @@ fn weighted_average(left: f64, left_weight: f64, right: f64, right_weight: f64) 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::{Centroid, TDigest, finite_lerp, weighted_average};
     use crate::SketchError;
@@ -620,6 +622,82 @@ mod tests {
         digest
     }
 
+    /// Checks mass independently in a wider integer, without float conversion.
+    fn assert_mass_invariant(digest: &TDigest) {
+        let mass: u128 = digest
+            .centroids
+            .iter()
+            .map(|centroid| u128::from(centroid.weight))
+            .chain(digest.buffered.values().map(|&weight| u128::from(weight)))
+            .sum();
+        assert_eq!(mass, u128::from(digest.count()));
+        let mut previous = f64::NEG_INFINITY;
+        for centroid in digest.ordered_centroids() {
+            assert!(centroid.weight > 0);
+            assert!(centroid.mean.is_finite());
+            assert!(previous <= centroid.mean);
+            assert!(digest.min <= centroid.mean && centroid.mean <= digest.max);
+            previous = centroid.mean;
+        }
+        assert_eq!(digest.is_empty(), digest.centroid_count() == 0);
+        if digest.is_empty() {
+            assert_eq!(digest.min, f64::INFINITY);
+            assert_eq!(digest.max, f64::NEG_INFINITY);
+        }
+    }
+
+    /// Compares every owned field and query bits, including the pending keys.
+    fn assert_same_state(actual: &TDigest, expected: &TDigest) {
+        assert_eq!(actual.compression.to_bits(), expected.compression.to_bits());
+        assert_eq!(actual.count, expected.count);
+        assert_eq!(actual.min.to_bits(), expected.min.to_bits());
+        assert_eq!(actual.max.to_bits(), expected.max.to_bits());
+        assert_eq!(actual.next_sequence, expected.next_sequence);
+        let centroids = |digest: &TDigest| {
+            digest
+                .centroids
+                .iter()
+                .map(|centroid| (centroid.mean.to_bits(), centroid.weight))
+                .collect::<Vec<_>>()
+        };
+        let buffered = |digest: &TDigest| {
+            digest
+                .buffered
+                .iter()
+                .map(|(key, &weight)| (key.mean.0.to_bits(), key.sequence, weight))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(centroids(actual), centroids(expected));
+        assert_eq!(buffered(actual), buffered(expected));
+        for q in [0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0] {
+            assert_eq!(
+                actual.quantile(q).map(f64::to_bits),
+                expected.quantile(q).map(f64::to_bits)
+            );
+        }
+    }
+
+    /// Tests query finiteness and order without imposing exact large ranks.
+    fn assert_usable_quantiles(digest: &TDigest) {
+        let mut previous = digest.min;
+        for step in 0..=1_000 {
+            let q = step as f64 / 1_000.0;
+            let value = digest.quantile(q).unwrap();
+            assert!(value.is_finite(), "q={q} count={}", digest.count());
+            assert!(digest.min <= value && value <= digest.max);
+            assert!(previous <= value, "q={q} previous={previous} value={value}");
+            previous = value;
+        }
+        assert_eq!(
+            digest.quantile(0.0).unwrap().to_bits(),
+            digest.min.to_bits()
+        );
+        assert_eq!(
+            digest.quantile(1.0).unwrap().to_bits(),
+            digest.max.to_bits()
+        );
+    }
+
     #[test]
     fn constructor_validates_compression() {
         assert!(TDigest::new(5.0).is_err());
@@ -634,43 +712,176 @@ mod tests {
         for _ in 0..62 {
             let copy = digest.clone();
             digest.merge(&copy).unwrap();
+            assert_mass_invariant(&digest);
         }
         assert!(digest.quantile(0.25).unwrap() < 0.0);
 
-        let before = format!("{digest:?}");
-        let queries = [0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0];
-        let quantiles = queries.map(|q| digest.quantile(q).unwrap().to_bits());
+        let before = digest.clone();
         let copy = digest.clone();
         assert_eq!(
             digest.merge(&copy),
             Err(SketchError::ObservationCountOverflow)
         );
         assert_eq!(digest.count(), 1_u64 << 63);
-        assert_eq!(format!("{digest:?}"), before);
-        assert_eq!(
-            queries.map(|q| digest.quantile(q).unwrap().to_bits()),
-            quantiles
-        );
+        assert_same_state(&digest, &before);
+        assert_usable_quantiles(&digest);
     }
 
     #[test]
     fn add_rejects_full_count_and_still_ignores_nonfinite_values() {
         let mut digest = repeated_value(3.0, u64::MAX, 10.0);
-        let before = format!("{digest:?}");
+        let before = digest.clone();
         for value in [-f64::MAX, 0.0, f64::MAX] {
             assert_eq!(
                 digest.add(value),
                 Err(SketchError::ObservationCountOverflow)
             );
-            assert_eq!(format!("{digest:?}"), before);
+            assert_same_state(&digest, &before);
         }
         for value in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
             assert_eq!(digest.add(value), Ok(()));
-            assert_eq!(format!("{digest:?}"), before);
+            assert_same_state(&digest, &before);
         }
         for q in [0.0, 0.25, 0.5, 0.75, 1.0] {
             assert_eq!(digest.quantile(q).unwrap(), 3.0);
         }
+    }
+
+    #[test]
+    fn exact_mass_survives_all_small_counts_and_every_binary_boundary() {
+        let mut counts: BTreeSet<u64> = (0..=255).collect();
+        for bit in 8..64 {
+            let power = 1_u64 << bit;
+            counts.extend([power - 1, power, power + 1]);
+        }
+        counts.extend([u64::MAX - 3, u64::MAX - 2, u64::MAX - 1, u64::MAX]);
+        assert_eq!(counts.len(), 427);
+
+        for compression in [10.0, 100.0] {
+            for &count in &counts {
+                let mut digest = repeated_value(3.0, count, compression);
+                assert_mass_invariant(&digest);
+                if count < u64::MAX {
+                    digest.add(7.0).unwrap();
+                    assert_eq!(digest.count(), count + 1);
+                    assert_mass_invariant(&digest);
+                }
+                if count < u64::MAX - 1 {
+                    let mut single = TDigest::new(compression).unwrap();
+                    single.add(-5.0).unwrap();
+                    digest.merge(&single).unwrap();
+                    assert_eq!(digest.count(), count + 2);
+                    assert_mass_invariant(&digest);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_merges_conserve_mass_and_keep_extreme_queries_usable() {
+        let pairs = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 3),
+            ((1_u64 << 53) - 1, 2),
+            (1_u64 << 53, 1),
+            (1_u64 << 53, 3),
+            (1_u64 << 63, (1_u64 << 63) - 1),
+            (u64::MAX - 1, 1),
+            (u64::MAX, 0),
+            (u64::MAX, 1),
+            (1_u64 << 63, 1_u64 << 63),
+        ];
+        for compression in [10.0, 40.0, 100.0] {
+            for (left_count, right_count) in pairs {
+                let mut left = repeated_value(-f64::MAX, left_count, compression);
+                let right = repeated_value(f64::MAX, right_count, compression);
+                let left_before = left.clone();
+                let right_before = right.clone();
+                let total = u128::from(left_count) + u128::from(right_count);
+                let result = left.merge(&right);
+                if total > u128::from(u64::MAX) {
+                    assert_eq!(result, Err(SketchError::ObservationCountOverflow));
+                    assert_same_state(&left, &left_before);
+                } else {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(u128::from(left.count()), total);
+                    assert_mass_invariant(&left);
+                    if !left.is_empty() {
+                        assert_usable_quantiles(&left);
+                    }
+                }
+                assert_same_state(&right, &right_before);
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_preserves_merged_buffered_and_source_state() {
+        let mut left = repeated_value(0.0, u64::MAX - 2, 10.0);
+        left.add(-1.0).unwrap();
+        left.add(1.0).unwrap();
+        assert!(!left.centroids.is_empty());
+        assert_eq!(left.buffered.len(), 2);
+        assert_eq!(left.next_sequence, 2);
+        let mut right = TDigest::new(10.0).unwrap();
+        right.add(-f64::MAX).unwrap();
+        right.add(f64::MAX).unwrap();
+        let left_before = left.clone();
+        let right_before = right.clone();
+
+        assert_eq!(
+            left.merge(&right),
+            Err(SketchError::ObservationCountOverflow)
+        );
+        assert_same_state(&left, &left_before);
+        assert_same_state(&right, &right_before);
+        assert_eq!(
+            left.add(f64::MAX),
+            Err(SketchError::ObservationCountOverflow)
+        );
+        assert_same_state(&left, &left_before);
+        assert_mass_invariant(&left);
+    }
+
+    #[test]
+    fn incompatible_compression_precedes_count_overflow_without_mutation() {
+        let mut left = repeated_value(3.0, u64::MAX, 10.0);
+        let mut right = TDigest::new(11.0).unwrap();
+        right.add(-f64::MAX).unwrap();
+        let left_before = left.clone();
+        let right_before = right.clone();
+        assert_eq!(
+            left.merge(&right),
+            Err(SketchError::IncompatibleSketches(
+                "compression must match for merge"
+            ))
+        );
+        assert_same_state(&left, &left_before);
+        assert_same_state(&right, &right_before);
+    }
+
+    #[test]
+    fn clear_at_count_limit_resets_all_state_and_allows_reuse() {
+        let mut digest = repeated_value(3.0, u64::MAX, 10.0);
+        digest.clear();
+        assert_eq!(digest.count(), 0);
+        assert_eq!(digest.next_sequence, 0);
+        assert_mass_invariant(&digest);
+        let empty = digest.clone();
+        for value in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            assert_eq!(digest.add(value), Ok(()));
+            assert_same_state(&digest, &empty);
+        }
+        digest.add(-f64::MAX).unwrap();
+        let mut other = TDigest::new(10.0).unwrap();
+        other.add(f64::MAX).unwrap();
+        digest.merge(&other).unwrap();
+        assert_eq!(digest.count(), 2);
+        assert_mass_invariant(&digest);
+        assert_usable_quantiles(&digest);
     }
 
     #[test]
