@@ -393,6 +393,13 @@ should automatically use the smaller precision. As with every hash-based
 distinct counter, raw values passed to `add_hash()` must be uniformly
 distributed high-quality 64-bit hashes.
 
+Scalar union, intersection and Jaccard queries on HLL and ULL allocate no heap
+workspace. They scan borrowed registers into fixed-size stack histograms,
+using `O(1)` additional space and time proportional to the larger input's
+register count. ULL reduces register groups at the smaller common precision
+during that scan. `merged()` and `downsize()` still return independently owned
+ULL sketches.
+
 `state()` borrows the serialized bytes and `into_state()` transfers ownership.
 `from_state()` consumes an owned byte vector, infers precision from its length,
 and validates every register before constructing the sketch. The length must

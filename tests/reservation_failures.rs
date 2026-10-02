@@ -1,4 +1,4 @@
-//! Exercises recoverable allocation failures through public sketch APIs.
+//! Exercises allocation failures and workspace bounds through public sketch APIs.
 //!
 //! The failure budget belongs to the current test thread. Allocator callbacks
 //! cannot borrow a caller-owned counter, so a thread-local Cell provides that
@@ -13,9 +13,11 @@ use std::ptr;
 use sketches::SketchError;
 use sketches::bloom_filter::BloomFilter;
 use sketches::cuckoo_filter::CuckooFilter;
+use sketches::hyperloglog::HyperLogLog;
 use sketches::minmax_sketch::MinMaxSketch;
 use sketches::reservoir_sampling::ReservoirSampling;
 use sketches::space_saving::SpaceSaving;
+use sketches::ultraloglog::UltraLogLog;
 
 thread_local! {
     /// Remaining successful allocation requests; None delegates normally.
@@ -196,6 +198,80 @@ impl Drop for RequestScope {
     fn drop(&mut self) {
         REQUEST_ACCOUNTING.with(|accounting| accounting.set(None));
     }
+}
+
+/// Measures only the query, ending accounting before result checks can allocate.
+fn without_allocation<T>(query: impl FnOnce() -> T) -> T {
+    let scope = RequestScope::start();
+    let result = query();
+    let requests = scope.finish();
+    assert_eq!(requests.requests, 0, "scalar query allocated");
+    assert_eq!(requests.bytes, 0);
+    result
+}
+
+#[test]
+fn hll_scalar_set_queries_need_no_heap_workspace() {
+    for precision in [4, 10, 18] {
+        let mut left = HyperLogLog::new(precision).unwrap();
+        let mut right = HyperLogLog::new(precision).unwrap();
+        for value in 0..1_000_u64 {
+            left.add(&value);
+            right.add(&(value + 500));
+        }
+        for (a, b) in [(&left, &right), (&right, &left), (&left, &left)] {
+            assert!(
+                without_allocation(|| a.union_estimate(b))
+                    .unwrap()
+                    .is_finite()
+            );
+            assert!(without_allocation(|| a.intersection_estimate(b)).is_ok());
+            assert!(without_allocation(|| a.jaccard_index(b)).is_ok());
+        }
+        let incompatible = HyperLogLog::new(if precision == 4 { 5 } else { 4 }).unwrap();
+        assert!(without_allocation(|| left.union_estimate(&incompatible)).is_err());
+        assert!(without_allocation(|| left.intersection_estimate(&incompatible)).is_err());
+        assert!(without_allocation(|| left.jaccard_index(&incompatible)).is_err());
+    }
+}
+
+#[test]
+fn ull_scalar_set_queries_need_no_heap_workspace() {
+    for (left_precision, right_precision) in [(3, 3), (10, 10), (16, 18)] {
+        let mut left = UltraLogLog::new(left_precision).unwrap();
+        let mut right = UltraLogLog::new(right_precision).unwrap();
+        for value in 0..1_000_u64 {
+            left.add(&value);
+            right.add(&(value + 500));
+        }
+        for (a, b) in [(&left, &right), (&right, &left), (&left, &left)] {
+            assert!(without_allocation(|| a.union_estimate(b)).is_finite());
+            assert!(without_allocation(|| a.intersection_estimate(b)).is_ok());
+            assert!(without_allocation(|| a.jaccard_index(b)).is_ok());
+        }
+    }
+    let saturated = UltraLogLog::from_state(vec![255; 8]).unwrap();
+    let empty = UltraLogLog::new(4).unwrap();
+    for (a, b) in [(&saturated, &empty), (&empty, &saturated)] {
+        assert!(without_allocation(|| a.union_estimate(b)).is_infinite());
+        assert_eq!(
+            without_allocation(|| a.intersection_estimate(b)),
+            Err(SketchError::EstimateUnavailable)
+        );
+        assert_eq!(
+            without_allocation(|| a.jaccard_index(b)),
+            Err(SketchError::EstimateUnavailable)
+        );
+    }
+
+    // APIs returning register owners still allocate independent storage.
+    let scope = RequestScope::start();
+    let merged = saturated.merged(&empty);
+    let downsized = empty.downsize(3).unwrap();
+    let requests = scope.finish();
+    assert!(requests.requests >= 2);
+    assert_eq!(merged.precision(), 3);
+    assert_eq!(downsized.precision(), 3);
 }
 
 #[test]

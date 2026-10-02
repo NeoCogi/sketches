@@ -55,6 +55,11 @@
 //! empty/saturated comparisons. Cardinality and union estimates retain their
 //! supported infinite result.
 //!
+//! Scalar set queries reduce borrowed register groups into fixed-size stack
+//! histograms. They take `O(2^max(p_left, p_right))` time and `O(1)` additional
+//! space, with no heap allocation. APIs returning a merged or downsized sketch
+//! still create independently owned register storage.
+//!
 //! [Ertl 2024]: https://arxiv.org/abs/2308.16862
 //! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 //! [Hash4j]: https://github.com/dynatrace-oss/hash4j
@@ -396,9 +401,12 @@ impl UltraLogLog {
 
     /// Estimates cardinality using the selected estimator.
     pub fn estimate_with(&self, estimator: UltraLogLogEstimator) -> f64 {
+        let histogram = self.register_histogram();
         match estimator {
-            UltraLogLogEstimator::OptimalFgra => self.estimate_fgra(),
-            UltraLogLogEstimator::MaximumLikelihood => self.estimate_maximum_likelihood(),
+            UltraLogLogEstimator::OptimalFgra => Self::estimate_fgra(&histogram, self.precision),
+            UltraLogLogEstimator::MaximumLikelihood => {
+                Self::estimate_maximum_likelihood(&histogram, self.precision)
+            }
         }
     }
 
@@ -456,46 +464,13 @@ impl UltraLogLog {
             ));
         }
 
-        if other.precision == self.precision {
-            // Equal partitions can combine their retained prefix flags
-            // register by register.
-            for (left, &right) in self.registers.iter_mut().zip(&other.registers) {
-                if right != 0 {
-                    *left = Self::pack(Self::unpack(*left) | Self::unpack(right));
-                }
-            }
-            return Ok(());
-        }
-
-        // Each lower-precision register corresponds to one contiguous group in
-        // the source. Group zero retains its source prefix; nonzero group
-        // addresses themselves encode observations after reduction.
-        let precision_difference = other.precision - self.precision;
-        let group_size = 1_usize << precision_difference;
-        let other_precision_minus_one = u32::from(other.precision - 1);
-
-        for (index, register) in self.registers.iter_mut().enumerate() {
-            let group_start = index * group_size;
-            let mut hash_prefix =
-                Self::unpack(*register) | Self::unpack(other.registers[group_start]);
-
-            // A nonempty nonzero subregister contributes the rank implied by
-            // the first set bit in its discarded address suffix. Its internal
-            // rank is irrelevant because the address difference appears first.
-            for offset in 1..group_size {
-                if other.registers[group_start + offset] != 0 {
-                    let observation_bit =
-                        (offset as u64).leading_zeros() + other_precision_minus_one;
-                    // The paper/reference formula is expressed with Java's
-                    // masked long shifts; preserve its modulo-64 bit index.
-                    hash_prefix |= 1_u64 << (observation_bit & 63);
-                }
-            }
-
-            // Preserve the canonical zero byte for a group with no observations.
-            if hash_prefix != 0 {
-                *register = Self::pack(hash_prefix);
-            }
+        let group_size = 1_usize << (other.precision - self.precision);
+        for (register, group) in self
+            .registers
+            .iter_mut()
+            .zip(other.registers.chunks_exact(group_size))
+        {
+            *register = Self::merge_register_group(*register, group, other.precision);
         }
         Ok(())
     }
@@ -521,10 +496,19 @@ impl UltraLogLog {
 
     /// Returns the estimated union cardinality at the smaller input precision.
     ///
+    /// Borrowed register groups feed a fixed-size histogram directly; no
+    /// merged sketch or reduced operand is allocated.
+    ///
     /// Valid saturation can produce infinity. Intersection and Jaccard queries
     /// report an unavailable estimate when they require such a cardinality.
     pub fn union_estimate(&self, other: &Self) -> f64 {
-        self.merged(other).estimate()
+        let precision = self.precision.min(other.precision);
+        let mut histogram = [0_u64; 256];
+        for (left, right) in self.aligned_register_pairs(other) {
+            let union = Self::merge_register_group(left, &[right], precision);
+            histogram[union as usize] += 1;
+        }
+        Self::estimate_fgra(&histogram, precision)
     }
 
     /// Returns the estimated intersection cardinality `|A ∩ B|`.
@@ -597,43 +581,75 @@ impl UltraLogLog {
 
     /// Computes shared inclusion-exclusion outputs at a common precision.
     ///
-    /// Reducing a higher-precision operand before estimating its cardinality
+    /// Reducing a higher-precision operand while collecting its histogram
     /// keeps all three estimates on the same register partition and avoids
     /// combining a high-resolution operand estimate with a lower-resolution
     /// union estimate.
     /// Nonfinite aligned cardinalities propagate the shared unavailable error;
     /// neither operand is mutated on success or failure.
     fn relation_estimates(&self, other: &Self) -> Result<InclusionExclusionEstimates, SketchError> {
-        // Reduce the higher-precision side exactly once, then keep the complete
-        // relation calculation on that shared partition.
-        if self.precision == other.precision {
-            Self::relation_estimates_at_common_precision(self, other)
-        } else if self.precision < other.precision {
-            let reduced_other = other
-                .downsize(self.precision)
-                .expect("the lower input precision is always a valid reduction target");
-            Self::relation_estimates_at_common_precision(self, &reduced_other)
-        } else {
-            let reduced_self = self
-                .downsize(other.precision)
-                .expect("the lower input precision is always a valid reduction target");
-            Self::relation_estimates_at_common_precision(&reduced_self, other)
+        let precision = self.precision.min(other.precision);
+        let mut left_histogram = [0_u64; 256];
+        let mut right_histogram = [0_u64; 256];
+        let mut union_histogram = [0_u64; 256];
+        // All three cardinalities use the same partition and ascending byte
+        // order as owned reduction/merge. No register-sized owner is needed.
+        for (left, right) in self.aligned_register_pairs(other) {
+            let union = Self::merge_register_group(left, &[right], precision);
+            left_histogram[left as usize] += 1;
+            right_histogram[right as usize] += 1;
+            union_histogram[union as usize] += 1;
         }
+        inclusion_exclusion_estimates(
+            Self::estimate_fgra(&left_histogram, precision),
+            Self::estimate_fgra(&right_histogram, precision),
+            Self::estimate_fgra(&union_histogram, precision),
+        )
     }
 
-    /// Calculates cardinality relations for two already aligned register
-    /// partitions, propagating the shared finite-cardinality requirement.
-    fn relation_estimates_at_common_precision(
-        left: &Self,
-        right: &Self,
-    ) -> Result<InclusionExclusionEstimates, SketchError> {
-        debug_assert_eq!(left.precision, right.precision);
+    /// Borrows each input's contiguous source groups and yields their register
+    /// values at the smaller precision. Equal precision gives one-byte groups.
+    /// Canonical pack/unpack retains the largest observation and flags for its
+    /// two preceding ranks; discarded lower bits cannot affect a later union.
+    fn aligned_register_pairs<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> impl Iterator<Item = (u8, u8)> + 'a {
+        let precision = self.precision.min(other.precision);
+        let left_group_size = 1_usize << (self.precision - precision);
+        let right_group_size = 1_usize << (other.precision - precision);
+        self.registers
+            .chunks_exact(left_group_size)
+            .zip(other.registers.chunks_exact(right_group_size))
+            .map(move |(left, right)| {
+                (
+                    Self::merge_register_group(0, left, self.precision),
+                    Self::merge_register_group(0, right, other.precision),
+                )
+            })
+    }
 
-        // Estimating all three cardinalities from aligned partitions preserves
-        // their useful covariance before shared mechanics apply feasibility
-        // clamps and the two-empty-set convention.
-        let union = left.merged(right).estimate();
-        inclusion_exclusion_estimates(left.estimate(), right.estimate(), union)
+    /// Combines a target register with one contiguous source group, without
+    /// allocating or mutating either input. `source` is a nonempty power-of-two
+    /// group of valid registers at `source_precision`; its length defines the
+    /// precision reduction, and `target` is valid at the resulting precision.
+    /// This is the authoritative register law for both merge and scalar queries.
+    fn merge_register_group(target: u8, source: &[u8], source_precision: u8) -> u8 {
+        debug_assert!(source.len().is_power_of_two());
+        let mut hash_prefix = Self::unpack(target) | Self::unpack(source[0]);
+        // Group zero keeps its prefix. A nonempty nonzero subregister instead
+        // contributes the rank encoded by its discarded address suffix; that
+        // address difference precedes its internal suffix observation.
+        for (offset, &register) in source.iter().enumerate().skip(1) {
+            if register != 0 {
+                let observation_bit =
+                    (offset as u64).leading_zeros() + u32::from(source_precision - 1);
+                // Match the reference formula's modulo-64 Java long shift.
+                hash_prefix |= 1_u64 << (observation_bit & 63);
+            }
+        }
+        // pack preserves the canonical zero byte for an empty group.
+        Self::pack(hash_prefix)
     }
 
     /// Expands one encoded register into its retained hash-prefix bits.
@@ -662,10 +678,11 @@ impl UltraLogLog {
     }
 
     /// Implements the paper's optimal further-generalized remaining-area
-    /// cardinality estimator.
-    fn estimate_fgra(&self) -> f64 {
-        let register_count = self.register_count() as u64;
-        let offset = i32::from(self.precision << 2) + 4;
+    /// cardinality estimator from valid byte multiplicities at `precision`.
+    /// Ascending byte order preserves the arithmetic of owned-state estimation.
+    fn estimate_fgra(histogram: &[u64; 256], precision: u8) -> f64 {
+        let register_count = 1_u64 << precision;
+        let offset = i32::from(precision << 2) + 4;
 
         let mut small_counts = [0_u64; 4];
         let mut saturated_counts = [0_u64; 4];
@@ -673,7 +690,7 @@ impl UltraLogLog {
 
         // Classify the 256 possible bytes once. Ordinary registers use a table;
         // boundary registers are deferred to the analytical range corrections.
-        for (register, count) in self.register_histogram().into_iter().enumerate() {
+        for (register, count) in histogram.iter().copied().enumerate() {
             if count == 0 {
                 continue;
             }
@@ -726,7 +743,7 @@ impl UltraLogLog {
             sum += Self::fgra_large_range_contribution(
                 saturated_counts,
                 register_count,
-                65 - i32::from(self.precision),
+                65 - i32::from(precision),
             );
         }
 
@@ -886,29 +903,32 @@ impl UltraLogLog {
         sum * power_2_minus_tau.powi(w) / ((1.0 + root_z) * (1.0 + z))
     }
 
-    /// Implements UltraLogLog's bias-reduced maximum-likelihood estimator.
-    fn estimate_maximum_likelihood(&self) -> f64 {
+    /// Implements UltraLogLog's bias-reduced maximum-likelihood estimator from
+    /// valid byte multiplicities. Integer scaling and ascending byte order are
+    /// identical to owned-state estimation; histogram total must equal `2^p`.
+    fn estimate_maximum_likelihood(histogram: &[u64; 256], precision: u8) -> f64 {
         let mut sum = 0_u64;
         let mut b = [0_u64; 65];
 
         // Convert byte multiplicities into the sufficient statistics of the
         // Poisson likelihood. Integer accumulation preserves the reference
         // implementation's modulo-2^64 scaling exactly.
-        for (register, count) in self.register_histogram().into_iter().enumerate() {
+        for (register, count) in histogram.iter().copied().enumerate() {
             if count != 0 {
                 sum = sum.wrapping_add(Self::mle_contribution(
                     register as u8,
                     count,
                     &mut b,
-                    self.precision,
+                    precision,
                 ));
             }
         }
 
         // A zero scaled sum has exactly two valid causes: every register is
-        // empty or every register is saturated. One byte distinguishes them.
+        // empty or every register is saturated. The empty-byte multiplicity
+        // distinguishes them without requiring a register owner.
         if sum == 0 {
-            return if self.registers[0] == 0 {
+            return if histogram[0] == 1_u64 << precision {
                 0.0
             } else {
                 f64::INFINITY
@@ -917,9 +937,9 @@ impl UltraLogLog {
 
         // Fold the unreachable terminal bucket into the last observable one,
         // then solve the normalized likelihood equation and undo its scaling.
-        let q = 64 - usize::from(self.precision);
+        let q = 64 - usize::from(precision);
         b[q - 1] += b[q];
-        let register_count = self.register_count() as f64;
+        let register_count = (1_u64 << precision) as f64;
         let factor = 2.0 * register_count;
         let a = sum as f64 * factor * 2_f64.powi(-64);
         let root = Self::solve_maximum_likelihood_equation(
@@ -1151,7 +1171,7 @@ mod tests {
                 let precision = left.precision().min(right.precision());
                 let aligned_left = left.downsize(precision).unwrap();
                 let aligned_right = right.downsize(precision).unwrap();
-                let union = aligned_left.union_estimate(&aligned_right);
+                let union = aligned_left.merged(&aligned_right).estimate();
                 let a = aligned_left.estimate();
                 let b = aligned_right.estimate();
                 assert_eq!(left.union_estimate(right).to_bits(), union.to_bits());
@@ -1571,6 +1591,204 @@ mod tests {
     /// each other possible leading-zero count.
     fn hash_for_observation_bit(bit: u8) -> u64 {
         if bit == 63 { 0 } else { 1_u64 << (62 - bit) }
+    }
+
+    /// Replays the observations retained by a legal byte through public raw
+    /// ingestion, independently of the merge/reduction helpers. The source
+    /// index and precision reconstruct hashes before the target discards bits.
+    fn replay_register(target: &mut UltraLogLog, register: u8, index: usize, source_precision: u8) {
+        if register == 0 {
+            return;
+        }
+        let highest = register >> 2;
+        for (bit, present) in [
+            (highest, true),
+            (highest - 1, register & 2 != 0),
+            (highest - 2, register & 1 != 0),
+        ] {
+            if present {
+                let hash =
+                    ((index as u64) << (64 - source_precision)) | hash_for_observation_bit(bit);
+                target.add_hash(hash);
+            }
+        }
+    }
+
+    #[test]
+    fn register_union_matches_raw_observations_for_every_legal_byte_pair() {
+        let mut direct = UltraLogLog::new(3).unwrap();
+        for precision in 3..=26 {
+            let reachable = reachable_register_bytes(precision);
+            for left in (0..=255_u8).filter(|&r| reachable[r as usize]) {
+                for right in (0..=255_u8).filter(|&r| reachable[r as usize]) {
+                    direct.clear();
+                    // Byte encoding is independent of precision. Replaying at
+                    // p=3 can represent every higher-precision legal byte while
+                    // keeping this exhaustive oracle's owned state small.
+                    replay_register(&mut direct, left, 0, precision);
+                    replay_register(&mut direct, right, 0, precision);
+                    assert_eq!(
+                        UltraLogLog::merge_register_group(left, &[right], precision),
+                        direct.state()[0],
+                        "precision={precision}, left={left}, right={right}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn histogram_estimators_preserve_boundaries_at_every_supported_precision() {
+        for precision in 3..=26 {
+            let reachable = reachable_register_bytes(precision);
+            let mut histogram = [0_u64; 256];
+            for register in (0..=255_u8).filter(|&r| reachable[r as usize]) {
+                histogram[register as usize] = 1_u64 << precision;
+                for estimate in [
+                    UltraLogLog::estimate_fgra(&histogram, precision),
+                    UltraLogLog::estimate_maximum_likelihood(&histogram, precision),
+                ] {
+                    match register {
+                        0 => assert_eq!(estimate.to_bits(), 0_f64.to_bits()),
+                        255 => assert_eq!(estimate, f64::INFINITY),
+                        _ => assert!(estimate.is_finite() && estimate > 0.0),
+                    }
+                }
+                histogram[register as usize] = 0;
+            }
+            histogram[0] = 1_u64 << (precision - 1);
+            histogram[255] = 1_u64 << (precision - 1);
+            assert!(UltraLogLog::estimate_fgra(&histogram, precision).is_finite());
+            assert!(UltraLogLog::estimate_maximum_likelihood(&histogram, precision).is_finite());
+        }
+    }
+
+    #[test]
+    fn register_reduction_matches_raw_hashes_through_maximum_precision_gap() {
+        for source_precision in 3..=26 {
+            let group_size = 1_usize << (source_precision - 3);
+            let mut group = vec![0; group_size];
+            let mut direct = UltraLogLog::new(3).unwrap();
+            // Exercise zero, each discarded-address rank, and the final offset.
+            group[0] = 4 * source_precision - 4;
+            for bit in 0..source_precision - 3 {
+                group[1_usize << bit] = 255;
+            }
+            group[group_size - 1] = 4 * source_precision + 2;
+            for (index, &register) in group.iter().enumerate() {
+                replay_register(&mut direct, register, index, source_precision);
+            }
+            assert_eq!(
+                UltraLogLog::merge_register_group(0, &group, source_precision),
+                direct.state()[0],
+                "source precision={source_precision}"
+            );
+            // A nonempty target must retain observations when source groups
+            // add lower ranks, and may acquire additional predecessor flags.
+            let mut target = UltraLogLog::new(3).unwrap();
+            target.add_hash(hash_for_observation_bit(63));
+            let original = target.state()[0];
+            for (index, &register) in group.iter().enumerate() {
+                replay_register(&mut target, register, index, source_precision);
+            }
+            assert_eq!(
+                UltraLogLog::merge_register_group(original, &group, source_precision),
+                target.state()[0]
+            );
+            group.fill(0);
+            assert_eq!(
+                UltraLogLog::merge_register_group(0, &group, source_precision),
+                0
+            );
+            assert_eq!(
+                UltraLogLog::merge_register_group(original, &group, source_precision),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_queries_match_owned_histograms_and_result_bits() {
+        for left_precision in [3, 4, 6, 8, 10] {
+            for right_precision in [3, 4, 6, 8, 10] {
+                let left_legal = reachable_register_bytes(left_precision);
+                let right_legal = reachable_register_bytes(right_precision);
+                let left_bytes: Vec<_> = (0..=255_u8).filter(|&r| left_legal[r as usize]).collect();
+                let right_bytes: Vec<_> =
+                    (0..=255_u8).filter(|&r| right_legal[r as usize]).collect();
+                for case in 0..6 {
+                    let left = UltraLogLog::from_state(
+                        (0..1_usize << left_precision)
+                            .map(|i| match case {
+                                0 => 0,
+                                1 => 255,
+                                2 if i % 2 == 0 => 255,
+                                2 => 0,
+                                _ => left_bytes[(i * 37 + case) % left_bytes.len()],
+                            })
+                            .collect(),
+                    )
+                    .unwrap();
+                    let right = UltraLogLog::from_state(
+                        (0..1_usize << right_precision)
+                            .map(|i| match case {
+                                0 | 1 => 0,
+                                2 if i % 2 == 1 => 255,
+                                2 => 0,
+                                _ => right_bytes[(i * 71 + case) % right_bytes.len()],
+                            })
+                            .collect(),
+                    )
+                    .unwrap();
+                    let left_before = left.clone();
+                    let right_before = right.clone();
+                    let precision = left_precision.min(right_precision);
+                    let aligned_left = left.downsize(precision).unwrap();
+                    let aligned_right = right.downsize(precision).unwrap();
+                    let owned_union = left.merged(&right);
+                    let mut left_histogram = [0_u64; 256];
+                    let mut right_histogram = [0_u64; 256];
+                    for (a, b) in left.aligned_register_pairs(&right) {
+                        left_histogram[a as usize] += 1;
+                        right_histogram[b as usize] += 1;
+                    }
+                    assert_eq!(left_histogram, aligned_left.register_histogram());
+                    assert_eq!(right_histogram, aligned_right.register_histogram());
+                    // Both extracted estimators must retain the empty/saturated
+                    // distinction as well as ordinary mixed-byte results.
+                    assert_eq!(
+                        UltraLogLog::estimate_maximum_likelihood(&left_histogram, precision)
+                            .to_bits(),
+                        aligned_left.estimate_mle().to_bits()
+                    );
+                    let union = owned_union.estimate();
+                    let relations = crate::jaccard::inclusion_exclusion_estimates(
+                        aligned_left.estimate(),
+                        aligned_right.estimate(),
+                        union,
+                    );
+                    for (a, b) in [(&left, &right), (&right, &left)] {
+                        assert_eq!(a.union_estimate(b).to_bits(), union.to_bits());
+                        assert_eq!(
+                            a.intersection_estimate(b).map(f64::to_bits),
+                            relations
+                                .as_ref()
+                                .map(|r| r.intersection.to_bits())
+                                .map_err(Clone::clone)
+                        );
+                        assert_eq!(
+                            a.jaccard_index(b).map(f64::to_bits),
+                            relations
+                                .as_ref()
+                                .map(|r| r.jaccard.to_bits())
+                                .map_err(Clone::clone)
+                        );
+                    }
+                    assert_eq!(left, left_before);
+                    assert_eq!(right, right_before);
+                }
+            }
+        }
     }
 
     #[test]

@@ -60,6 +60,10 @@
 //! these relations, including self and empty/saturated comparisons. Cardinality
 //! and union estimates retain their supported infinite result.
 //!
+//! Scalar set queries scan borrowed registers and use fixed-size stack
+//! multiplicities: `O(2^p)` time and `O(1)` additional space, with no heap
+//! allocation. Mutable merging still updates the receiver's owned registers.
+//!
 //! [Ertl 2017]: https://arxiv.org/pdf/1702.01284
 
 use std::hash::Hash;
@@ -198,8 +202,7 @@ impl HyperLogLog {
             counts[register as usize] += 1;
         }
 
-        let suffix_bits = HASH_BITS - self.precision as usize;
-        Self::maximum_likelihood_estimate(&counts[..=suffix_bits + 1], self.register_count())
+        Self::estimate_counts(&counts, self.precision)
     }
 
     /// Returns the estimated cardinality rounded to `u64`.
@@ -238,8 +241,9 @@ impl HyperLogLog {
 
     /// Returns the estimated union cardinality `|A ∪ B|`.
     ///
-    /// This clones `self`, merges `other` into that clone using register-wise
-    /// maxima, then estimates the resulting merged sketch.
+    /// This counts register-wise maxima directly from borrowed inputs, then
+    /// applies the same estimator as an owned merge. It takes `O(2^p)` time,
+    /// fixed-size stack workspace and no heap allocation.
     ///
     /// # Example
     /// ```rust
@@ -264,9 +268,17 @@ impl HyperLogLog {
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when precision differs.
     pub fn union_estimate(&self, other: &Self) -> Result<f64, SketchError> {
-        let mut union = self.clone();
-        union.merge(other)?;
-        Ok(union.estimate())
+        if self.precision != other.precision {
+            return Err(SketchError::IncompatibleSketches(
+                "precision must match for merge",
+            ));
+        }
+
+        let mut counts = [0_usize; MAX_REGISTER_COUNTS];
+        for (&left, &right) in self.registers.iter().zip(&other.registers) {
+            counts[left.max(right) as usize] += 1;
+        }
+        Ok(Self::estimate_counts(&counts, self.precision))
     }
 
     /// Returns the estimated intersection cardinality `|A ∩ B|`.
@@ -387,6 +399,14 @@ impl HyperLogLog {
         let max_rank = 64 - precision as u32 + 1;
         let rank = suffix.leading_zeros() + 1;
         rank.min(max_rank) as u8
+    }
+
+    /// Estimates valid register multiplicities at `precision`, whether collected
+    /// from a sketch or borrowed register-wise maxima. The fixed buffer holds
+    /// every supported rank; only the precision's observable range reaches MLE.
+    fn estimate_counts(counts: &[usize; MAX_REGISTER_COUNTS], precision: u8) -> f64 {
+        let suffix_bits = HASH_BITS - precision as usize;
+        Self::maximum_likelihood_estimate(&counts[..=suffix_bits + 1], 1_usize << precision)
     }
 
     /// Implements the maximum-likelihood cardinality estimator from Algorithm 8
@@ -609,6 +629,68 @@ mod tests {
         let mut saturated = [0_usize; 58];
         saturated[57] = 256;
         assert!(HyperLogLog::maximum_likelihood_estimate(&saturated, 256).is_infinite());
+    }
+
+    #[test]
+    fn borrowed_set_queries_match_owned_merge_bits_at_every_precision() {
+        for precision in super::MIN_PRECISION..=super::MAX_PRECISION {
+            let maximum = 65 - precision;
+            for case in 0..8 {
+                let mut left = HyperLogLog::new(precision).unwrap();
+                let mut right = HyperLogLog::new(precision).unwrap();
+                for (index, (a, b)) in left
+                    .registers
+                    .iter_mut()
+                    .zip(&mut right.registers)
+                    .enumerate()
+                {
+                    // Legal empty, identical, complementary saturated, fully
+                    // saturated and mixed-rank states exercise estimator tails.
+                    (*a, *b) = match case {
+                        0 => (0, 0),
+                        1 => (0, 1),
+                        2 => (maximum / 2, maximum / 2),
+                        3 if index % 2 == 0 => (maximum, 0),
+                        3 => (0, maximum),
+                        4 => (maximum, maximum),
+                        _ => (
+                            (crate::splitmix64(index as u64 + case) % u64::from(maximum + 1)) as u8,
+                            (crate::splitmix64(index as u64 + case + 71) % u64::from(maximum + 1))
+                                as u8,
+                        ),
+                    };
+                }
+                let left_before = left.clone();
+                let right_before = right.clone();
+                let mut owned = left.clone();
+                owned.merge(&right).unwrap();
+                let union = owned.estimate();
+                let relations = crate::jaccard::inclusion_exclusion_estimates(
+                    left.estimate(),
+                    right.estimate(),
+                    union,
+                );
+                for (a, b) in [(&left, &right), (&right, &left)] {
+                    assert_eq!(a.union_estimate(b).unwrap().to_bits(), union.to_bits());
+                    assert_eq!(
+                        a.intersection_estimate(b).map(f64::to_bits),
+                        relations
+                            .as_ref()
+                            .map(|r| r.intersection.to_bits())
+                            .map_err(Clone::clone)
+                    );
+                    assert_eq!(
+                        a.jaccard_index(b).map(f64::to_bits),
+                        relations
+                            .as_ref()
+                            .map(|r| r.jaccard.to_bits())
+                            .map_err(Clone::clone)
+                    );
+                }
+                assert_eq!(left.registers, left_before.registers);
+                assert_eq!(right.registers, right_before.registers);
+            }
+        }
     }
 
     #[test]
