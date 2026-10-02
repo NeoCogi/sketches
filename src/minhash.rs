@@ -119,12 +119,20 @@ impl MinHash {
     ///
     /// For `k` independent ideal MinHash components and true Jaccard similarity
     /// `J`, the estimator's standard error is `sqrt(J * (1 - J) / k)`. Its
-    /// maximum over `J` is `1 / (2 * sqrt(k))`, so this constructor selects the
-    /// smallest `k` whose worst-case standard error does not exceed the target.
+    /// maximum over `J` is `1 / (2 * sqrt(k))`. This constructor starts from
+    /// `ceil((0.5 / max_standard_error)^2)`, then increases the width until
+    /// [`Self::worst_case_standard_error`] does not exceed the target.
+    ///
+    /// Sizing and the reported model error use ordinary `f64` arithmetic. The
+    /// result satisfies `sketch.worst_case_standard_error() <= max_standard_error`
+    /// without a tolerance; sizing is conservative at rounding boundaries and
+    /// does not promise exact mathematical minimality. Finite targets at least
+    /// `0.5` select one component. Explicit widths remain available via [`Self::new`].
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] when `max_standard_error` is
-    /// non-finite, non-positive, or requires an unrepresentable signature.
+    /// non-finite, non-positive, or requires an unrepresentable or unallocatable
+    /// signature. Width validation finishes before sketch allocation.
     pub fn with_error_rate(max_standard_error: f64) -> Result<Self, SketchError> {
         let num_hashes = required_hashes_for_max_standard_error(max_standard_error)?;
         Self::new(num_hashes)
@@ -132,8 +140,11 @@ impl MinHash {
 
     /// Returns the worst-case standard error under the independent-component
     /// MinHash model.
+    ///
+    /// Evaluates `0.5 / sqrt(k)` with ordinary `f64` rounding. Error-based
+    /// construction validates its target against this same calculation.
     pub fn worst_case_standard_error(&self) -> f64 {
-        0.5 / (self.num_hashes() as f64).sqrt()
+        max_standard_error(self.num_hashes())
     }
 
     /// Returns the standard error at a specified true Jaccard similarity under
@@ -267,22 +278,44 @@ impl MinHash {
     }
 }
 
-fn required_hashes_for_max_standard_error(max_standard_error: f64) -> Result<usize, SketchError> {
-    if !max_standard_error.is_finite() || max_standard_error <= 0.0 {
+/// Reports the rounded worst-case model error for a positive signature width.
+///
+/// Constructors guarantee `num_hashes >= 1`. Keeping one arithmetic owner makes
+/// the sizing postcondition agree with the public accessor, including rounding.
+fn max_standard_error(num_hashes: usize) -> f64 {
+    0.5 / (num_hashes as f64).sqrt()
+}
+
+/// Selects a representable width satisfying the reported error target.
+///
+/// The floating inverse gives an initial conservative candidate; its rounded
+/// ceiling can still undersize a boundary, so verify the shared error calculation
+/// and use checked increments before allocating. This promises the rounded
+/// accessor postcondition, not exact-real minimality or a fixed correction count.
+fn required_hashes_for_max_standard_error(target: f64) -> Result<usize, SketchError> {
+    if !target.is_finite() || target <= 0.0 {
         return Err(SketchError::InvalidParameter(
             "standard error must be finite and greater than zero",
         ));
     }
 
-    let root = 0.5 / max_standard_error;
-    let required = root * root;
-    if !required.is_finite() || required.ceil() >= usize::MAX as f64 {
+    let root = 0.5 / target;
+    let required = (root * root).ceil();
+    if !required.is_finite() || required >= usize::MAX as f64 {
         return Err(SketchError::InvalidParameter(
             "requested standard error requires too many hashes",
         ));
     }
 
-    Ok((required.ceil() as usize).max(1))
+    let mut num_hashes = (required as usize).max(1);
+    while max_standard_error(num_hashes) > target {
+        num_hashes = num_hashes
+            .checked_add(1)
+            .ok_or(SketchError::InvalidParameter(
+                "requested standard error requires too many hashes",
+            ))?;
+    }
+    Ok(num_hashes)
 }
 
 impl JacardIndex for MinHash {
@@ -350,24 +383,31 @@ mod tests {
     }
 
     #[test]
-    fn error_rate_constructor_selects_the_minimal_width() {
-        for target in [0.49, 0.25, 0.1, 0.05, 0.01] {
+    fn error_rate_constructor_selects_a_conservative_width() {
+        for (target, expected_width) in [(0.49, 2), (0.25, 4), (0.1, 25), (0.05, 100), (0.01, 2500)]
+        {
             let sketch = MinHash::with_error_rate(target).unwrap();
             let num_hashes = sketch.num_hashes();
             let selected_error = sketch.worst_case_standard_error();
             assert!(
-                selected_error <= target * (1.0 + 16.0 * f64::EPSILON),
+                selected_error <= target,
                 "target={target} k={num_hashes} error={selected_error}"
             );
-
-            if num_hashes > 1 {
-                let previous_error = 0.5 / ((num_hashes - 1) as f64).sqrt();
-                assert!(
-                    previous_error > target,
-                    "target={target} k={num_hashes} previous_error={previous_error}"
-                );
-            }
+            assert_eq!(num_hashes, expected_width);
         }
+    }
+
+    #[test]
+    fn error_rate_constructor_honors_the_reported_target_at_width_18() {
+        let target = f64::from_bits(0x3FBE_2B7D_DDFE_FA66);
+        let sketch = MinHash::with_error_rate(target).unwrap();
+        assert!(
+            sketch.worst_case_standard_error() <= target,
+            "target={target:?} k={} error={:?}",
+            sketch.num_hashes(),
+            sketch.worst_case_standard_error()
+        );
+        assert_eq!(sketch.num_hashes(), 19);
     }
 
     #[test]

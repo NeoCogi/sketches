@@ -423,6 +423,25 @@ remain in HLL form and better set-operation estimates are required, use the
 joint maximum-likelihood approach from Ertl's paper rather than interpreting
 these inclusion-exclusion helpers as precise low-overlap estimators.
 
+## MinHash Signature Sizing
+
+`MinHash::new(k)` selects an explicit positive signature width. Under the ideal
+independent-component model, the Jaccard estimator has standard error
+`sqrt(J * (1 - J) / k)`, maximized at `J = 0.5` with `0.5 / sqrt(k)`.
+
+`MinHash::with_error_rate(target)` is a convenience constructor for a finite
+positive target. It starts from `ceil((0.5 / target)^2)` and checks the reported
+`worst_case_standard_error()`, increasing the width if necessary. The returned
+sketch satisfies `worst_case_standard_error() <= target` without a tolerance.
+Calculations use ordinary `f64` rounding, and the width is conservative rather
+than guaranteed mathematically minimal. Targets at least `0.5` select one
+component; unrepresentable or unallocatable widths return `InvalidParameter`.
+
+The check runs during construction. Each extra component retains an additional
+seed and signature word (16 bytes of payload) and adds component work to updates,
+comparisons and merges. Run `cargo bench --locked --offline --bench minhash` for
+constructor and operation timings, including the width-18 rounding boundary.
+
 ## MinHash LSH Candidate Model
 
 `MinHashLshIndex` uses classical MinHash banding. If a signature is divided

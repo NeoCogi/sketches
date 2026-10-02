@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "mincount"
 harness = false
+
+[[bench]]
+name = "minhash"
+harness = false
