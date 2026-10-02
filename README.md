@@ -329,6 +329,13 @@ of tracked items can be much smaller than that reservation. The replacement is
 committed after reconstruction succeeds, preserving both summaries on an
 internal reservation error.
 
+`clear` resets tracked items, bucket links and total count while retaining the
+configured capacity and allocated buffers for reuse. Its nonempty time bound is
+`O(capacity)`, with `O(1)` additional space: clearing the reserved hash-table
+control storage can depend on capacity even when only one item is tracked.
+These bounds assume constant-time item destruction; the current standard-library
+hash table has a fast path for an already empty lookup.
+
 For example:
 
 ```rust

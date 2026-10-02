@@ -48,7 +48,7 @@
 //! Let `C` be the configured counter capacity, `m` the number of currently
 //! tracked counters (`m <= C`), and `k` the requested result size.
 //! The expected bounds assume expected `O(1)` hash-table operations and treat
-//! hashing, equality, and cloning one item as `O(1)`.
+//! hashing, equality, cloning, and dropping one item as `O(1)`.
 //!
 //! | Operation | Time | Additional space | Why |
 //! | --- | ---: | ---: | --- |
@@ -56,7 +56,7 @@
 //! | [`SpaceSaving::estimate`] / [`SpaceSaving::estimate_with_error`] / [`SpaceSaving::lower_bound`] | expected `O(1)` | `O(1)` | One hash lookup |
 //! | [`SpaceSaving::top_k`] | `O(min(k, m))` | `O(min(k, m))` | Traverses buckets from largest to smallest and clones only returned items |
 //! | [`SpaceSaving::merge`] | expected `O(C)` | `O(C)` | Combines counters and reconstructs an independently reserved full-capacity owner |
-//! | [`SpaceSaving::clear`] | `O(m)` | `O(1)` | Drops all tracked items and bucket links |
+//! | [`SpaceSaving::clear`] | `O(C)` | `O(1)` | Resets reserved lookup storage and drops tracked counter/bucket state |
 //! | Other accessors | `O(1)` | `O(1)` | Read stored fields |
 //!
 //! The retained representation itself uses `O(C)` space. Merge additionally
@@ -64,6 +64,12 @@
 //! even when the inputs are empty or underfull. Existing inputs remain live
 //! until reconstruction succeeds; the replacement is then committed. The
 //! live-entry buffers and fixed-pass radix ordering also fit within `O(C)`.
+//!
+//! A nonempty `clear` also touches the lookup table's reserved control storage,
+//! whose size is proportional to `C`, even when only one counter is tracked.
+//! The current standard-library `HashMap` skips that reset when already empty;
+//! this fast path does not make nonempty clearing proportional only to `m`.
+//! Clearing retains allocated buffers and the configured capacity for reuse.
 //!
 //! For a tracked item, the stored estimate is an upper bound and
 //! `estimate - error` is a lower bound on its frequency, provided the exact
@@ -276,6 +282,15 @@ where
     }
 
     /// Clears tracked counters, Stream-Summary buckets, and total count.
+    ///
+    /// Retains the configured capacity and allocated buffers for reuse. Releases
+    /// this summary's item handles; items shared with cloned or merged summaries
+    /// remain alive until their last owner releases them.
+    ///
+    /// Takes `O(capacity)` time and `O(1)` additional space, assuming constant-time
+    /// item destruction. A nonempty lookup resets its reserved control storage,
+    /// so sparse summaries do not have an `O(tracked_items)` clear bound. The
+    /// current standard-library `HashMap` returns immediately when already empty.
     pub fn clear(&mut self) {
         self.lookup.clear();
         self.counters.clear();
