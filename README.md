@@ -474,6 +474,17 @@ through `similarity_for_candidate_probability`. For example, 128 components
 split into 32 bands of 4 rows select a pair with similarity `0.5` with modeled
 probability about `0.873`.
 
+Both helpers accept finite inputs in `[0, 1]` and use ordinary `f64` rounding.
+Tiny intermediate probabilities do not need to be materialized before a band
+factor or root can produce the final result: the forward tail uses two half
+powers with the band factor between them, and the inverse retains logarithmic
+scale through the root. For `(b, r) = (32, 4)`, similarity `1e-81` gives a
+positive subnormal candidate probability, and the inverse of the smallest
+positive `f64` gives similarity about `6.2684e-82`. Final unrepresentable values
+can still round to zero; quantization also prevents exact round trips for every
+input. These scalar calculations use constant time/space and do not change
+candidate retrieval.
+
 Banding is a probabilistic candidate filter. `query_top_k` ranks only items that
 match the query in at least one band; it does not scan every indexed signature
 and therefore does not guarantee the global top `k`. MinHash signatures use the

@@ -279,6 +279,11 @@ where
     /// similarity `s`. The probability of matching at least one band is then
     /// `1 - (1 - s^r)^b`.
     ///
+    /// Calculations use ordinary `f64` rounding. In the tiny tail, the band
+    /// factor is applied between two half powers so an underflowing `s^r`
+    /// does not erase a representable final probability. A final result below
+    /// the floating-point range can still round to zero.
+    ///
     /// This is a model of the candidate-selection curve, not a per-query
     /// guarantee. The crate uses deterministically derived practical hash
     /// functions rather than ideal random permutations, and the final 64-bit
@@ -294,12 +299,33 @@ where
             ));
         }
 
-        let one_band_match = similarity.powf(self.rows_per_band as f64);
+        if similarity == 0.0 || similarity == 1.0 {
+            return Ok(similarity);
+        }
+
+        let bands = self.bands as f64;
+        let rows = self.rows_per_band as f64;
+        let one_band_match = similarity.powf(rows);
+        if self.bands == 1 {
+            return Ok(one_band_match);
+        }
+
+        if self.rows_per_band > 1 && one_band_match < f64::MIN_POSITIVE {
+            // For x = s^r < 2^-1022, p = b*x + O((b*x)^2). The checked
+            // signature layout bounds b by usize::MAX / 8, so b*x < 2^-961
+            // even on a 64-bit target: the correction is far below f64
+            // precision. Split the power before multiplying by b; a nonzero
+            // final result has normal half powers and no underflowing product
+            // until the final rounding. Unlike a log/exp fallback, this keeps
+            // power evaluation at the transition on the same numerical scale.
+            let half_band_match = similarity.powf(rows * 0.5);
+            return Ok((bands * half_band_match) * half_band_match);
+        }
 
         // Directly evaluating `1 - (1 - one_band_match).powf(b)` loses
         // precision when the result is close to zero. `ln_1p` accurately forms
         // log(1 - x), and `-exp_m1` accurately forms 1 - exp(x).
-        let no_band_match_log = self.bands as f64 * (-one_band_match).ln_1p();
+        let no_band_match_log = bands * (-one_band_match).ln_1p();
         Ok(-no_band_match_log.exp_m1())
     }
 
@@ -307,9 +333,14 @@ where
     /// probability is reached.
     ///
     /// This is the inverse of [`Self::candidate_probability`]. In particular,
-    /// passing `0.5` returns the exact midpoint of the configured S-curve; the
+    /// passing `0.5` returns the modeled midpoint of the configured S-curve; the
     /// commonly quoted `(1 / bands)^(1 / rows_per_band)` threshold is only a
     /// rough approximation to that point.
+    ///
+    /// The inverse carries the band probability on a logarithmic scale until
+    /// taking the root, including for positive subnormal inputs. Calculations
+    /// use ordinary `f64` rounding; final quantization prevents exact round
+    /// trips for every possible input.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] unless `probability` is finite
@@ -324,11 +355,29 @@ where
             ));
         }
 
-        // Invert p = 1 - (1 - s^r)^b. As above, the log/expm1 form preserves
-        // small probabilities that direct subtraction would round away.
-        let all_band_miss_log = (-probability).ln_1p();
-        let one_band_match = -(all_band_miss_log / self.bands as f64).exp_m1();
-        Ok(one_band_match.powf(1.0 / self.rows_per_band as f64))
+        if probability == 0.0 || probability == 1.0 {
+            return Ok(probability);
+        }
+
+        let rows = self.rows_per_band as f64;
+        if self.bands == 1 {
+            return Ok(probability.powf(1.0 / rows));
+        }
+
+        let all_band_miss_magnitude = -(-probability).ln_1p();
+        if self.rows_per_band == 1 {
+            // There is no later root to amplify a tiny intermediate. Keep
+            // ordinary rounding, including final subnormal quantization.
+            return Ok(-(-all_band_miss_magnitude / self.bands as f64).exp_m1());
+        }
+
+        // t = -ln(1-p)/b can underflow before taking the r-th root. Compute
+        // log(t) from its original operands, then use the same log-scale
+        // calculation throughout the domain to avoid a discontinuous switch
+        // between a tail approximation and the ordinary rounded power.
+        let log_miss_magnitude = all_band_miss_magnitude.ln() - (self.bands as f64).ln();
+        let log_band_match = log_one_minus_exp_negative_from_log(log_miss_magnitude);
+        Ok((log_band_match / rows).exp())
     }
 
     /// Returns the number of indexed items.
@@ -655,6 +704,30 @@ where
     }
 }
 
+/// Computes `ln(1 - exp(-t))` from `log_t = ln(t)` for positive finite `t`.
+///
+/// The caller owns input validation. For normal `t`, `ln(-expm1(-t))`
+/// avoids subtracting nearly equal numbers and keeps the result nonpositive.
+/// For subnormal `t`, use the original `log_t`: the difference between
+/// `ln(1 - exp(-t))` and `ln(t)` is `-t/2 + O(t^2)`, far below the precision
+/// of this logarithm. This also preserves the scale if exponentiating
+/// `log_t` underflows completely. Switching only in the extreme tail avoids
+/// cancellation between opposing logarithms in an ordinary-range correction.
+///
+/// This is a local application of stable logarithmic probability arithmetic;
+/// related `log1p`/`expm1` formulations are analyzed in Mächler's note:
+/// <https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf>.
+/// It introduces no cached state and does not promise correctly rounded results
+/// for every input or every platform's transcendental implementation.
+fn log_one_minus_exp_negative_from_log(log_t: f64) -> f64 {
+    let t = log_t.exp();
+    if t < f64::MIN_POSITIVE {
+        log_t
+    } else {
+        (-(-t).exp_m1()).ln()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -769,6 +842,106 @@ mod tests {
         for invalid in [-f64::EPSILON, 1.0 + f64::EPSILON, f64::NAN, f64::INFINITY] {
             assert!(index.candidate_probability(invalid).is_err());
             assert!(index.similarity_for_candidate_probability(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn candidate_probability_preserves_final_subnormal_band_amplification() {
+        let index = MinHashLshIndex::<u64>::new(128, 32).unwrap();
+        // Independently rounded from the exact binary input using 900-digit
+        // Decimal arithmetic: s^4 underflows, but 32*s^4 rounds to six units
+        // of the smallest subnormal. The full model has the same rounded value.
+        assert_eq!(index.candidate_probability(1e-81).unwrap().to_bits(), 6);
+        assert_eq!(index.candidate_probability(1e-100).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn inverse_probability_preserves_subnormal_inputs_before_taking_the_root() {
+        let minimum = f64::from_bits(1);
+        for (width, bands, expected) in [
+            (4, 2, 1.5717277847026288e-162),
+            (8, 4, 1.1113793747425387e-162),
+            (128, 32, 6.268428400928395e-82),
+        ] {
+            let index = MinHashLshIndex::<u64>::new(width, bands).unwrap();
+            let actual = index.similarity_for_candidate_probability(minimum).unwrap();
+            // References are independent of the implementation. Relative
+            // error makes a zero result fail regardless of the tiny magnitude.
+            assert!(actual.is_normal());
+            assert!((actual / expected - 1.0).abs() < 1e-13);
+        }
+    }
+
+    #[test]
+    fn probability_single_band_and_single_row_boundaries_remain_exact() {
+        let minimum = f64::from_bits(1);
+        for (width, bands) in [(1, 1), (4, 1), (2, 2), (128, 32)] {
+            let index = MinHashLshIndex::<u64>::new(width, bands).unwrap();
+            for endpoint in [0.0, -0.0, 1.0] {
+                assert_eq!(index.candidate_probability(endpoint).unwrap(), endpoint);
+                assert_eq!(
+                    index
+                        .similarity_for_candidate_probability(endpoint)
+                        .unwrap(),
+                    endpoint
+                );
+            }
+        }
+        let identity = MinHashLshIndex::<u64>::new(1, 1).unwrap();
+        for input in [minimum, f64::MIN_POSITIVE, 0.25, 0.5, 1.0] {
+            assert_eq!(identity.candidate_probability(input).unwrap(), input);
+            assert_eq!(
+                identity
+                    .similarity_for_candidate_probability(input)
+                    .unwrap(),
+                input
+            );
+        }
+        let single_row = MinHashLshIndex::<u64>::new(32, 32).unwrap();
+        assert_eq!(
+            single_row.candidate_probability(minimum).unwrap().to_bits(),
+            32
+        );
+        // Here there is no amplifying root: the final inverse itself is below
+        // the representable range and legitimately rounds to zero.
+        assert_eq!(
+            single_row
+                .similarity_for_candidate_probability(minimum)
+                .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn probability_models_are_monotone_across_the_normal_tail_boundary() {
+        for bands in [2, 3, 7, 32, 63] {
+            for rows in [2, 3, 4, 5, 16, 64, 128, 1024] {
+                let index = MinHashLshIndex::<u64>::new(bands * rows, bands).unwrap();
+                let similarity_center = f64::MIN_POSITIVE.powf(1.0 / rows as f64);
+                let probability_center = -(-(bands as f64) * f64::MIN_POSITIVE).exp_m1();
+                for inverse in [false, true] {
+                    let center = if inverse {
+                        probability_center
+                    } else {
+                        similarity_center
+                    };
+                    let mut previous = 0.0;
+                    for bits in center.to_bits() - 1024..=center.to_bits() + 1024 {
+                        let input = f64::from_bits(bits);
+                        let actual = if inverse {
+                            index.similarity_for_candidate_probability(input).unwrap()
+                        } else {
+                            index.candidate_probability(input).unwrap()
+                        };
+                        assert!(actual.is_finite() && (0.0..=1.0).contains(&actual));
+                        assert!(
+                            actual >= previous,
+                            "bands={bands} rows={rows} inverse={inverse} input={input:e} previous={previous:e} actual={actual:e}"
+                        );
+                        previous = actual;
+                    }
+                }
+            }
         }
     }
 
