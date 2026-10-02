@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Fix"
+  short_description: "Implement documented fixes in coherent, tested commits"
+  default_prompt: "Use $implement-fix to implement the agreed repository change, update its tests and documentation, and commit the work on a new branch."

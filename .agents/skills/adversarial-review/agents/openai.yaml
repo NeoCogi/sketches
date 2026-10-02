@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Review"
+  short_description: "Independent architecture and history-based repository audit"
+  default_prompt: "Use $adversarial-review to audit the requested repository scope with an independent agent, trace findings through Git history, and explain root causes, ambiguous contracts, simplification options, and acceptance tests."

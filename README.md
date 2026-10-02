@@ -109,9 +109,7 @@ not guarantee a positive semidefinite full covariance matrix or identical
 results across arbitrary batch partitions. Extreme finite coordinates may
 overflow intermediate calculations, eventually producing infinity or NaN.
 The accumulator maintains moments without sketch approximation, but does not
-promise exact real arithmetic. The
-[F1 fix record](docs/F1_VECTOR_WELFORD_FIX.md) documents the repaired orientation
-dependence and its regression coverage.
+promise exact real arithmetic.
 
 ## MinCount Sketch Parameters and Seeds
 
@@ -378,8 +376,7 @@ assert!(UltraLogLog::from_state(vec![9; 8]).is_err());
 
 Import validation takes `O(register_count)` time and accepts legal saturated
 bytes. A fully saturated sketch can still return an infinite cardinality
-estimate. The [F2 fix record](docs/F2_ULTRALOGLOG_STATE_IMPORT_FIX.md) describes
-the import invariant and exhaustive reachability and estimator-order tests.
+estimate.
 
 UltraLogLog also implements `JacardIndex` and provides
 `intersection_estimate()` and `jaccard_index()`. These use the default FGRA
@@ -409,9 +406,6 @@ assert_eq!(
 );
 # Ok::<(), SketchError>(())
 ```
-
-The [F4 fix record](docs/F4_CARDINALITY_RELATIONS_FIX.md) documents the
-availability policy, precision boundaries and regression coverage.
 
 ## HyperLogLog Intersection and Jaccard Limitations
 
