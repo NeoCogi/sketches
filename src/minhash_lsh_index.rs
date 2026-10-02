@@ -109,12 +109,12 @@ impl StoredSignature {
     }
 }
 
-/// Canonical per-ID state. `next_same_hash` resolves the extremely rare case
-/// where distinct IDs have the same randomized 64-bit lookup hash.
+/// Canonical per-ID state. `next_same_hash` resolves distinct IDs sharing a
+/// randomized 64-bit lookup hash, including user types with colliding hashes.
+/// The chain's hash belongs to `id_heads`; removal already computes it for lookup.
 #[derive(Debug, Clone)]
 struct Entry<Id> {
     id: Id,
-    id_hash: u64,
     next_same_hash: Option<EntryHandle>,
     signature: StoredSignature,
 }
@@ -427,7 +427,6 @@ where
 
         let entry = Entry {
             id,
-            id_hash,
             next_same_hash: self.id_heads.get(&id_hash).copied(),
             signature: StoredSignature::from_minhash(signature),
         };
@@ -448,7 +447,7 @@ where
         };
 
         self.remove_handle_from_bands(handle);
-        self.unlink_id_handle(handle);
+        self.unlink_id_handle(handle, id_hash);
         self.entries[handle.0] = None;
         self.free_entries.push(handle);
         self.entry_count -= 1;
@@ -662,11 +661,15 @@ where
         None
     }
 
-    fn unlink_id_handle(&mut self, handle: EntryHandle) {
+    /// Unlinks a live handle from the equality-checked ID lookup chain.
+    ///
+    /// `id_hash` must be the hash used to find `handle` in `remove`. Forwarding
+    /// that value avoids storing it per entry or hashing the user ID again.
+    /// The entry stays live until its successor link has been read and repaired.
+    fn unlink_id_handle(&mut self, handle: EntryHandle, id_hash: u64) {
         let entry = self.entries[handle.0]
             .as_ref()
             .expect("live handle must reference an entry");
-        let id_hash = entry.id_hash;
         let target_next = entry.next_same_hash;
         let head = self.id_heads[&id_hash];
 
@@ -1057,6 +1060,111 @@ mod tests {
         let candidates = index.query_candidates(&signature_b).unwrap();
         assert!(candidates.contains(&CollidingId(2)));
         assert!(!candidates.contains(&CollidingId(1)));
+    }
+
+    #[test]
+    fn collision_chain_removal_works_in_every_order() {
+        let signature = signature_for_range(0, 100, 16);
+        let mut permutations = 0;
+        // Enumerate all 24 permutations, exercising head, middle, tail, and
+        // final-chain removal without relying on a randomized hash collision.
+        for encoded in 0..256_u64 {
+            let order = [0, 1, 2, 3].map(|position| (encoded >> (position * 2)) & 3);
+            if (0..4).any(|position| order[..position].contains(&order[position])) {
+                continue;
+            }
+            permutations += 1;
+            let mut index = MinHashLshIndex::new(16, 4).unwrap();
+            let mut remaining = vec![0, 1, 2, 3];
+            for value in &remaining {
+                index.insert(CollidingId(*value), &signature).unwrap();
+            }
+
+            for removed in order {
+                assert!(index.remove(&CollidingId(removed)));
+                assert!(!index.remove(&CollidingId(removed)));
+                remaining.retain(|value| *value != removed);
+                for value in 0..4 {
+                    assert_eq!(
+                        index.contains_id(&CollidingId(value)),
+                        remaining.contains(&value)
+                    );
+                }
+                let mut candidates: Vec<_> = index
+                    .query_candidates(&signature)
+                    .unwrap()
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect();
+                candidates.sort_unstable();
+                assert_eq!(candidates, remaining);
+                let ranked = index.query_top_k(&signature, 4).unwrap();
+                assert_eq!(ranked.len(), remaining.len());
+                assert!(
+                    ranked
+                        .iter()
+                        .all(|(id, score)| { remaining.contains(&id.0) && *score == 1.0 })
+                );
+            }
+            assert!(index.id_heads.is_empty());
+            assert!(index.tables.iter().all(|table| table.is_empty()));
+        }
+        assert_eq!(permutations, 24);
+    }
+
+    #[test]
+    fn removal_hashes_the_lookup_id_once_and_never_rehashes_the_stored_id() {
+        #[derive(Debug, Clone)]
+        struct HashCountedId {
+            value: u64,
+            calls: Rc<Cell<usize>>,
+        }
+
+        impl PartialEq for HashCountedId {
+            fn eq(&self, other: &Self) -> bool {
+                self.value == other.value
+            }
+        }
+
+        impl Eq for HashCountedId {}
+
+        impl Hash for HashCountedId {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.calls.set(self.calls.get() + 1);
+                0_u8.hash(state);
+            }
+        }
+
+        let stored_calls = Rc::new(Cell::new(0));
+        let lookup_calls = Rc::new(Cell::new(0));
+        let signature = signature_for_range(0, 100, 16);
+        let mut index = MinHashLshIndex::new(16, 4).unwrap();
+        for value in 0..4 {
+            index
+                .insert(
+                    HashCountedId {
+                        value,
+                        calls: Rc::clone(&stored_calls),
+                    },
+                    &signature,
+                )
+                .unwrap();
+        }
+        assert_eq!(stored_calls.get(), 4);
+
+        // Middle, head, tail, missing, and final live entry in one hash chain.
+        for (value, existed) in [(2, true), (3, true), (0, true), (9, false), (1, true)] {
+            lookup_calls.set(0);
+            assert_eq!(
+                index.remove(&HashCountedId {
+                    value,
+                    calls: Rc::clone(&lookup_calls),
+                }),
+                existed
+            );
+            assert_eq!(lookup_calls.get(), 1);
+            assert_eq!(stored_calls.get(), 4);
+        }
     }
 
     #[test]
