@@ -28,6 +28,12 @@
 //! does not report a runtime false-positive rate: that probability also
 //! depends on assumptions about hashing and the distribution of absent
 //! queries, which the bitmap does not retain.
+//!
+//! Sizing uses the standard asymptotic Bloom model. Small filters and stringent
+//! targets can have substantially larger false-positive probabilities with
+//! double hashing, even for ordinary absent queries. Evaluate representative
+//! workloads when the false-positive rate matters; the target is not a finite
+//! probability bound.
 
 use std::hash::Hash;
 
@@ -57,6 +63,12 @@ pub struct BloomFilter {
 impl BloomFilter {
     /// Creates a Bloom filter from an expected number of distinct items and a
     /// target false-positive rate.
+    ///
+    /// The target selects dimensions using the standard asymptotic Bloom model.
+    /// Small filters and stringent targets can have substantially larger
+    /// false-positive probabilities with double hashing. Evaluate representative
+    /// workloads when that rate matters; construction does not enforce a finite
+    /// probability bound.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid input values,
@@ -107,6 +119,10 @@ impl BloomFilter {
     /// `f64` arithmetic. This recommendation does not allocate or guarantee
     /// that its bitmap fits available memory.
     ///
+    /// This is asymptotic sizing, not a finite false-positive bound. Small
+    /// double-hashed filters can substantially exceed the nominal target even
+    /// when their dimensions are representable.
+    ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid parameters or a
     /// rounded recommendation outside the `usize` range.
@@ -148,6 +164,10 @@ impl BloomFilter {
     ///
     /// Formula: `k = (m / n) * ln(2)`, rounded to the nearest integer using
     /// ordinary `f64` arithmetic, with a minimum of one hash probe.
+    ///
+    /// This asymptotic recommendation does not account for finite probe-set
+    /// correlation in small double-hashed filters and does not enforce a
+    /// false-positive bound.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid parameters or a
@@ -253,7 +273,11 @@ impl BloomFilter {
         Ok(())
     }
 
-    /// Returns two independent hashes for Kirsch-Mitzenmacher double hashing.
+    /// Returns two seeded base hashes for Kirsch-Mitzenmacher double hashing.
+    ///
+    /// The odd step avoids short cycles at power-of-two bit lengths, but the
+    /// resulting probe sets remain correlated. Distinct seeds alone do not
+    /// establish statistical independence or a finite false-positive bound.
     fn hash_pair<T: Hash>(&self, item: &T) -> (u64, u64) {
         let first = seeded_hash64(item, HASH_SEED_A);
         let second = seeded_hash64(item, HASH_SEED_B) | 1;
@@ -277,8 +301,209 @@ impl BloomFilter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::BloomFilter;
-    use crate::SketchError;
+    use crate::{SketchError, splitmix64};
+
+    /// Mathematical probe set for the 32-bit, 22-probe singleton model.
+    /// Modulo 32 depends only on low bits, including after u64/usize wrapping.
+    fn singleton_probe_mask(start: u64, step: u64) -> u32 {
+        (0..22).fold(0, |mask, index| {
+            mask | (1_u32 << ((start % 32 + index * (step % 32)) % 32))
+        })
+    }
+
+    /// Counts independent insertion sequences by occupied-cell count, exactly.
+    /// The bounded test cases fit in u128; each draw either revisits an occupied
+    /// cell or selects one of the remaining cells. No Poisson approximation or
+    /// assumption of independent bitmap-cell occupancy is used.
+    fn independent_occupancy_counts(bits: u32, probes: u32) -> Vec<u128> {
+        let total = u128::from(bits).checked_pow(probes).unwrap();
+        let mut counts = vec![0; bits as usize + 1];
+        counts[0] = 1;
+        for _ in 0..probes {
+            let mut next = vec![0; counts.len()];
+            for (occupied, &count) in counts.iter().enumerate() {
+                next[occupied] += count * occupied as u128;
+                if occupied < bits as usize {
+                    next[occupied + 1] += count * (bits as usize - occupied) as u128;
+                }
+            }
+            counts = next;
+        }
+        assert_eq!(counts.iter().sum::<u128>(), total);
+        counts
+    }
+
+    /// Independent-probe singleton control, converting exact sequence counts
+    /// to f64 only for the final probability. This models a different probe
+    /// policy from production double hashing and is not a sizing guarantee.
+    fn independent_singleton_probability(bits: u32, probes: u32) -> f64 {
+        let total = u128::from(bits).pow(probes) as f64;
+        independent_occupancy_counts(bits, probes)
+            .iter()
+            .enumerate()
+            .map(|(occupied, &count)| {
+                (count as f64 / total) * (occupied as f64 / f64::from(bits)).powi(probes as i32)
+            })
+            .sum()
+    }
+
+    #[test]
+    fn tiny_recommendations_have_an_exhaustive_finite_probe_set_model() {
+        let filter = BloomFilter::new(1, 3e-7).unwrap();
+        assert_eq!((filter.bit_len(), filter.num_hashes()), (32, 22));
+        let other = BloomFilter::new(1, 1e-6).unwrap();
+        assert_eq!((other.bit_len(), other.num_hashes()), (29, 20));
+
+        let mut multiplicities = BTreeMap::<u32, u32>::new();
+        for start in 0..32 {
+            for step in (1..32).step_by(2) {
+                let mask = singleton_probe_mask(start, step);
+                assert_eq!(mask.count_ones(), 22);
+                *multiplicities.entry(mask).or_default() += 1;
+            }
+        }
+        assert_eq!(multiplicities.len(), 256);
+        assert!(multiplicities.values().all(|&count| count == 2));
+        // Enumerate every ordered member/query mask pair. Equal cardinalities
+        // make subset and equality equivalent. Independent uniform base-hash
+        // pairs select 512 equally likely progressions: 1,024 / 512^2 = 1/256.
+        let mut positives = 0_u32;
+        for (&member, &member_count) in &multiplicities {
+            for (&query, &query_count) in &multiplicities {
+                if member & query == query {
+                    assert_eq!(member, query);
+                    positives += member_count * query_count;
+                }
+            }
+        }
+        assert_eq!(multiplicities.values().sum::<u32>(), 512);
+        assert_eq!(positives, 1_024);
+        assert_eq!(f64::from(positives) / 512.0_f64.powi(2), 1.0 / 256.0);
+    }
+
+    #[test]
+    fn independent_probe_control_matches_exhaustive_small_cases_and_exact_references() {
+        for bits in 1..=4_u32 {
+            for probes in 1..=4_u32 {
+                // Enumerate all insertion/query sequences in base `bits`,
+                // independently of the occupied-cell recurrence above.
+                let masks: Vec<u32> = (0..bits.pow(probes))
+                    .map(|mut sequence| {
+                        (0..probes).fold(0, |mask, _| {
+                            let next = mask | (1 << (sequence % bits));
+                            sequence /= bits;
+                            next
+                        })
+                    })
+                    .collect();
+                let mut counts = vec![0_u128; bits as usize + 1];
+                let mut positives = 0_u64;
+                for &member in &masks {
+                    counts[member.count_ones() as usize] += 1;
+                    for &query in &masks {
+                        positives += u64::from(member & query == query);
+                    }
+                }
+                assert_eq!(independent_occupancy_counts(bits, probes), counts);
+                let exhaustive = positives as f64 / (masks.len() as f64).powi(2);
+                let control = independent_singleton_probability(bits, probes);
+                assert!((control - exhaustive).abs() <= 2e-15);
+            }
+        }
+        // References calculated with integer sequence counts and Python
+        // fractions.Fraction(sum(count[j] * j^k), m^(2k)), rounded once to f64.
+        for (bits, probes, exact_reference) in [
+            (29, 20, 5.667_623_940_780_199e-6),
+            (32, 22, 1.584_474_481_503_565_4e-6),
+        ] {
+            let control = independent_singleton_probability(bits, probes);
+            assert!((control / exact_reference - 1.0).abs() < 2e-14);
+        }
+        assert!(independent_singleton_probability(32, 22) < (1.0 / 256.0) / 1_000.0);
+    }
+
+    #[test]
+    fn production_singleton_bitmap_and_queries_follow_the_finite_model() {
+        let mut filter = BloomFilter::new(1, 3e-7).unwrap();
+        for member in 1_000_000_000..1_000_000_064_u64 {
+            filter.clear();
+            filter.insert(&member);
+            let (start, step) = filter.hash_pair(&member);
+            assert_eq!(step & 1, 1);
+            let member_mask = singleton_probe_mask(start, step);
+            assert_eq!(filter.words, [u64::from(member_mask)]);
+            assert!(filter.contains(&member));
+            for query in 0..512_u64 {
+                let (start, step) = filter.hash_pair(&query);
+                let query_mask = singleton_probe_mask(start, step);
+                assert_eq!(
+                    filter.contains(&query),
+                    member_mask & query_mask == query_mask
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identified_workloads_cover_tiny_and_ordinary_rates_merge_clear_and_reuse() {
+        // Disjoint member/query integer ranges, also tested through a bijective
+        // mixer. Sample rates describe only these workloads and current hashes;
+        // the exhaustive ideal model above carries the probability conclusion.
+        for mixed in [false, true] {
+            let key = |value| if mixed { splitmix64(value) } else { value };
+            for (items, target, trials, queries) in [
+                (1, 3e-7, 128, 1_000),
+                (1, 1e-6, 128, 1_000),
+                (128, 1e-6, 4, 8_000),
+                (4_000, 0.01, 2, 8_000),
+            ] {
+                let mut positives = 0;
+                for trial in 0..trials {
+                    let mut left = BloomFilter::new(items, target).unwrap();
+                    let mut right = left.clone();
+                    let first = 1_000_000_000 + (trial * items) as u64;
+                    for index in 0..items {
+                        let filter = if index < items / 2 {
+                            &mut left
+                        } else {
+                            &mut right
+                        };
+                        filter.insert(&key(first + index as u64));
+                    }
+                    let donor_before = right.words.clone();
+                    left.merge(&right).unwrap();
+                    assert_eq!(right.words, donor_before);
+                    assert_eq!(left.inserted_items(), items as u64);
+                    for index in 0..items {
+                        assert!(left.contains(&key(first + index as u64)));
+                    }
+                    for query in trial * queries..(trial + 1) * queries {
+                        positives += usize::from(left.contains(&key(query as u64)));
+                    }
+                    let dimensions = (left.bit_len(), left.num_hashes());
+                    left.clear();
+                    assert!(left.is_empty());
+                    assert!(left.words.iter().all(|&word| word == 0));
+                    assert!(!left.contains(&key(first)));
+                    left.insert(&key(first));
+                    assert!(left.contains(&key(first)));
+                    assert_eq!(left.inserted_items(), 1);
+                    assert_eq!((left.bit_len(), left.num_hashes()), dimensions);
+                }
+                let samples = trials * queries;
+                eprintln!("mixed={mixed} n={items} target={target}: {positives}/{samples}");
+                // Ensure both query outcomes are exercised without asserting a
+                // portable observed rate for Rust's internal hash algorithm.
+                assert!(positives < samples);
+                if items == 1 {
+                    assert!(positives > 0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn oversized_bit_recommendation_is_rejected_before_construction() {

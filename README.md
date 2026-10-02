@@ -261,6 +261,17 @@ its backing storage fits available memory; construction performs that separate
 reservation. The target false-positive rate retains its existing statistical
 sizing meaning.
 
+Bloom sizing uses the standard asymptotic model, rather than a finite
+false-positive bound. Small filters and stringent targets can have substantially
+larger false-positive probabilities with double hashing, even for ordinary
+absent queries. For example, `BloomFilter::new(1, 3e-7)` selects 32 bits and 22
+probes. Under independent uniform low-bit base hashes, its singleton
+false-positive probability is `1/256`, because only 256 distinct probe sets
+occur. This is an ideal finite-model result, not a universal workload rate.
+Evaluate representative workloads when false-positive cost matters. Inserted
+items still have no false negatives, and the filter does not report a runtime
+false-positive rate.
+
 Space-Saving also reserves every temporary and rebuilt buffer in `merge`
 fallibly. Reservation errors leave both summaries unchanged; the replacement
 is committed only after reconstruction succeeds. Its constructor reserves the
