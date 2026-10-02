@@ -16,6 +16,7 @@ use sketches::cuckoo_filter::CuckooFilter;
 use sketches::hyperloglog::HyperLogLog;
 use sketches::minmax_sketch::MinMaxSketch;
 use sketches::reservoir_sampling::ReservoirSampling;
+use sketches::rv_coefficient::RvCoefficient;
 use sketches::space_saving::SpaceSaving;
 use sketches::ultraloglog::UltraLogLog;
 
@@ -640,4 +641,32 @@ fn space_saving_merge_validates_compatibility_before_reserving() {
     assert!(matches!(result, Err(SketchError::IncompatibleSketches(_))));
     assert_eq!(summary_snapshot(&receiver), before);
     assert!(donor.is_empty());
+}
+
+#[test]
+fn rv_coefficient_queries_need_no_heap_workspace() {
+    for (p, q) in [(1, 1), (2, 2), (3, 2), (4, 4)] {
+        let mut rv = RvCoefficient::new(p, q).unwrap();
+        for step in 0..20 {
+            let x: Vec<f64> = (0..p).map(|i| (step * p + i) as f64).collect();
+            let y: Vec<f64> = (0..q).map(|i| ((step + 1) * q + i) as f64).collect();
+            rv.add(&x, &y).unwrap();
+        }
+        assert!(without_allocation(|| rv.rv_coefficient()).is_some());
+        if p >= 2 && q >= 2 {
+            assert!(without_allocation(|| rv.adjusted_rv_coefficient()).is_some());
+        }
+    }
+}
+
+#[test]
+fn rv_coefficient_constructor_reports_failed_reservations() {
+    for allowed in 0..5 {
+        let result = {
+            let _scope = FailureScope::after(allowed);
+            RvCoefficient::new(4, 4)
+        };
+        assert!(matches!(result, Err(SketchError::InvalidParameter(_))));
+    }
+    assert!(RvCoefficient::new(4, 4).is_ok());
 }

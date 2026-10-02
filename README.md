@@ -78,6 +78,7 @@ This crate uses Rust edition 2024. See [CHANGELOG.md](CHANGELOG.md) for the
 | MinHash LSH Index | `minhash_lsh_index` | You need fast near-duplicate/candidate lookup before reranking | Uses banding over MinHash signatures |
 | Reservoir Sampling | `reservoir_sampling` | You need a uniform sample from an unbounded stream | Fixed-size unbiased sample |
 | Vector Welford's Algorithm | `vector_welford` | You need streaming means, variances, and covariances of numeric vectors | Online moments using `f64`, without sketch approximation; `O(d²)` space; mergeable |
+| RV Coefficient | `rv_coefficient` | You need streaming RV matrix correlation between two vector streams | Generalizes $R^2$ to vector sets $X \in \mathbb{R}^p$ and $Y \in \mathbb{R}^q$; $O(p^2 + q^2 + pq)$ space; mergeable |
 | Jaccard trait/helpers | `jaccard` | You want a shared Jaccard API across sketches | Provides `JaccardIndex` trait |
 
 ## Which Sketch Should I Use?
@@ -102,6 +103,7 @@ If your primary goal is:
 - Tail-sensitive quantiles: use `TDigest`.
 - Keep a representative stream sample: use `ReservoirSampling`.
 - Track vector means, variances, and covariances: use `VectorWelford`.
+- Measure multivariate linear association between two vector streams: use `RvCoefficient`.
 
 ## Vector Welford's Algorithm
 
@@ -141,6 +143,44 @@ results across arbitrary batch partitions. Extreme finite coordinates may
 overflow intermediate calculations, eventually producing infinity or NaN.
 The accumulator maintains moments without sketch approximation, but does not
 promise exact real arithmetic.
+
+## RV Coefficient (Multivariate Vector Correlation)
+
+`RvCoefficient` evaluates the RV coefficient ([Robert & Escoufier 1976]) between two
+streaming vector sets $X \in \mathbb{R}^p$ and $Y \in \mathbb{R}^q$. It generalizes the
+squared Pearson correlation coefficient ($R^2$) to vector-valued variables.
+
+It tracks the running means and centered cross-product sum matrices $S_{XX}$, $S_{YY}$,
+and $S_{XY}$ in an online manner using Pébay's pairwise multivariate formulas. Evaluating
+$RV$ takes $O(p^2 + q^2 + pq)$ time and $O(1)$ stack workspace with **zero heap allocations**:
+
+$$RV(X, Y) = \frac{\|S_{XY}\|_F^2}{\|S_{XX}\|_F \|S_{YY}\|_F}$$
+
+```rust
+use sketches::rv_coefficient::RvCoefficient;
+
+// X has 2 features, Y has 2 features.
+let mut rv = RvCoefficient::new(2, 2)?;
+
+// Paired stream observations: Y is a scaled rotation of X
+for (x, y) in [
+    ([1.0, 0.0], [0.0, 2.0]),
+    ([0.0, 1.0], [-2.0, 0.0]),
+    ([-1.0, 0.0], [0.0, -2.0]),
+    ([0.0, -1.0], [2.0, 0.0]),
+] {
+    rv.add(&x, &y)?;
+}
+
+let coeff = rv.rv_coefficient().unwrap();
+assert!((coeff - 1.0).abs() < 1e-10);
+# Ok::<(), sketches::SketchError>(())
+```
+
+Results lie in $[0.0, 1.0]$. Returns `None` if fewer than two observations have been added
+or if either vector set has zero total variance. The accumulator also provides
+`adjusted_rv_coefficient()` for high-dimensional regimes ($p \ge 2, q \ge 2$) where diagonal
+variances are excluded ([Smilde et al. 2009]).
 
 ## Count-Min Sketch Parameters and Seeds
 

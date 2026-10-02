@@ -34,6 +34,9 @@ applications must not assume compatibility with states produced by 0.1.2.
   Count-Min, Count Sketch and MinMax.
 - Seeded KLL constructors and batched quantile queries.
 - MinHash LSH candidate-probability, inverse-model and sizing helpers.
+- RV coefficient streaming multivariate matrix correlation between distinct
+  vector-valued streams, with Welford-style cross-product updates, zero-allocation
+  Frobenius queries, pairwise merging and adjusted RV2 estimation.
 
 ### Correctness and resource changes
 

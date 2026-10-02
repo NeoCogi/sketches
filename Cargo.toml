@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "minhash"
 harness = false
+
+[[bench]]
+name = "rv_coefficient"
+harness = false
