@@ -163,7 +163,7 @@ mod quantile_contract_tests {
             let mut tdigest = TDigest::new(100.0).unwrap();
             for &value in values {
                 kll.add(value);
-                tdigest.add(value);
+                tdigest.add(value).unwrap();
             }
 
             for &(q, expected) in queries {

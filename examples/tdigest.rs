@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Feed a synthetic response-time stream in milliseconds.
     for latency_ms in 1_u64..=20_000 {
-        digest.add(latency_ms as f64);
+        digest.add(latency_ms as f64)?;
     }
 
     // t-digest is especially useful for tail quantiles.

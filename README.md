@@ -439,6 +439,24 @@ entries and batch-merged with the compressed centroids. Quantile queries merge
 those two ordered views while reading, so they neither clone nor sort the
 centroid state.
 
+`TDigest` tracks observation counts and centroid weights as exact `u64`
+integers. Its `add(value)` and `merge(&other)` methods return `Result` and reject
+counts beyond `u64::MAX` with `SketchError::ObservationCountOverflow` before
+changing any state. Non-finite additions are ignored and return `Ok(())`,
+including at the count limit. Centroid means, compression decisions and query
+ranks still use rounded `f64` arithmetic; exact counts do not promise distinct
+adjacent ranks above `2^53`.
+
+```rust
+use sketches::tdigest::TDigest;
+
+let mut digest = TDigest::new(100.0)?;
+digest.add(10.0)?;
+digest.add(20.0)?;
+assert_eq!(digest.count(), 2);
+# Ok::<(), sketches::SketchError>(())
+```
+
 KLL queries build a sorted weighted view of the retained samples. When several
 quantiles are needed from the same sketch, use `KllSketch::quantiles(&queries)`
 to allocate and sort that view once and answer every target rank in one scan.

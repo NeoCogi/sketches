@@ -32,6 +32,11 @@
 //! implementation evaluates the equivalent convex combinations in a
 //! sign-aware form so intermediate `f64` arithmetic stays finite for every
 //! finite sample value.
+//! Observation and centroid counts are exact `u64` integers. Adding or merging
+//! beyond `u64::MAX` observations returns [`SketchError::ObservationCountOverflow`]
+//! before changing the digest. Counts are converted to `f64` only for centroid
+//! means, compression and query interpolation; those calculations still round,
+//! and adjacent integer ranks above `2^53` need not remain distinguishable.
 //! Ingestion follows the paper's progressive-merge design: additions collect
 //! in an ordered buffer and are periodically merged with the already ordered
 //! centroid array. Keeping the buffer ordered costs `O(log B)` per addition,
@@ -47,10 +52,13 @@ use crate::SketchError;
 
 const BUFFER_MULTIPLIER: f64 = 10.0;
 
+/// A finite mean representing a positive, exact number of observations.
 #[derive(Debug, Clone, Copy)]
 struct Centroid {
+    /// Convex combination of the observations represented by this centroid.
     mean: f64,
-    weight: f64,
+    /// Exact mass; all merged and buffered weights sum to `TDigest::count`.
+    weight: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,7 +98,7 @@ struct BufferedKey {
 ///
 /// let mut digest = TDigest::new(100.0).unwrap();
 /// for value in 0_u64..10_000 {
-///     digest.add(value as f64);
+///     digest.add(value as f64).unwrap();
 /// }
 ///
 /// let p95 = digest.quantile(0.95).unwrap();
@@ -98,14 +106,19 @@ struct BufferedKey {
 /// ```
 #[derive(Debug, Clone)]
 pub struct TDigest {
+    /// Finite compression parameter, at least ten.
     compression: f64,
     /// Fully merged centroids, always ordered by mean.
     centroids: Vec<Centroid>,
     /// Pending centroids ordered for allocation-free read-only queries.
-    buffered: BTreeMap<BufferedKey, f64>,
+    buffered: BTreeMap<BufferedKey, u64>,
+    /// Next tie-breaking key, reset when the pending buffer is compressed.
     next_sequence: u64,
-    total_weight: f64,
+    /// Authoritative exact count, equal to the sum of all centroid weights.
+    count: u64,
+    /// Exact observed minimum, or positive infinity when empty.
     min: f64,
+    /// Exact observed maximum, or negative infinity when empty.
     max: f64,
 }
 
@@ -130,7 +143,7 @@ impl TDigest {
             centroids: Vec::new(),
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 0.0,
+            count: 0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
         })
@@ -163,28 +176,40 @@ impl TDigest {
         self.centroids.len() + self.buffered.len()
     }
 
-    /// Returns the total observed weight rounded to `u64`.
+    /// Returns the exact number of finite observations, including merged data.
     pub fn count(&self) -> u64 {
-        self.total_weight.round() as u64
+        self.count
     }
 
     /// Returns `true` when no values were added.
     pub fn is_empty(&self) -> bool {
-        self.total_weight == 0.0
+        self.count == 0
     }
 
     /// Adds one value to the digest.
     ///
     /// Every finite `f64`, including values at either finite extreme, is
-    /// supported. Non-finite values are ignored.
-    pub fn add(&mut self, value: f64) {
+    /// supported. Non-finite values are ignored and return `Ok(())`, even at
+    /// the count limit.
+    ///
+    /// # Errors
+    /// Returns [`SketchError::ObservationCountOverflow`] at `u64::MAX` finite
+    /// observations. On error, the entire digest is unchanged.
+    pub fn add(&mut self, value: f64) -> Result<(), SketchError> {
         if !value.is_finite() {
-            return;
+            return Ok(());
         }
+
+        // Validate the observation owner before extrema, buffer or sequence
+        // changes. The private ingestion step can then update mass infallibly.
+        self.count
+            .checked_add(1)
+            .ok_or(SketchError::ObservationCountOverflow)?;
 
         self.min = self.min.min(value);
         self.max = self.max.max(value);
-        self.add_weighted(value, 1.0);
+        self.add_centroid(value, 1);
+        Ok(())
     }
 
     /// Returns the approximate quantile for `q` in `[0, 1]`.
@@ -198,6 +223,8 @@ impl TDigest {
     /// centroids containing multiple samples are positioned at their midpoint
     /// ranks, singleton centroids remain exact samples, and terminal
     /// interpolation uses the separately retained observed minimum and maximum.
+    /// Rank calculations use rounded `f64` counts, so adjacent integer ranks
+    /// above `2^53` are not guaranteed to be distinguishable.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid `q` or empty
@@ -229,43 +256,45 @@ impl TDigest {
             return Ok(first.mean);
         }
 
-        let index = q * self.total_weight;
+        let total_weight = self.count as f64;
+        let index = q * total_weight;
         if index < 1.0 {
             return Ok(self.min);
         }
 
-        if first.weight > 1.0 && index < first.weight * 0.5 {
-            let interior_weight = first.weight * 0.5 - 1.0;
+        if first.weight > 1 && index < first.weight as f64 * 0.5 {
+            let interior_weight = first.weight as f64 * 0.5 - 1.0;
             if interior_weight > 0.0 {
                 let fraction = ((index - 1.0) / interior_weight).clamp(0.0, 1.0);
                 return Ok(finite_lerp(self.min, first.mean, fraction));
             }
         }
 
-        if index > self.total_weight - 1.0 {
+        if index > total_weight - 1.0 {
             return Ok(self.max);
         }
 
         let last = self
             .last_ordered_centroid()
             .expect("non-empty digest has a centroid");
-        let weight_from_right = self.total_weight - index;
-        if last.weight > 1.0 && weight_from_right <= last.weight * 0.5 {
-            let interior_weight = last.weight * 0.5 - 1.0;
+        let weight_from_right = total_weight - index;
+        if last.weight > 1 && weight_from_right <= last.weight as f64 * 0.5 {
+            let interior_weight = last.weight as f64 * 0.5 - 1.0;
             if interior_weight > 0.0 {
                 let fraction = ((weight_from_right - 1.0) / interior_weight).clamp(0.0, 1.0);
                 return Ok(finite_lerp(self.max, last.mean, fraction));
             }
         }
 
-        let mut weight_so_far = first.weight * 0.5;
+        let mut weight_so_far = first.weight as f64 * 0.5;
         let mut left = first;
         for right in centroids {
-            let interval_weight = (left.weight + right.weight) * 0.5;
+            // These disjoint centroid weights sum to at most the exact count.
+            let interval_weight = (left.weight + right.weight) as f64 * 0.5;
 
             if weight_so_far + interval_weight > index {
                 let mut left_singleton_weight = 0.0;
-                if left.weight == 1.0 {
+                if left.weight == 1 {
                     if index - weight_so_far < 0.5 {
                         return Ok(left.mean);
                     }
@@ -273,7 +302,7 @@ impl TDigest {
                 }
 
                 let mut right_singleton_weight = 0.0;
-                if right.weight == 1.0 {
+                if right.weight == 1 {
                     if weight_so_far + interval_weight - index <= 0.5 {
                         return Ok(right.mean);
                     }
@@ -304,6 +333,9 @@ impl TDigest {
     ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when compression differs.
+    /// For compatible digests, returns [`SketchError::ObservationCountOverflow`]
+    /// if the combined count exceeds `u64::MAX`. Either error leaves the entire
+    /// destination unchanged.
     pub fn merge(&mut self, other: &Self) -> Result<(), SketchError> {
         if (self.compression - other.compression).abs() > f64::EPSILON {
             return Err(SketchError::IncompatibleSketches(
@@ -311,32 +343,42 @@ impl TDigest {
             ));
         }
 
+        // Preflight the complete merge before changing any owned state. Each
+        // partial ingestion is then bounded by this validated final count.
+        self.count
+            .checked_add(other.count)
+            .ok_or(SketchError::ObservationCountOverflow)?;
+
         if !other.is_empty() {
             self.min = self.min.min(other.min);
             self.max = self.max.max(other.max);
         }
 
         for centroid in other.ordered_centroids() {
-            self.add_weighted(centroid.mean, centroid.weight);
+            self.add_centroid(centroid.mean, centroid.weight);
         }
         self.compress();
         Ok(())
     }
 
-    /// Clears all centroids and observed weight.
+    /// Clears centroids, buffered observations, count and extrema for reuse.
     pub fn clear(&mut self) {
         self.centroids.clear();
         self.buffered.clear();
         self.next_sequence = 0;
-        self.total_weight = 0.0;
+        self.count = 0;
         self.min = f64::INFINITY;
         self.max = f64::NEG_INFINITY;
     }
 
-    fn add_weighted(&mut self, value: f64, weight: f64) {
-        if !value.is_finite() || !weight.is_finite() || weight <= 0.0 {
-            return;
-        }
+    /// Ingests a valid centroid after the public owner checks count capacity.
+    ///
+    /// The caller supplies a finite mean and positive weight. During a merge,
+    /// the incoming weights sum to `other.count`, so every partial count is
+    /// bounded by the preflighted total. Compression sees the exact mass of the
+    /// data ingested so far, preserving the progressive-merge behavior.
+    fn add_centroid(&mut self, value: f64, weight: u64) {
+        debug_assert!(value.is_finite() && weight > 0);
 
         if self.next_sequence == u64::MAX {
             self.compress();
@@ -350,7 +392,7 @@ impl TDigest {
         let replaced = self.buffered.insert(key, weight);
         debug_assert!(replaced.is_none());
 
-        self.total_weight += weight;
+        self.count += weight;
         if self.buffered.len() >= self.buffer_limit() {
             self.compress();
         }
@@ -390,11 +432,16 @@ impl TDigest {
         }
     }
 
+    /// Evaluates the scale-function limit using the finite exact count owner.
     fn max_centroid_weight(&self, q: f64) -> f64 {
-        let scaled = (self.total_weight / self.compression) * 4.0 * q * (1.0 - q);
+        let scaled = (self.count as f64 / self.compression) * 4.0 * q * (1.0 - q);
         scaled.max(1.0)
     }
 
+    /// Combines ordered centroids without changing their total integer mass.
+    ///
+    /// Disjoint weights and completed mass sum to at most `self.count`, so the
+    /// integer additions cannot overflow. Only ratios and means use `f64`.
     fn compress(&mut self) {
         if self.buffered.is_empty() && self.centroids.len() <= 1 {
             return;
@@ -406,7 +453,7 @@ impl TDigest {
         let mut old = old.into_iter().peekable();
         let mut buffered = buffered.into_iter().peekable();
         let mut merged: Vec<Centroid> = Vec::with_capacity(capacity);
-        let mut cumulative = 0.0;
+        let mut cumulative = 0_u64;
 
         loop {
             let take_buffered = match (old.peek(), buffered.peek()) {
@@ -428,14 +475,18 @@ impl TDigest {
             };
 
             if let Some(last) = merged.last_mut() {
-                let q =
-                    ((cumulative + 0.5 * last.weight) / self.total_weight.max(1.0)).clamp(0.0, 1.0);
+                let q = ((cumulative as f64 + 0.5 * last.weight as f64) / self.count.max(1) as f64)
+                    .clamp(0.0, 1.0);
                 let max_weight = self.max_centroid_weight(q);
 
-                if last.weight + centroid.weight <= max_weight {
-                    let updated_weight = last.weight + centroid.weight;
-                    last.mean =
-                        weighted_average(last.mean, last.weight, centroid.mean, centroid.weight);
+                let updated_weight = last.weight + centroid.weight;
+                if updated_weight as f64 <= max_weight {
+                    last.mean = weighted_average(
+                        last.mean,
+                        last.weight as f64,
+                        centroid.mean,
+                        centroid.weight as f64,
+                    );
                     last.weight = updated_weight;
                     continue;
                 }
@@ -451,9 +502,10 @@ impl TDigest {
     }
 }
 
+/// Borrowed merge of the compressed array and pending integer-weight buffer.
 struct OrderedCentroids<'a> {
     merged: std::iter::Peekable<std::slice::Iter<'a, Centroid>>,
-    buffered: std::iter::Peekable<std::collections::btree_map::Iter<'a, BufferedKey, f64>>,
+    buffered: std::iter::Peekable<std::collections::btree_map::Iter<'a, BufferedKey, u64>>,
 }
 
 impl Iterator for OrderedCentroids<'_> {
@@ -539,12 +591,33 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{Centroid, TDigest, finite_lerp, weighted_average};
+    use crate::SketchError;
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() <= 1e-12,
             "actual={actual} expected={expected}"
         );
+    }
+
+    /// Builds an exact count through public unit additions and binary merging.
+    fn repeated_value(value: f64, count: u64, compression: f64) -> TDigest {
+        let mut digest = TDigest::new(compression).unwrap();
+        let mut power = TDigest::new(compression).unwrap();
+        power.add(value).unwrap();
+        let mut remaining = count;
+        while remaining != 0 {
+            if remaining & 1 != 0 {
+                digest.merge(&power).unwrap();
+            }
+            remaining >>= 1;
+            if remaining != 0 {
+                let copy = power.clone();
+                power.merge(&copy).unwrap();
+            }
+        }
+        assert_eq!(digest.count(), count);
+        digest
     }
 
     #[test]
@@ -554,19 +627,66 @@ mod tests {
     }
 
     #[test]
+    fn clone_merge_rejects_observation_count_overflow_before_mutation() {
+        let mut digest = TDigest::new(10.0).unwrap();
+        digest.add(-1.0).unwrap();
+        digest.add(1.0).unwrap();
+        for _ in 0..62 {
+            let copy = digest.clone();
+            digest.merge(&copy).unwrap();
+        }
+        assert!(digest.quantile(0.25).unwrap() < 0.0);
+
+        let before = format!("{digest:?}");
+        let queries = [0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0];
+        let quantiles = queries.map(|q| digest.quantile(q).unwrap().to_bits());
+        let copy = digest.clone();
+        assert_eq!(
+            digest.merge(&copy),
+            Err(SketchError::ObservationCountOverflow)
+        );
+        assert_eq!(digest.count(), 1_u64 << 63);
+        assert_eq!(format!("{digest:?}"), before);
+        assert_eq!(
+            queries.map(|q| digest.quantile(q).unwrap().to_bits()),
+            quantiles
+        );
+    }
+
+    #[test]
+    fn add_rejects_full_count_and_still_ignores_nonfinite_values() {
+        let mut digest = repeated_value(3.0, u64::MAX, 10.0);
+        let before = format!("{digest:?}");
+        for value in [-f64::MAX, 0.0, f64::MAX] {
+            assert_eq!(
+                digest.add(value),
+                Err(SketchError::ObservationCountOverflow)
+            );
+            assert_eq!(format!("{digest:?}"), before);
+        }
+        for value in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            assert_eq!(digest.add(value), Ok(()));
+            assert_eq!(format!("{digest:?}"), before);
+        }
+        for q in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert_eq!(digest.quantile(q).unwrap(), 3.0);
+        }
+    }
+
+    #[test]
     fn additions_are_buffered_and_batch_compressed() {
         let mut digest = TDigest::new(10.0).unwrap();
         let buffer_limit = digest.buffer_limit();
 
         for value in (1..buffer_limit).rev() {
-            digest.add(value as f64);
+            digest.add(value as f64).unwrap();
         }
 
         assert!(digest.centroids.is_empty());
         assert_eq!(digest.buffered.len(), buffer_limit - 1);
         assert!(digest.quantile(0.5).unwrap().is_finite());
 
-        digest.add(0.0);
+        digest.add(0.0).unwrap();
 
         assert!(digest.buffered.is_empty());
         assert!(!digest.centroids.is_empty());
@@ -583,7 +703,9 @@ mod tests {
         let mut digest = TDigest::new(10.0).unwrap();
         let buffer_limit = digest.buffer_limit();
         for value in 0..buffer_limit + 37 {
-            digest.add(((value * 47) % (buffer_limit + 37)) as f64);
+            digest
+                .add(((value * 47) % (buffer_limit + 37)) as f64)
+                .unwrap();
         }
 
         assert!(!digest.centroids.is_empty());
@@ -663,16 +785,16 @@ mod tests {
             centroids: vec![
                 Centroid {
                     mean: -f64::MAX,
-                    weight: 4.0,
+                    weight: 4,
                 },
                 Centroid {
                     mean: f64::MAX,
-                    weight: 4.0,
+                    weight: 4,
                 },
             ],
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 8.0,
+            count: 8,
             min: -f64::MAX,
             max: f64::MAX,
         };
@@ -683,16 +805,16 @@ mod tests {
             centroids: vec![
                 Centroid {
                     mean: f64::MAX / 2.0,
-                    weight: 4.0,
+                    weight: 4,
                 },
                 Centroid {
                     mean: f64::MAX,
-                    weight: 4.0,
+                    weight: 4,
                 },
             ],
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 8.0,
+            count: 8,
             min: -f64::MAX,
             max: f64::MAX,
         };
@@ -703,16 +825,16 @@ mod tests {
             centroids: vec![
                 Centroid {
                     mean: -f64::MAX,
-                    weight: 4.0,
+                    weight: 4,
                 },
                 Centroid {
                     mean: -f64::MAX / 2.0,
-                    weight: 4.0,
+                    weight: 4,
                 },
             ],
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 8.0,
+            count: 8,
             min: -f64::MAX,
             max: f64::MAX,
         };
@@ -723,8 +845,8 @@ mod tests {
     fn extreme_finite_stream_produces_finite_monotonic_quantiles() {
         let mut digest = TDigest::new(20.0).unwrap();
         for _ in 0..1_000 {
-            digest.add(-f64::MAX);
-            digest.add(f64::MAX);
+            digest.add(-f64::MAX).unwrap();
+            digest.add(f64::MAX).unwrap();
         }
 
         assert!(
@@ -757,9 +879,9 @@ mod tests {
         let mut shifted = TDigest::new(100.0).unwrap();
         for index in 0..SAMPLE_COUNT {
             let value = index as f64;
-            baseline.add(value);
-            scaled.add(value * scale);
-            shifted.add(shift + value * shifted_step);
+            baseline.add(value).unwrap();
+            scaled.add(value * scale).unwrap();
+            shifted.add(shift + value * shifted_step).unwrap();
         }
 
         for q in [0.01, 0.5, 0.99] {
@@ -794,7 +916,7 @@ mod tests {
                         "permuted" => (index * 7_919) % SAMPLE_COUNT,
                         _ => unreachable!(),
                     };
-                    digest.add(value as f64);
+                    digest.add(value as f64).unwrap();
                 }
 
                 for q in [0.01, 0.5, 0.99] {
@@ -816,8 +938,8 @@ mod tests {
     #[test]
     fn two_singletons_step_at_the_empirical_rank_boundary() {
         let mut digest = TDigest::new(100.0).unwrap();
-        digest.add(0.0);
-        digest.add(10.0);
+        digest.add(0.0).unwrap();
+        digest.add(10.0).unwrap();
 
         let below = f64::from_bits(0.5_f64.to_bits() - 1);
         let above = f64::from_bits(0.5_f64.to_bits() + 1);
@@ -833,16 +955,16 @@ mod tests {
             centroids: vec![
                 Centroid {
                     mean: 0.0,
-                    weight: 4.0,
+                    weight: 4,
                 },
                 Centroid {
                     mean: 10.0,
-                    weight: 4.0,
+                    weight: 4,
                 },
             ],
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 8.0,
+            count: 8,
             min: -2.0,
             max: 12.0,
         };
@@ -868,11 +990,11 @@ mod tests {
             compression: 100.0,
             centroids: vec![Centroid {
                 mean: 5.0,
-                weight: 8.0,
+                weight: 8,
             }],
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 8.0,
+            count: 8,
             min: 0.0,
             max: 10.0,
         };
@@ -888,20 +1010,20 @@ mod tests {
             centroids: vec![
                 Centroid {
                     mean: 0.0,
-                    weight: 4.0,
+                    weight: 4,
                 },
                 Centroid {
                     mean: 10.0,
-                    weight: 1.0,
+                    weight: 1,
                 },
                 Centroid {
                     mean: 20.0,
-                    weight: 1.0,
+                    weight: 1,
                 },
             ],
             buffered: BTreeMap::new(),
             next_sequence: 0,
-            total_weight: 6.0,
+            count: 6,
             min: -2.0,
             max: 20.0,
         };
@@ -914,16 +1036,16 @@ mod tests {
     #[test]
     fn exact_extrema_survive_compression_and_merge() {
         let mut left = TDigest::new(20.0).unwrap();
-        left.add(-123.5);
+        left.add(-123.5).unwrap();
         for value in 0_u64..5_000 {
-            left.add(value as f64);
+            left.add(value as f64).unwrap();
         }
 
         let mut right = TDigest::new(20.0).unwrap();
         for value in 5_000_u64..10_000 {
-            right.add(value as f64);
+            right.add(value as f64).unwrap();
         }
-        right.add(12_345.5);
+        right.add(12_345.5).unwrap();
 
         left.merge(&right).unwrap();
 
@@ -935,7 +1057,7 @@ mod tests {
     fn quantiles_are_monotonic_across_centroid_boundaries() {
         let mut digest = TDigest::new(40.0).unwrap();
         for value in 0_u64..20_000 {
-            digest.add((value % 1_003) as f64);
+            digest.add((value % 1_003) as f64).unwrap();
         }
 
         let mut previous = digest.quantile(0.0).unwrap();
@@ -953,7 +1075,7 @@ mod tests {
     fn median_estimate_is_reasonable() {
         let mut digest = TDigest::new(120.0).unwrap();
         for value in 0_u64..10_000 {
-            digest.add(value as f64);
+            digest.add(value as f64).unwrap();
         }
 
         let p50 = digest.quantile(0.5).unwrap();
@@ -964,7 +1086,7 @@ mod tests {
     fn high_quantile_tracks_tail() {
         let mut digest = TDigest::new(120.0).unwrap();
         for value in 0_u64..10_000 {
-            digest.add(value as f64);
+            digest.add(value as f64).unwrap();
         }
 
         let p95 = digest.quantile(0.95).unwrap();
@@ -979,10 +1101,10 @@ mod tests {
         let mut right = TDigest::new(80.0).unwrap();
 
         for value in 0_u64..5_000 {
-            left.add(value as f64);
+            left.add(value as f64).unwrap();
         }
         for value in 5_000_u64..10_000 {
-            right.add(value as f64);
+            right.add(value as f64).unwrap();
         }
 
         left.merge(&right).unwrap();
@@ -1000,13 +1122,13 @@ mod tests {
     #[test]
     fn clear_resets_state() {
         let mut digest = TDigest::new(50.0).unwrap();
-        digest.add(1.0);
-        digest.add(2.0);
+        digest.add(1.0).unwrap();
+        digest.add(2.0).unwrap();
         digest.clear();
         assert!(digest.is_empty());
         assert!(digest.quantile(0.5).is_err());
 
-        digest.add(9.0);
+        digest.add(9.0).unwrap();
         assert_eq!(digest.quantile(0.0).unwrap(), 9.0);
         assert_eq!(digest.quantile(1.0).unwrap(), 9.0);
     }

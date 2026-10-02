@@ -44,7 +44,7 @@ fn main() {
         let started = Instant::now();
         let mut digest = TDigest::new(compression).unwrap();
         for index in 0..INGESTION_SAMPLES {
-            digest.add(black_box(input_value(index)));
+            digest.add(black_box(input_value(index))).unwrap();
         }
         let ingestion_elapsed = started.elapsed();
 
