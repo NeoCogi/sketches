@@ -40,7 +40,7 @@ sketches = { path = "../sketches" }
 | Count-Min Sketch | `count_min_sketch` | You need approximate non-negative frequency counts | Count-Min with conservative updates; estimates are one-sided upper bounds |
 | MinMax Sketch | `minmax_sketch` | You need to compress a fixed key-to-ordered-value mapping | Insert-min/query-max; estimates for inserted keys are one-sided lower bounds |
 | Count Sketch | `count_sketch` | You need approximate signed frequency updates | Good for turnstile streams (+/- updates) |
-| Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Stream-Summary keeps updates expected `O(1)` and `top_k(k)` proportional to `k` |
+| Space-Saving | `space_saving` | You need top-k / heavy hitters from a unit-weight stream | Expected amortized `O(1)` updates; `top_k(k)` proportional to `k` |
 | KLL Sketch | `kll` | You need general quantiles (median, p90, p99) | Good default quantile sketch |
 | t-digest | `tdigest` | You care most about tail quantiles (p95/p99/p999) | Typically stronger tail behavior |
 | MinHash | `minhash` | You need Jaccard similarity between sets | Best default for similarity tasks |
@@ -316,10 +316,16 @@ need exact membership tracking outside the filter.
 
 `SpaceSaving` accepts one observation per `insert(item)` call. It intentionally
 does not expose a weighted or batched update: the original Stream-Summary data
-structure obtains expected constant-time updates because every counter moves
+structure changes only a constant number of links because every counter moves
 only from `count` to `count + 1`. Equal counters share a bucket, count buckets
 stay linked in sorted order, and `top_k(k)` walks down from the largest bucket
 without sorting every retained counter.
+
+Complete insertion takes expected amortized `O(1)` time. Private arenas grow
+occasionally, requiring up to `O(capacity)` time and additional workspace when
+an allocation moves. This can happen on the first insertion after merge
+reconstruction, which reserves exactly the rebuilt count groups. Released
+bucket slots are reused; the retained representation uses `O(capacity)` space.
 
 `merge` combines the estimates and error bounds, retaining at most the configured
 counter capacity. It uses expected `O(capacity)` time and `O(capacity)` additional

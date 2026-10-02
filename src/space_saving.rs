@@ -52,12 +52,20 @@
 //!
 //! | Operation | Time | Additional space | Why |
 //! | --- | ---: | ---: | --- |
-//! | [`SpaceSaving::insert`] | expected `O(1)` | `O(1)` | One hash lookup and a constant number of link changes |
+//! | [`SpaceSaving::insert`] | expected amortized `O(1)` | `O(C)` worst case during growth | Constant link work; private arenas occasionally grow |
 //! | [`SpaceSaving::estimate`] / [`SpaceSaving::estimate_with_error`] / [`SpaceSaving::lower_bound`] | expected `O(1)` | `O(1)` | One hash lookup |
 //! | [`SpaceSaving::top_k`] | `O(min(k, m))` | `O(min(k, m))` | Traverses buckets from largest to smallest and clones only returned items |
 //! | [`SpaceSaving::merge`] | expected `O(C)` | `O(C)` | Combines counters and reconstructs an independently reserved full-capacity owner |
 //! | [`SpaceSaving::clear`] | `O(C)` | `O(1)` | Resets reserved lookup storage and drops tracked counter/bucket state |
 //! | Other accessors | `O(1)` | `O(1)` | Read stored fields |
+//!
+//! Each insertion performs a constant number of link changes, but growing a
+//! private arena can take `O(C)` time. A moving reallocation can temporarily
+//! keep both old and new buffers live, using `O(C)` additional workspace.
+//! Geometric growth and reuse of released bucket slots make complete insertion
+//! expected amortized `O(1)` over the storage lifecycle. In particular, the first
+//! insertion after merge reconstruction may grow an exactly reserved bucket
+//! arena before releasing the counter's previous bucket.
 //!
 //! The retained representation itself uses `O(C)` space. Merge additionally
 //! reserves a replacement lookup table and counter arena for `C` counters,
@@ -205,8 +213,10 @@ where
     /// Inserts one occurrence of `item`.
     ///
     /// This is the unit-weight update from the original Space-Saving
-    /// algorithm. Expected time is `O(1)`: the item hash lookup and all
-    /// Stream-Summary bucket/counter link changes take expected constant time.
+    /// algorithm. Expected amortized time is `O(1)`: the item hash lookup and
+    /// bucket/counter link changes take expected constant time, while private
+    /// arena growth occasionally takes `O(capacity)` time and can require
+    /// `O(capacity)` additional workspace during a moving reallocation.
     /// Counts and the total stream length saturate at [`u64::MAX`].
     pub fn insert(&mut self, item: T) {
         if let Some(&counter) = self.lookup.get(&item) {
