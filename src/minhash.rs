@@ -26,6 +26,9 @@
 //! minimum for each of `k` deterministically derived hash functions. This is
 //! distinct from [Broder's original single-permutation bottom-`k` sketch][broder].
 //!
+//! [`MinHash::worst_case_standard_error`] reports the model's maximum standard
+//! error; [`MinHash::standard_error_at`] evaluates it at a true Jaccard similarity.
+//!
 //! Each [`MinHash`] owns its deterministically derived component seeds and its
 //! signature. Seeds remain precomputed on the insertion hot path without any
 //! global cache or shared mutable state. The concrete hash algorithm behind
@@ -177,16 +180,6 @@ impl MinHash {
     /// Returns the number of signature components.
     pub fn num_hashes(&self) -> usize {
         self.signature.len()
-    }
-
-    /// Returns the worst-case standard error under the independent-component
-    /// MinHash model.
-    #[deprecated(
-        since = "0.1.3",
-        note = "use worst_case_standard_error or standard_error_at"
-    )]
-    pub fn expected_error(&self) -> f64 {
-        self.worst_case_standard_error()
     }
 
     /// Returns `true` when no item has been observed yet.
@@ -593,11 +586,6 @@ mod tests {
         assert!(sketch.standard_error_at(-f64::EPSILON).is_err());
         assert!(sketch.standard_error_at(1.0 + f64::EPSILON).is_err());
         assert!(sketch.standard_error_at(f64::NAN).is_err());
-
-        #[allow(deprecated)]
-        {
-            assert_eq!(sketch.expected_error(), sketch.worst_case_standard_error());
-        }
     }
 
     #[test]
