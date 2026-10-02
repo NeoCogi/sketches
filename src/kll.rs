@@ -59,17 +59,37 @@ const ERROR_BOUND_CONSTANT: f64 = CAPACITY_DECAY * CAPACITY_DECAY * (2.0 * CAPAC
 const DEFAULT_FAILURE_PROBABILITY: f64 = 0.01;
 const DEFAULT_SEED: u64 = 0xD1B5_4A32_C192_ED03;
 
+/// Selects a representable `k >= 2` for the basic single-query bound.
+///
+/// The caller validates that both parameters are finite and in `(0,1)`.
+/// Sizing and the correction of a rounded-down candidate use ordinary `f64`
+/// logarithms; an unavailable dimension returns `None` before sketch creation.
 fn required_k(rank_error: f64, failure_probability: f64) -> Option<usize> {
     let required = (rank_error_bound(1, failure_probability) / rank_error).ceil();
 
     if !required.is_finite() || required > usize::MAX as f64 {
         return None;
     }
-    Some((required as usize).max(2))
+    let mut k = (required as usize).max(2);
+    let log_threshold = std::f64::consts::LN_2 - failure_probability.ln();
+    // Check C * (rank_error * k)^2 >= ln(2) - ln(p), without exponentiating
+    // the probability or separately squaring a tiny error and a large k.
+    while {
+        let scaled_error = rank_error * k as f64;
+        ERROR_BOUND_CONSTANT * scaled_error * scaled_error < log_threshold
+    } {
+        k = k.checked_add(1)?;
+    }
+    Some(k)
 }
 
+/// Inverts the basic single-query bound for a positive `k` and valid probability.
+///
+/// `ln(2) - ln(p)` stays finite for every positive `f64` probability, including
+/// subnormals whose `2/p` would overflow. Calculations use ordinary rounding.
 fn rank_error_bound(k: usize, failure_probability: f64) -> f64 {
-    ((2.0 / failure_probability).ln() / ERROR_BOUND_CONSTANT).sqrt() / k as f64
+    let log_threshold = std::f64::consts::LN_2 - failure_probability.ln();
+    (log_threshold / ERROR_BOUND_CONSTANT).sqrt() / k as f64
 }
 
 /// Approximate quantile sketch using KLL-style compaction.
@@ -150,7 +170,8 @@ impl KllSketch {
     /// queries must account for their combined failure probability.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid `rank_error`.
+    /// Returns [`SketchError::InvalidParameter`] for invalid `rank_error` or an
+    /// unrepresentable `k`.
     pub fn with_error_rate(rank_error: f64) -> Result<Self, SketchError> {
         Self::with_error_rate_and_seed(rank_error, DEFAULT_SEED)
     }
@@ -162,7 +183,8 @@ impl KllSketch {
     /// sketch that may later be merged.
     ///
     /// # Errors
-    /// Returns [`SketchError::InvalidParameter`] for invalid `rank_error`.
+    /// Returns [`SketchError::InvalidParameter`] for invalid `rank_error` or an
+    /// unrepresentable `k`.
     pub fn with_error_rate_and_seed(rank_error: f64, seed: u64) -> Result<Self, SketchError> {
         Self::with_error_rate_and_failure_probability_and_seed(
             rank_error,
@@ -176,6 +198,10 @@ impl KllSketch {
     /// Sizing uses the paper's single-quantile bound for the basic fully
     /// mergeable varying-capacity construction. Both parameters must be finite
     /// and strictly between zero and one.
+    /// Positive subnormal failure probabilities are supported when the
+    /// resulting `k` fits: `ln(2/p)` is evaluated as `ln(2) - ln(p)`, and the
+    /// rounded candidate is checked in the log domain. Sizing uses ordinary
+    /// `f64` rounding; it does not strengthen the statistical guarantee.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid or unrepresentable
@@ -196,6 +222,9 @@ impl KllSketch {
     ///
     /// Use a different caller-generated `seed` for each independently populated
     /// sketch that may later be merged. Seeds do not need to match for merging.
+    /// Sizing uses the same stable-log, single-query contract as
+    /// [`Self::with_error_rate_and_failure_probability`], including positive
+    /// subnormal failure probabilities and ordinary `f64` rounding.
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid or unrepresentable
@@ -767,6 +796,189 @@ mod tests {
         assert!(KllSketch::with_error_rate(f64::NAN).is_err());
         assert!(KllSketch::with_error_rate_and_failure_probability(0.01, 0.0).is_err());
         assert!(KllSketch::with_error_rate_and_failure_probability(0.01, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn error_constructors_size_tiny_probabilities_and_rounding_boundaries() {
+        // Independent 100-digit answers from exact f64 probability/rank inputs
+        // and sqrt(ln(2/p)/(4/27)) / rank_error. Literal bits also pin neighbors
+        // of both reciprocal-overflow boundaries and integer-k thresholds.
+        for (probability_bits, rank_bits, expected_k) in [
+            (0x0000_0000_0000_0001, 0x3fb9_9999_9999_999a, 710),
+            (0x0000_0000_0000_0002, 0x3fb9_9999_9999_999a, 709),
+            (0x0000_0000_0000_0003, 0x3fb9_9999_9999_999a, 709),
+            (0x0000_0000_0000_0004, 0x3fb9_9999_9999_999a, 709),
+            (0x000f_ffff_ffff_ffff, 0x3fb9_9999_9999_999a, 692),
+            (0x0010_0000_0000_0000, 0x3fb9_9999_9999_999a, 692),
+            (0x0010_0000_0000_0001, 0x3fb9_9999_9999_999a, 692),
+            (0x0003_ffff_ffff_ffff, 0x3fb9_9999_9999_999a, 693),
+            (0x0004_0000_0000_0000, 0x3fb9_9999_9999_999a, 693),
+            (0x0004_0000_0000_0001, 0x3fb9_9999_9999_999a, 693),
+            (0x0007_ffff_ffff_ffff, 0x3fb9_9999_9999_999a, 693),
+            (0x0008_0000_0000_0000, 0x3fb9_9999_9999_999a, 693),
+            (0x0008_0000_0000_0001, 0x3fb9_9999_9999_999a, 693),
+            (0x0007_30d6_7819_e8d2, 0x3fb9_9999_9999_999a, 693), // p=1e-308
+            (0x01a5_6e1f_c2f8_f359, 0x3fb9_9999_9999_999a, 684), // p=1e-300
+            (0x3f84_7ae1_47ae_147b, 0x3fb9_9999_9999_999a, 60),  // p=0.01
+            (0x3fe0_0000_0000_0000, 0x3fb9_9999_9999_999a, 31),  // p=0.5
+            (0x3fef_ffff_ffff_ffff, 0x3fb9_9999_9999_999a, 22),  // p just below 1
+            (0x3fef_ffff_ffff_ffff, 0x3fe7_128a_c8de_70b6, 4),
+            (0x3fef_ffff_ffff_ffff, 0x3fe7_128a_c8de_78b6, 3),
+            (0x3f84_7ae1_47ae_147b, 0x3fb9_840c_feb3_27d5, 61),
+            (0x3f84_7ae1_47ae_147b, 0x3fb9_840c_feb3_2fd5, 60),
+            (0x3f84_7ae1_47ae_147b, 0x3f84_725d_5326_da51, 600),
+            (0x3f84_7ae1_47ae_147b, 0x3f84_725d_5326_e251, 599),
+            (0x3fe0_0000_0000_0000, 0x3fb9_42ec_e771_97f5, 32),
+            (0x3fe0_0000_0000_0000, 0x3fb9_42ec_e771_9ff5, 31),
+            (0x0000_0000_0000_0001, 0x3fb9_9237_ae45_c96e, 711),
+            (0x0000_0000_0000_0001, 0x3fb9_9237_ae45_d16e, 710),
+            // The inverse quotient can round to 19 although its bound fails.
+            (0x3f84_7ae1_47ae_147b, 0x3fd4_24e1_d68d_7372, 20),
+        ] {
+            let probability = f64::from_bits(probability_bits);
+            let rank_error = f64::from_bits(rank_bits);
+            let default =
+                KllSketch::with_error_rate_and_failure_probability(rank_error, probability)
+                    .unwrap();
+            let seeded = KllSketch::with_error_rate_and_failure_probability_and_seed(
+                rank_error,
+                probability,
+                7,
+            )
+            .unwrap();
+            assert_eq!(
+                default.k(),
+                expected_k,
+                "p={probability:e} rank={rank_error:e}"
+            );
+            assert_eq!(
+                seeded.k(),
+                expected_k,
+                "p={probability:e} rank={rank_error:e}"
+            );
+            assert_eq!(
+                default.rng_state,
+                KllSketch::new(expected_k).unwrap().rng_state
+            );
+            assert_eq!(
+                seeded.rng_state,
+                KllSketch::with_seed(expected_k, 7).unwrap().rng_state
+            );
+        }
+    }
+
+    #[test]
+    fn error_constructors_accept_every_binary_probability_exponent() {
+        for (rank_error, maximum_k) in [(0.01, 7_093), (0.1, 710), (0.9, 79)] {
+            let mut previous_k = 0;
+            // Cover the full probability exponent range for three rank-error
+            // scales; no reciprocal or exponential is used as the test oracle.
+            for exponent in 1..=1_074 {
+                let bits = if exponent <= 1_022 {
+                    (1_023 - exponent) << 52
+                } else {
+                    1_u64 << (1_074 - exponent)
+                };
+                let probability = f64::from_bits(bits);
+                let sketch = KllSketch::with_error_rate_and_failure_probability_and_seed(
+                    rank_error,
+                    probability,
+                    7,
+                )
+                .unwrap();
+                assert!(
+                    sketch.k() >= previous_k,
+                    "exponent={exponent} rank={rank_error}"
+                );
+                assert!(sketch.k() <= maximum_k);
+                assert!(sketch.k() >= 2);
+                assert_eq!(sketch.count(), 0);
+                assert!(sketch.is_empty());
+                previous_k = sketch.k();
+            }
+            assert_eq!(previous_k, maximum_k);
+        }
+    }
+
+    #[test]
+    fn error_constructors_preserve_invalid_and_unrepresentable_errors() {
+        let invalid = [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            -0.1,
+            -0.0,
+            0.0,
+            1.0,
+            f64::INFINITY,
+        ];
+        for value in invalid {
+            assert_eq!(
+                KllSketch::with_error_rate_and_failure_probability_and_seed(value, 0.01, 7)
+                    .unwrap_err(),
+                SketchError::InvalidParameter(
+                    "rank_error must be finite and strictly between 0 and 1"
+                ),
+            );
+            assert_eq!(
+                KllSketch::with_error_rate_and_failure_probability_and_seed(0.1, value, 7)
+                    .unwrap_err(),
+                SketchError::InvalidParameter(
+                    "failure_probability must be finite and strictly between 0 and 1"
+                ),
+            );
+        }
+        for probability in [0.01, f64::from_bits(1)] {
+            for rank_error in [1e-30, f64::MIN_POSITIVE, f64::from_bits(1)] {
+                assert_eq!(
+                    KllSketch::with_error_rate_and_failure_probability_and_seed(
+                        rank_error,
+                        probability,
+                        7,
+                    )
+                    .unwrap_err(),
+                    SketchError::InvalidParameter("rank_error requires an unrepresentable k"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_probability_preserves_seeded_compaction_merging_and_clear() {
+        let probability = f64::from_bits(1);
+        let mut automatic =
+            KllSketch::with_error_rate_and_failure_probability_and_seed(0.1, probability, 7)
+                .unwrap();
+        let mut shard =
+            KllSketch::with_error_rate_and_failure_probability_and_seed(0.1, probability, 8)
+                .unwrap();
+        let mut explicit = KllSketch::with_seed(710, 7).unwrap();
+        let mut explicit_shard = KllSketch::with_seed(710, 8).unwrap();
+        for value in 0..4_000 {
+            if value % 2 == 0 {
+                automatic.add(value as f64);
+                explicit.add(value as f64);
+            } else {
+                shard.add(value as f64);
+                explicit_shard.add(value as f64);
+            }
+        }
+        automatic.merge(&shard).unwrap();
+        explicit.merge(&explicit_shard).unwrap();
+        assert_eq!(automatic.levels, explicit.levels);
+        assert_eq!(automatic.rng_state, explicit.rng_state);
+        assert_eq!(automatic.count(), 4_000);
+        assert_eq!(retained_weight(&automatic), 4_000);
+        let queries = [0.0, 0.25, 0.5, 0.75, 1.0];
+        assert_eq!(automatic.quantiles(&queries), explicit.quantiles(&queries));
+
+        automatic.clear();
+        assert_eq!(automatic.k(), 710);
+        assert_eq!(automatic.count(), 0);
+        for value in [0.0, 10.0, 20.0] {
+            automatic.add(value);
+        }
+        assert_eq!(automatic.quantile(0.5).unwrap(), 10.0);
+        assert_eq!(retained_weight(&automatic), 3);
     }
 
     #[test]

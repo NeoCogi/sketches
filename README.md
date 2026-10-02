@@ -489,6 +489,16 @@ quantiles are needed from the same sketch, use `KllSketch::quantiles(&queries)`
 to allocate and sort that view once and answer every target rank in one scan.
 Results are returned in the same order as the input queries.
 
+`KllSketch::with_error_rate_and_failure_probability(rank_error, p)` selects
+`k` from the basic construction's bound for one fixed quantile query:
+`2 * exp(-(4/27) * rank_error^2 * k^2) <= p`. Both parameters must be finite
+and strictly between zero and one. Sizing evaluates `ln(2/p)` as
+`ln(2) - ln(p)` and checks the rounded candidate in the log domain, so positive
+subnormal probabilities are supported when `k` fits in `usize`. With
+`rank_error = 0.1`, `p = 1e-308` selects `k = 693` and
+`p = f64::from_bits(1)` selects `k = 710`. Sizing uses ordinary `f64` rounding
+and retains the existing single-query statistical contract and seed policy.
+
 ### KLL randomness and merging
 
 Each `KllSketch` owns its compaction random-number state. The crate does not use
