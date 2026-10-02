@@ -141,7 +141,7 @@ impl<T> ReservoirSampling<T> {
     ///
     /// # Panics
     /// Panics if adding the iterator's items would make the observation count
-    /// exceed `u64::MAX`.
+    /// exceed `u64::MAX`. Items processed before the overflow remain committed.
     pub fn extend<I>(&mut self, items: I)
     where
         I: IntoIterator<Item = T>,
@@ -389,5 +389,148 @@ mod tests {
         assert_eq!(reservoir.len(), 0);
         assert_eq!(reservoir.seen(), 0);
         assert!(reservoir.is_empty());
+    }
+
+    #[test]
+    fn filling_clear_and_clone_preserve_the_owned_random_stream() {
+        let seed = 0xC391_0C8D_016B_07D6;
+        let mut reservoir = ReservoirSampling::new(2, seed).unwrap();
+        reservoir.extend([0_u64, 1]);
+        assert_eq!(reservoir.rng_state, seed); // Filling needs no random words.
+        reservoir.add(2); // At bound three, reject zero and accept the next word.
+        assert_eq!(reservoir.samples(), &[2, 1]);
+        assert_eq!(reservoir.rng_state, 0x6E78_9E6A_A1B9_65F4);
+
+        reservoir.clear();
+        assert_eq!(reservoir.capacity(), 2);
+        assert_eq!(reservoir.seen(), 0);
+        assert!(reservoir.samples().is_empty());
+        assert_eq!(reservoir.rng_state, 0x6E78_9E6A_A1B9_65F4);
+        reservoir.extend([3, 4]);
+        assert_eq!(reservoir.rng_state, 0x6E78_9E6A_A1B9_65F4);
+        reservoir.add(5);
+        assert_eq!(reservoir.samples(), &[5, 4]);
+        assert_eq!(reservoir.rng_state, 0x3743_27C6_3D0C_C8A6);
+
+        let mut cloned = reservoir.clone();
+        reservoir.extend(6..1_000);
+        cloned.extend(6..1_000);
+        assert_eq!(reservoir.samples(), cloned.samples());
+        assert_eq!(reservoir.seen(), cloned.seen());
+        assert_eq!(reservoir.rng_state, cloned.rng_state);
+    }
+
+    #[test]
+    fn observation_overflow_preserves_sample_count_and_random_state() {
+        let mut reservoir = ReservoirSampling::new(1, 0xC391_0C8D_016B_07D6).unwrap();
+        reservoir.add(7_u64);
+        reservoir.seen = u64::MAX - 1;
+        reservoir.add(19);
+        let state_before = reservoir.rng_state;
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reservoir.add(23);
+        }));
+        assert!(overflow.is_err());
+        assert_eq!(reservoir.seen(), u64::MAX);
+        assert_eq!(reservoir.samples(), &[7]);
+        assert_eq!(reservoir.rng_state, state_before);
+    }
+
+    #[test]
+    fn extend_overflow_preserves_its_completed_prefix() {
+        let seed = seed_for_first_word(u64::MAX);
+        let mut reservoir = ReservoirSampling::new(2, seed).unwrap();
+        reservoir.extend([0_u64, 1]);
+        reservoir.seen = u64::MAX - 1;
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reservoir.extend([2, 3]);
+        }));
+        assert!(overflow.is_err());
+        // The first item uses the last legal count and accepted index zero;
+        // the second fails before advancing the counter, sample or word stream.
+        assert_eq!(reservoir.samples(), &[2, 1]);
+        assert_eq!(reservoir.seen(), u64::MAX);
+        assert_eq!(reservoir.rng_state, u64::MAX);
+    }
+
+    #[test]
+    fn moved_items_drop_once_across_rejection_replacement_and_clear() {
+        use std::{cell::Cell, rc::Rc};
+
+        /// Observes destruction of owned stream items without implementing Clone.
+        struct Item {
+            /// Identifies the stream item whose destruction is being counted.
+            id: usize,
+            /// Shared test-only counters remain observable after ownership moves.
+            drops: Rc<[Cell<u32>; 4]>,
+        }
+        impl Drop for Item {
+            fn drop(&mut self) {
+                self.drops[self.id].set(self.drops[self.id].get() + 1);
+            }
+        }
+        let drops: Rc<[Cell<u32>; 4]> = Rc::new(std::array::from_fn(|_| Cell::new(0)));
+        let item = |id| Item {
+            id,
+            drops: Rc::clone(&drops),
+        };
+        let mut reservoir = ReservoirSampling::new(1, 0xC391_0C8D_016B_07D6).unwrap();
+        reservoir.add(item(0));
+        reservoir.seen = u64::MAX - 1;
+        reservoir.add(item(1)); // Rejection continues; final index skips this item.
+        assert_eq!(reservoir.samples()[0].id, 0);
+        assert_eq!(drops[0].get(), 0);
+        assert_eq!(drops[1].get(), 1);
+
+        reservoir.clear();
+        assert_eq!(drops[0].get(), 1);
+        reservoir.add(item(2));
+        reservoir.add(item(3)); // The next word is even, so index zero is replaced.
+        assert_eq!(reservoir.samples()[0].id, 3);
+        assert_eq!(drops[2].get(), 1);
+        assert_eq!(drops[3].get(), 0);
+
+        let samples = reservoir.into_samples();
+        assert_eq!(samples[0].id, 3);
+        assert_eq!(drops[3].get(), 0);
+        drop(samples);
+        assert!(drops.iter().all(|count| count.get() == 1));
+    }
+
+    #[test]
+    fn ordinary_stream_inclusion_is_consistent_across_varied_seeds() {
+        const TRIALS: u32 = 8_192;
+        const STREAM_LENGTH: usize = 17;
+        // A sanity check for Algorithm R over a non-power-of-two stream length.
+        // Finite trials cannot detect the old mapping's tiny modulo bias; the
+        // exact prefix/preimage tests establish that part of the contract.
+        for capacity in [1, 3, 8, STREAM_LENGTH] {
+            let mut counts = [0_u32; STREAM_LENGTH];
+            for trial in 0..TRIALS {
+                let seed = splitmix64(u64::from(trial));
+                let mut reservoir = ReservoirSampling::new(capacity, seed).unwrap();
+                reservoir.extend(0..STREAM_LENGTH);
+                assert_eq!(reservoir.len(), capacity);
+                assert_eq!(reservoir.seen(), STREAM_LENGTH as u64);
+                let mut included = [false; STREAM_LENGTH];
+                for &position in reservoir.samples() {
+                    assert!(
+                        !included[position],
+                        "positions must be sampled without replacement"
+                    );
+                    included[position] = true;
+                    counts[position] += 1;
+                }
+            }
+            let probability = capacity as f64 / STREAM_LENGTH as f64;
+            let expected = f64::from(TRIALS) * probability;
+            let deviation = (f64::from(TRIALS) * probability * (1.0 - probability)).sqrt();
+            for (position, count) in counts.into_iter().enumerate() {
+                assert!(
+                    (f64::from(count) - expected).abs() <= 6.0 * deviation + 1.0,
+                    "capacity={capacity} position={position} count={count} expected={expected}"
+                );
+            }
+        }
     }
 }
