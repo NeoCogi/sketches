@@ -33,6 +33,10 @@
 //! weighted mass `N`, `q` selects zero-based rank
 //! `min(floor(q * N), N - 1)`. This is also the exact-sample convention used by
 //! [`crate::tdigest::TDigest`].
+//! Nonempty quantile requests require at most `2^52` observations. This
+//! conservative limit keeps count conversion exact; the `f64` product still
+//! uses ordinary rounding. Ingestion and merging support exact `u64` counts
+//! independently of this query limit.
 //!
 //! It does not implement the paper's later sampler or GK-based refinements.
 //! Those refinements improve asymptotic space or failure-probability dependence
@@ -58,6 +62,12 @@ const CAPACITY_DECAY: f64 = 2.0 / 3.0;
 const ERROR_BOUND_CONSTANT: f64 = CAPACITY_DECAY * CAPACITY_DECAY * (2.0 * CAPACITY_DECAY - 1.0);
 const DEFAULT_FAILURE_PROBABILITY: f64 = 0.01;
 const DEFAULT_SEED: u64 = 0xD1B5_4A32_C192_ED03;
+
+/// Inclusive count limit for nonempty quantile requests.
+///
+/// This conservative policy keeps mass conversion exact without changing the
+/// established rounded-product rank convention or the `u64` storage limit.
+const MAX_QUANTILE_COUNT: u64 = 1_u64 << 52;
 
 /// Selects a representable `k >= 2` for the basic single-query bound.
 ///
@@ -110,6 +120,7 @@ fn rank_error_bound(k: usize, failure_probability: f64) -> f64 {
 pub struct KllSketch {
     k: usize,
     levels: Vec<Vec<f64>>,
+    /// Exact retained mass; ingestion may exceed the separate quantile limit.
     count: u64,
     rng_state: u64,
 }
@@ -272,6 +283,8 @@ impl KllSketch {
     /// Adds one value to the sketch.
     ///
     /// Non-finite values are ignored.
+    /// Counts above `2^52` remain valid for ingestion, but quantile requests
+    /// with at least one query return [`SketchError::ObservationLimitExceeded`].
     ///
     /// # Panics
     /// Panics if the observation count is already `u64::MAX`. This limit is
@@ -299,12 +312,36 @@ impl KllSketch {
     /// `10`. This is the crate-wide empirical inverse-CDF convention shared
     /// with [`crate::tdigest::TDigest`].
     ///
+    /// Queries require at most `2^52` observations, including at the endpoints.
+    /// Within this limit the count converts exactly to `f64`, while `q * N`
+    /// still uses ordinary floating-point rounding.
+    ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] for invalid `q` or empty
-    /// sketches.
+    /// sketches, or [`SketchError::ObservationLimitExceeded`] with limit `2^52`
+    /// when the count is larger. Query validation precedes count validation;
+    /// all validation occurs before allocating or sorting retained samples.
+    ///
+    /// # Example
+    /// ```rust
+    /// use sketches::{SketchError, kll::KllSketch};
+    ///
+    /// let mut sketch = KllSketch::new(2)?;
+    /// sketch.add(7.0);
+    /// for _ in 0..52 {
+    ///     sketch.merge(&sketch.clone())?;
+    /// }
+    /// assert_eq!(sketch.quantile(0.5)?, 7.0); // Exactly 2^52 observations.
+    /// sketch.add(7.0);
+    /// assert_eq!(
+    ///     sketch.quantile(0.5),
+    ///     Err(SketchError::ObservationLimitExceeded { limit: 1_u64 << 52 }),
+    /// );
+    /// # Ok::<(), SketchError>(())
+    /// ```
     pub fn quantile(&self, q: f64) -> Result<f64, SketchError> {
         Self::validate_quantile(q)?;
-        self.validate_non_empty()?;
+        self.validate_queryable()?;
 
         let weighted_values = self.sorted_weighted_values();
         let total_weight = self.total_weight(&weighted_values);
@@ -323,12 +360,16 @@ impl KllSketch {
     /// This is more efficient than calling [`Self::quantile`] repeatedly.
     ///
     /// An empty query slice returns an empty vector, including for an empty
-    /// sketch.
+    /// sketch or one above the `2^52` query count limit. Nonempty requests use
+    /// the same count limit and rounded-product convention as [`Self::quantile`].
     ///
     /// # Errors
     /// Returns [`SketchError::InvalidParameter`] when any query is non-finite or
     /// outside `[0, 1]`, or when a non-empty query slice is used with an empty
-    /// sketch.
+    /// sketch. Returns [`SketchError::ObservationLimitExceeded`] with limit
+    /// `2^52` for a nonempty request when the count is larger. All queries are
+    /// validated before the count check and before allocating or sorting the
+    /// retained weighted view; an error returns no partial results.
     pub fn quantiles(&self, queries: &[f64]) -> Result<Vec<f64>, SketchError> {
         for &query in queries {
             Self::validate_quantile(query)?;
@@ -336,7 +377,7 @@ impl KllSketch {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        self.validate_non_empty()?;
+        self.validate_queryable()?;
 
         let weighted_values = self.sorted_weighted_values();
         let total_weight = self.total_weight(&weighted_values);
@@ -378,6 +419,10 @@ impl KllSketch {
     /// not correlated. The merge itself uses this sketch's owned RNG state for
     /// any new compactions and does not access global state.
     ///
+    /// A combined count above `2^52` remains valid for merging and ingestion,
+    /// but quantile requests with at least one query then return
+    /// [`SketchError::ObservationLimitExceeded`].
+    ///
     /// # Errors
     /// Returns [`SketchError::IncompatibleSketches`] when `k` differs, or
     /// [`SketchError::ObservationCountOverflow`] when the combined observation
@@ -404,7 +449,9 @@ impl KllSketch {
         Ok(())
     }
 
-    /// Clears all retained state.
+    /// Clears retained samples and resets the exact count, preserving RNG state.
+    ///
+    /// Subsequent additions can be queried within the normal count limit.
     pub fn clear(&mut self) {
         self.levels.clear();
         self.levels.push(Vec::new());
@@ -420,11 +467,20 @@ impl KllSketch {
         Ok(())
     }
 
-    fn validate_non_empty(&self) -> Result<(), SketchError> {
+    /// Checks the shared count contract for a nonempty quantile request.
+    ///
+    /// Callers validate query values first and handle empty batches separately.
+    /// This read-only check runs before constructing any weighted query view.
+    fn validate_queryable(&self) -> Result<(), SketchError> {
         if self.count == 0 {
             return Err(SketchError::InvalidParameter(
                 "quantile is undefined for an empty sketch",
             ));
+        }
+        if self.count > MAX_QUANTILE_COUNT {
+            return Err(SketchError::ObservationLimitExceeded {
+                limit: MAX_QUANTILE_COUNT,
+            });
         }
         Ok(())
     }
@@ -456,6 +512,10 @@ impl KllSketch {
         total_weight
     }
 
+    /// Applies the empirical rank convention to validated, queryable mass.
+    ///
+    /// The count limit makes the mass conversion exact. Multiplication retains
+    /// ordinary `f64` rounding, including established small-sample boundaries.
     fn target_rank(q: f64, total_weight: u128) -> u128 {
         ((total_weight as f64 * q).floor() as u128).min(total_weight.saturating_sub(1))
     }
@@ -1326,6 +1386,29 @@ mod tests {
         assert!(sketch.quantiles(&[0.5, f64::NAN]).is_err());
         assert!(sketch.quantiles(&[-0.1]).is_err());
         assert!(sketch.quantiles(&[1.1]).is_err());
+    }
+
+    #[test]
+    fn quantile_query_limit_is_inclusive() {
+        let mut sketch = KllSketch::with_seed(2, 7).unwrap();
+        sketch.add(7.0);
+        for _ in 0..52 {
+            let copy = sketch.clone();
+            sketch.merge(&copy).unwrap();
+        }
+
+        assert_eq!(sketch.count(), 4_503_599_627_370_496);
+        assert_eq!(retained_weight(&sketch), sketch.count() as u128);
+        assert_eq!(sketch.quantile(0.5), Ok(7.0));
+        assert_eq!(sketch.quantiles(&[0.0, 0.5, 1.0]), Ok(vec![7.0; 3]));
+
+        sketch.add(7.0);
+        assert_eq!(sketch.count(), 4_503_599_627_370_497);
+        let expected = SketchError::ObservationLimitExceeded {
+            limit: 4_503_599_627_370_496,
+        };
+        assert_eq!(sketch.quantile(0.5), Err(expected.clone()));
+        assert_eq!(sketch.quantiles(&[0.0, 0.5, 1.0]), Err(expected));
     }
 
     #[test]

@@ -459,8 +459,17 @@ smallest and largest retained values rather than guaranteed exact stream
 extrema. t-digest follows the same rank rule for singleton centroids, may
 interpolate between multi-sample centroid midpoint ranks, and separately
 retains the exact observed minimum and maximum for `q = 0` and `q = 1`.
-Its centroid means and interpolated quantiles remain finite across the complete
-finite `f64` input range, including mixtures of `-f64::MAX` and `f64::MAX`.
+
+KLL scalar queries and nonempty batches require at most `2^52` observations;
+larger counts return `SketchError::ObservationLimitExceeded { limit: 1 << 52 }`
+before allocating or sorting query state. The boundary is inclusive and applies
+to endpoint queries too. Query values are validated first; an empty batch always
+returns an empty vector. KLL ingestion and merging still support exact `u64`
+counts. This conservative query limit keeps count conversion exact and preserves
+ordinary `f64` product rounding, including the established small-sample ranks.
+
+t-digest's centroid means and interpolated quantiles remain finite across the
+complete finite `f64` input range, including mixtures of `-f64::MAX` and `f64::MAX`.
 Additions are accumulated in an ordered buffer of roughly `10 * compression`
 entries and batch-merged with the compressed centroids. Quantile queries merge
 those two ordered views while reading, so they neither clone nor sort the

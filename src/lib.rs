@@ -73,6 +73,14 @@ pub enum SketchError {
     /// Returned when combining sketches would exceed the supported observation
     /// count.
     ObservationCountOverflow,
+    /// Returned when a query exceeds its supported observation-count limit.
+    ///
+    /// The sketch's exact count can remain valid for ingestion and merging.
+    /// KLL quantile queries use this error above `2^52` observations.
+    ObservationLimitExceeded {
+        /// Maximum observation count accepted by the requested query, inclusive.
+        limit: u64,
+    },
     /// Returned when a Count Sketch update would exceed its exact signed
     /// counter range.
     CounterOverflow,
@@ -90,6 +98,12 @@ impl fmt::Display for SketchError {
             Self::IncompatibleSketches(message) => write!(f, "incompatible sketches: {message}"),
             Self::ObservationCountOverflow => {
                 write!(f, "observation count exceeds u64::MAX")
+            }
+            Self::ObservationLimitExceeded { limit } => {
+                write!(
+                    f,
+                    "observation count exceeds supported query limit of {limit}"
+                )
             }
             Self::CounterOverflow => {
                 write!(f, "Count Sketch counter update exceeds the exact i64 range")
