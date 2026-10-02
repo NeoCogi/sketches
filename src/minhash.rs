@@ -29,7 +29,7 @@
 //! Each [`MinHash`] owns its deterministically derived component seeds and its
 //! signature. Seeds remain precomputed on the insertion hot path without any
 //! global cache or shared mutable state. The concrete hash algorithm behind
-//! [`crate::seeded_hash64`] is an implementation detail, so signatures should
+//! `crate::seeded_hash64` is an implementation detail, so signatures should
 //! not be treated as a portable persistence format across crate or Rust versions.
 //!
 //! [broder]: https://www.cs.princeton.edu/courses/archive/spring13/cos598C/broder97resemblance.pdf

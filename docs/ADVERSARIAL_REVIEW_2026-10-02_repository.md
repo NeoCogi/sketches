@@ -19,7 +19,7 @@ line references and final-state appendix below describe the original
 | ID | Status | Result and fresh verification |
 | --- | --- | --- |
 | F1 | Addressed | Module, constructor, sizing helpers and README explicitly describe asymptotic sizing and finite probe correlation. Four new regressions exhaust all 512 `(32,22)` base-hash pairs, check an independent-probe control against 16 exhaustive small cases and exact reference values, bridge the model to production, and exercise 608,000 absent queries plus merge/clear/reuse over two identified key distributions. All 19 Bloom tests pass. Production dimensions/probes and the advisory contract remain unchanged; no finite target guarantee is added. |
-| D1 | Pending | Replace the private-helper hyperlink while retaining the persistence caveat. |
+| D1 | Addressed | The private-helper reference is plain inline code. Public rustdoc passes with `rustdoc::private_intra_doc_links` denied; the rendered MinHash page retains the persistence/version caveat. The helper remains crate-private and hashing is unchanged. |
 | S1 | Pending | Acquire all MinMax backing capacities before initialization. |
 | S2 | Pending | Consolidate constructor coefficient stepping without changing domains or draw order. |
 
