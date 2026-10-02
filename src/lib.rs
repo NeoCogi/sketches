@@ -29,7 +29,7 @@
 //! - [`hyperloglog::HyperLogLog`] for approximate cardinality estimation.
 //! - [`ultraloglog::UltraLogLog`] for more space-efficient approximate
 //!   cardinality estimation.
-//! - [`jacard`] for approximate set overlap/Jaccard helpers on cardinality and
+//! - [`jaccard`] for approximate set overlap/Jaccard helpers on cardinality and
 //!   similarity sketches.
 //! - [`bloom_filter::BloomFilter`] for approximate set membership checks.
 //! - [`count_sketch::CountSketch`] for signed approximate frequency estimation.
@@ -39,7 +39,7 @@
 //! - [`tdigest::TDigest`] for tail-friendly quantiles.
 //! - [`cuckoo_filter::CuckooFilter`] for membership with deletions.
 //! - [`minhash::MinHash`] for approximate Jaccard estimation.
-//! - [`lsh_minhash::MinHashLshIndex`] for approximate nearest-neighbor lookup.
+//! - [`minhash_lsh_index::MinHashLshIndex`] for approximate nearest-neighbor lookup.
 //! - [`reservoir_sampling::ReservoirSampling`] for uniform stream sampling.
 //! - [`vector_welford::VectorWelford`] for streaming vector moments without sketch approximation.
 
@@ -52,10 +52,10 @@ pub mod count_min_sketch;
 pub mod count_sketch;
 pub mod cuckoo_filter;
 pub mod hyperloglog;
-pub mod jacard;
+pub mod jaccard;
 pub mod kll;
-pub mod lsh_minhash;
 pub mod minhash;
+pub mod minhash_lsh_index;
 pub mod minmax_sketch;
 pub mod reservoir_sampling;
 pub mod space_saving;

@@ -123,7 +123,7 @@ struct Entry<Id> {
 ///
 /// # Example
 /// ```rust
-/// use sketches::lsh_minhash::MinHashLshIndex;
+/// use sketches::minhash_lsh_index::MinHashLshIndex;
 /// use sketches::minhash::MinHash;
 ///
 /// let num_hashes = 128;

@@ -61,7 +61,7 @@
 
 use std::hash::Hash;
 
-use crate::jacard::{InclusionExclusionEstimates, JacardIndex, inclusion_exclusion_estimates};
+use crate::jaccard::{InclusionExclusionEstimates, JaccardIndex, inclusion_exclusion_estimates};
 use crate::{SketchError, seeded_hash64};
 
 /// Smallest precision supported by the byte encoding and merge bit tricks.
@@ -1078,7 +1078,7 @@ impl UltraLogLog {
     }
 }
 
-impl JacardIndex for UltraLogLog {
+impl JaccardIndex for UltraLogLog {
     /// Delegates the shared trait API to UltraLogLog's documented inherent
     /// inclusion-exclusion implementation.
     fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError> {
@@ -1158,7 +1158,7 @@ mod tests {
 
                 let intersection = left.intersection_estimate(right);
                 let jaccard = left.jaccard_index(right);
-                let trait_jaccard = crate::jacard::JacardIndex::jaccard_index(left, right);
+                let trait_jaccard = crate::jaccard::JaccardIndex::jaccard_index(left, right);
                 if [a, b, union].iter().any(|value| !value.is_finite()) {
                     assert_eq!(intersection, Err(crate::SketchError::EstimateUnavailable));
                     assert_eq!(jaccard, Err(crate::SketchError::EstimateUnavailable));

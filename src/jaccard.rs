@@ -107,10 +107,10 @@ pub(crate) fn inclusion_exclusion_estimates(
 /// # Example
 /// ```rust
 /// use sketches::SketchError;
-/// use sketches::jacard::JacardIndex;
+/// use sketches::jaccard::JaccardIndex;
 /// use sketches::minhash::MinHash;
 ///
-/// fn compare<S: JacardIndex>(left: &S, right: &S) -> Result<f64, SketchError> {
+/// fn compare<S: JaccardIndex>(left: &S, right: &S) -> Result<f64, SketchError> {
 ///     left.jaccard_index(right)
 /// }
 ///
@@ -126,7 +126,7 @@ pub(crate) fn inclusion_exclusion_estimates(
 /// let similarity = compare(&left, &right).unwrap();
 /// assert!(similarity > 0.20 && similarity < 0.60);
 /// ```
-pub trait JacardIndex {
+pub trait JaccardIndex {
     /// Returns the estimated Jaccard index `|A ∩ B| / |A ∪ B|`.
     ///
     /// # Errors
@@ -142,7 +142,7 @@ pub trait JacardIndex {
 mod tests {
     use crate::{
         hyperloglog::HyperLogLog,
-        jacard::{JacardIndex, inclusion_exclusion_estimates},
+        jaccard::{JaccardIndex, inclusion_exclusion_estimates},
         minhash::MinHash,
         ultraloglog::UltraLogLog,
     };
@@ -178,7 +178,7 @@ mod tests {
             Err(crate::SketchError::EstimateUnavailable)
         );
         assert_eq!(
-            JacardIndex::jaccard_index(&saturated, &saturated),
+            JaccardIndex::jaccard_index(&saturated, &saturated),
             Err(crate::SketchError::EstimateUnavailable)
         );
         assert_eq!(saturated, before);
@@ -251,7 +251,7 @@ mod tests {
             right.add(&value);
         }
 
-        let similarity = JacardIndex::jaccard_index(&left, &right).unwrap();
+        let similarity = JaccardIndex::jaccard_index(&left, &right).unwrap();
         assert!(similarity > 0.20 && similarity < 0.60);
     }
 
@@ -268,7 +268,7 @@ mod tests {
             right.add(&value);
         }
 
-        let similarity = JacardIndex::jaccard_index(&left, &right).unwrap();
+        let similarity = JaccardIndex::jaccard_index(&left, &right).unwrap();
         assert!(similarity > 0.20 && similarity < 0.60);
     }
 
@@ -285,7 +285,7 @@ mod tests {
             right.add(&value);
         }
 
-        let similarity = JacardIndex::jaccard_index(&left, &right).unwrap();
+        let similarity = JaccardIndex::jaccard_index(&left, &right).unwrap();
         assert!(similarity > 0.20 && similarity < 0.60);
     }
 }

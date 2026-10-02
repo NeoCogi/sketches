@@ -64,7 +64,7 @@
 
 use std::hash::Hash;
 
-use crate::jacard::{JacardIndex, inclusion_exclusion_estimates};
+use crate::jaccard::{JaccardIndex, inclusion_exclusion_estimates};
 use crate::{SketchError, seeded_hash64};
 
 const MIN_PRECISION: u8 = 4;
@@ -482,7 +482,7 @@ impl HyperLogLog {
     }
 }
 
-impl JacardIndex for HyperLogLog {
+impl JaccardIndex for HyperLogLog {
     fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError> {
         HyperLogLog::jaccard_index(self, other)
     }
@@ -737,7 +737,7 @@ mod tests {
             Err(crate::SketchError::EstimateUnavailable)
         );
         assert_eq!(
-            crate::jacard::JacardIndex::jaccard_index(&saturated, &saturated),
+            crate::jaccard::JaccardIndex::jaccard_index(&saturated, &saturated),
             Err(crate::SketchError::EstimateUnavailable)
         );
         assert_eq!(saturated.precision, before.precision);
@@ -776,7 +776,7 @@ mod tests {
                 let right_before = right.clone();
                 let intersection = left.intersection_estimate(right);
                 let jaccard = left.jaccard_index(right);
-                let trait_jaccard = crate::jacard::JacardIndex::jaccard_index(left, right);
+                let trait_jaccard = crate::jaccard::JaccardIndex::jaccard_index(left, right);
                 if left.precision != right.precision {
                     for result in [
                         left.union_estimate(right),

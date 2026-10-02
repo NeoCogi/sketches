@@ -36,7 +36,7 @@
 
 use std::hash::Hash;
 
-use crate::jacard::JacardIndex;
+use crate::jaccard::JaccardIndex;
 use crate::{SketchError, seeded_hash64, splitmix64};
 
 /// Derivation seed for the deterministic default MinHash family.
@@ -329,7 +329,7 @@ fn required_hashes_for_max_standard_error(target: f64) -> Result<usize, SketchEr
     Ok(num_hashes)
 }
 
-impl JacardIndex for MinHash {
+impl JaccardIndex for MinHash {
     fn jaccard_index(&self, other: &Self) -> Result<f64, SketchError> {
         self.estimate_jaccard(other)
     }

@@ -20,43 +20,44 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-use sketches::hyperloglog::HyperLogLog;
+use sketches::minhash::MinHash;
+use sketches::minhash_lsh_index::MinHashLshIndex;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Use the same precision for both sketches so merge-based operations are valid.
-    let mut left = HyperLogLog::new(14)?;
-    let mut right = HyperLogLog::new(14)?;
+    // Use 128 hash components split across 32 bands (4 rows per band).
+    let num_hashes = 128;
+    let mut index = MinHashLshIndex::new(num_hashes, 32)?;
 
-    // Build two sets with a controlled overlap:
-    // left  = [0, 10_000)
-    // right = [5_000, 15_000)
-    // exact intersection = 5_000, exact union = 15_000.
-    for value in 0_u64..10_000 {
-        left.add(&value);
-    }
-    for value in 5_000_u64..15_000 {
-        right.add(&value);
+    // Create two indexed documents as MinHash signatures.
+    let mut doc_a = MinHash::new(num_hashes)?;
+    let mut doc_b = MinHash::new(num_hashes)?;
+
+    // doc_a tokens: [0, 10_000)
+    for token in 0_u64..10_000 {
+        doc_a.add(&token);
     }
 
-    // Estimate set relations derived from the two sketches.
-    let union = left.union_estimate(&right)?;
-    let intersection = left.intersection_estimate(&right)?;
-    let jaccard = left.jaccard_index(&right)?;
+    // doc_b tokens: [20_000, 30_000) (mostly disjoint from query below).
+    for token in 20_000_u64..30_000 {
+        doc_b.add(&token);
+    }
 
-    // Print both approximate and exact values to make error intuitive.
-    let exact_union = 15_000.0;
-    let exact_intersection = 5_000.0;
-    let exact_jaccard = exact_intersection / exact_union;
+    // Index them by document ids.
+    index.insert(1_u64, &doc_a)?;
+    index.insert(2_u64, &doc_b)?;
 
-    println!("union estimate:        {:.2} (exact {:.2})", union, exact_union);
-    println!(
-        "intersection estimate: {:.2} (exact {:.2})",
-        intersection, exact_intersection
-    );
-    println!(
-        "jaccard estimate:      {:.4} (exact {:.4})",
-        jaccard, exact_jaccard
-    );
+    // Build a query overlapping heavily with doc_a: [1_000, 11_000).
+    let mut query = MinHash::new(num_hashes)?;
+    for token in 1_000_u64..11_000 {
+        query.add(&token);
+    }
+
+    // LSH first retrieves likely neighbors, then we can rerank with Jaccard.
+    let candidates = index.query_candidates(&query)?;
+    println!("Candidates: {:?}", candidates);
+
+    let ranked = index.query_top_k(&query, 5)?;
+    println!("Top matches (id, est_jaccard): {:?}", ranked);
 
     Ok(())
 }

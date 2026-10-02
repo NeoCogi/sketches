@@ -44,10 +44,10 @@ sketches = { path = "../sketches" }
 | KLL Sketch | `kll` | You need general quantiles (median, p90, p99) | Good default quantile sketch |
 | t-digest | `tdigest` | You care most about tail quantiles (p95/p99/p999) | Typically stronger tail behavior |
 | MinHash | `minhash` | You need Jaccard similarity between sets | Best default for similarity tasks |
-| MinHash LSH | `lsh_minhash` | You need fast near-duplicate/candidate lookup before reranking | Uses banding over MinHash signatures |
+| MinHash LSH Index | `minhash_lsh_index` | You need fast near-duplicate/candidate lookup before reranking | Uses banding over MinHash signatures |
 | Reservoir Sampling | `reservoir_sampling` | You need a uniform sample from an unbounded stream | Fixed-size unbiased sample |
 | Vector Welford's Algorithm | `vector_welford` | You need streaming means, variances, and covariances of numeric vectors | Online moments using `f64`, without sketch approximation; `O(d²)` space; mergeable |
-| Jaccard trait/helpers | `jacard` | You want a shared Jaccard API across sketches | Provides `JacardIndex` trait |
+| Jaccard trait/helpers | `jaccard` | You want a shared Jaccard API across sketches | Provides `JaccardIndex` trait |
 
 ## Which Sketch Should I Use?
 
@@ -59,7 +59,7 @@ If your primary goal is:
 - Jaccard similarity: use `MinHash` first.
 - Candidate retrieval for similarity search: use `MinHashLshIndex`, then rerank with MinHash Jaccard.
 - Jaccard from existing cardinality pipelines: `HyperLogLog` or `UltraLogLog`
-  plus the `jacard` trait are available, but read the low-overlap limitations
+  plus the `jaccard` trait are available, but read the low-overlap limitations
   below before using them.
 - Membership without delete: use `BloomFilter`.
 - Membership with delete: use `CuckooFilter`; delete only items known to have been inserted successfully.
@@ -378,7 +378,7 @@ Import validation takes `O(register_count)` time and accepts legal saturated
 bytes. A fully saturated sketch can still return an infinite cardinality
 estimate.
 
-UltraLogLog also implements `JacardIndex` and provides
+UltraLogLog also implements `JaccardIndex` and provides
 `intersection_estimate()` and `jaccard_index()`. These use the default FGRA
 cardinality estimator and inclusion-exclusion; they are not a specialized joint
 UltraLogLog estimator. Inputs with different precisions are first evaluated at
@@ -614,7 +614,7 @@ println!("nominal relative standard error = {}", hll.expected_relative_error());
 Approximate Jaccard similarity (recommended via MinHash):
 
 ```rust
-use sketches::jacard::JacardIndex;
+use sketches::jaccard::JaccardIndex;
 use sketches::minhash::MinHash;
 
 let mut left = MinHash::new(256)?;
@@ -637,9 +637,9 @@ println!("jaccard ~ {:.4}", left.jaccard_index(&right)?);
 cargo run --example bloom_filter
 cargo run --example cuckoo_filter
 cargo run --example hyperloglog
-cargo run --example jacard
+cargo run --example hyperloglog_set_operations
 cargo run --example minhash
-cargo run --example lsh_minhash
+cargo run --example minhash_lsh_index
 cargo run --example count_min_sketch
 cargo run --example minmax_sketch
 cargo run --example count_sketch
