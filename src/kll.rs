@@ -649,6 +649,47 @@ mod tests {
             .sum()
     }
 
+    /// Builds a real sketch with an arbitrary `u64` count using public merges.
+    ///
+    /// Binary decomposition keeps each intermediate count representable and
+    /// retains only bounded compactor state, even at `u64::MAX` observations.
+    /// Equal values supply an independent quantile oracle below the query limit.
+    fn repeated_value_sketch(value: f64, count: u64, k: usize, seed: u64) -> KllSketch {
+        let mut result = KllSketch::with_seed(k, seed).unwrap();
+        if count == 0 {
+            return result;
+        }
+
+        let mut power = KllSketch::with_seed(k, seed.wrapping_add(1)).unwrap();
+        power.add(value);
+        let mut remaining = count;
+        loop {
+            if remaining & 1 != 0 {
+                result.merge(&power).unwrap();
+            }
+            remaining >>= 1;
+            if remaining == 0 {
+                break;
+            }
+            power.merge(&power.clone()).unwrap();
+        }
+
+        assert_eq!(result.count(), count);
+        assert_eq!(retained_weight(&result), count as u128);
+        for (level, values) in result.levels.iter().enumerate() {
+            assert!(values.len() <= result.level_capacity(level));
+        }
+        result
+    }
+
+    /// Compares all owned state after an operation expected to be read-only.
+    fn assert_sketch_unchanged(sketch: &KllSketch, before: &KllSketch) {
+        assert_eq!(sketch.k, before.k);
+        assert_eq!(sketch.count, before.count);
+        assert_eq!(sketch.levels, before.levels);
+        assert_eq!(sketch.rng_state, before.rng_state);
+    }
+
     fn estimated_rank(sketch: &KllSketch, exclusive_upper_bound: f64) -> i128 {
         sketch
             .levels
@@ -1409,6 +1450,242 @@ mod tests {
         };
         assert_eq!(sketch.quantile(0.5), Err(expected.clone()));
         assert_eq!(sketch.quantiles(&[0.0, 0.5, 1.0]), Err(expected));
+    }
+
+    #[test]
+    fn quantile_query_limit_covers_large_count_boundaries() {
+        let counts = [
+            0,
+            1,
+            2,
+            3,
+            4_503_599_627_370_495,
+            4_503_599_627_370_496,
+            4_503_599_627_370_497,
+            9_007_199_254_740_991,
+            9_007_199_254_740_992,
+            9_007_199_254_740_993,
+            9_007_199_254_740_995,
+            1_u64 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let queries = [
+            1.0,
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            1.0 / 3.0,
+            f64::from_bits(0.5_f64.to_bits() - 1),
+            0.5,
+            f64::from_bits(0.5_f64.to_bits() + 1),
+            2.0 / 3.0,
+            f64::from_bits(1.0_f64.to_bits() - 1),
+            0.5,
+        ];
+        let limit_error = SketchError::ObservationLimitExceeded {
+            limit: 4_503_599_627_370_496,
+        };
+        let empty_error =
+            SketchError::InvalidParameter("quantile is undefined for an empty sketch");
+
+        for k in [2, 200] {
+            for seed in [0, 7, u64::MAX] {
+                for count in counts {
+                    let sketch = repeated_value_sketch(7.0, count, k, seed);
+                    let before = sketch.clone();
+                    let error = if count == 0 {
+                        Some(empty_error.clone())
+                    } else if count > 4_503_599_627_370_496 {
+                        Some(limit_error.clone())
+                    } else {
+                        None
+                    };
+
+                    for query in queries {
+                        assert_eq!(
+                            sketch.quantile(query),
+                            error.clone().map_or(Ok(7.0), Err),
+                            "count={count}, k={k}, seed={seed}, q={query:?}"
+                        );
+                    }
+                    assert_eq!(
+                        sketch.quantiles(&queries),
+                        error.map_or(Ok(vec![7.0; queries.len()]), Err),
+                        "count={count}, k={k}, seed={seed}"
+                    );
+                    assert_eq!(sketch.quantiles(&[]), Ok(Vec::new()));
+                    assert_sketch_unchanged(&sketch, &before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantile_query_limit_preserves_invalid_query_precedence() {
+        let invalid_queries = [
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -f64::from_bits(1),
+            -1.0,
+            f64::from_bits(1.0_f64.to_bits() + 1),
+            2.0,
+        ];
+        let expected = SketchError::InvalidParameter("q must be finite and in [0, 1]");
+        for count in [
+            0,
+            4_503_599_627_370_496,
+            4_503_599_627_370_497,
+            9_007_199_254_740_995,
+            u64::MAX,
+        ] {
+            let sketch = repeated_value_sketch(7.0, count, 2, 7);
+            let before = sketch.clone();
+            for invalid in invalid_queries {
+                assert_eq!(sketch.quantile(invalid), Err(expected.clone()));
+                for batch in [
+                    vec![invalid],
+                    vec![0.0, invalid],
+                    vec![invalid, 1.0],
+                    vec![1.0, 0.5, invalid, 0.0],
+                ] {
+                    assert_eq!(sketch.quantiles(&batch), Err(expected.clone()));
+                }
+            }
+            assert_eq!(sketch.quantiles(&[]), Ok(Vec::new()));
+            assert_sketch_unchanged(&sketch, &before);
+        }
+    }
+
+    #[test]
+    fn quantile_query_limit_rejects_the_reproduced_median_discrepancy() {
+        let mut zeros = repeated_value_sketch(0.0, 1_u64 << 52, 200, 1);
+        zeros.add(0.0);
+        zeros.add(0.0);
+        let mut tens = repeated_value_sketch(10.0, 1_u64 << 52, 200, 2);
+        tens.add(10.0);
+        zeros.merge(&tens).unwrap();
+
+        assert_eq!(zeros.count(), 9_007_199_254_740_995);
+        assert_eq!(retained_weight(&zeros), 9_007_199_254_740_995);
+        assert_eq!(estimated_rank(&zeros, 10.0), 4_503_599_627_370_498);
+        // Independently expose the original one-rank error, without invoking
+        // the production target helper or defining a new arithmetic convention.
+        assert_eq!(zeros.count() / 2, 4_503_599_627_370_497);
+        assert_eq!(zeros.count() as f64 as u64, 9_007_199_254_740_996);
+        assert_eq!(
+            (zeros.count() as f64 * 0.5).floor() as u64,
+            4_503_599_627_370_498
+        );
+
+        let expected = SketchError::ObservationLimitExceeded {
+            limit: 4_503_599_627_370_496,
+        };
+        let queries = [
+            0.0,
+            f64::from_bits(0.5_f64.to_bits() - 1),
+            0.5,
+            f64::from_bits(0.5_f64.to_bits() + 1),
+            1.0,
+        ];
+        let before = zeros.clone();
+        for query in queries {
+            assert_eq!(zeros.quantile(query), Err(expected.clone()));
+        }
+        assert_eq!(zeros.quantiles(&queries), Err(expected));
+        assert_sketch_unchanged(&zeros, &before);
+    }
+
+    #[test]
+    fn quantile_query_limit_preserves_ingestion_merge_and_clear() {
+        let mut sketch = repeated_value_sketch(7.0, 4_503_599_627_370_495, 2, 7);
+        let mut singleton = KllSketch::with_seed(2, 8).unwrap();
+        singleton.add(7.0);
+        let donor_before = singleton.clone();
+        sketch.merge(&singleton).unwrap();
+        assert_eq!(sketch.count(), 4_503_599_627_370_496);
+        assert_eq!(sketch.quantile(0.5), Ok(7.0));
+
+        sketch.merge(&singleton).unwrap();
+        sketch.add(7.0);
+        assert_eq!(sketch.count(), 4_503_599_627_370_498);
+        assert_eq!(retained_weight(&sketch), sketch.count() as u128);
+        assert_sketch_unchanged(&singleton, &donor_before);
+        let expected = SketchError::ObservationLimitExceeded {
+            limit: 4_503_599_627_370_496,
+        };
+        assert_eq!(sketch.quantile(0.5), Err(expected.clone()));
+        let before = sketch.clone();
+        for ignored in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            sketch.add(ignored);
+        }
+        assert_sketch_unchanged(&sketch, &before);
+
+        sketch.merge(&before).unwrap();
+        assert_eq!(sketch.count(), 9_007_199_254_740_996);
+        assert_eq!(retained_weight(&sketch), sketch.count() as u128);
+        assert_eq!(sketch.quantiles(&[0.0, 0.5, 1.0]), Err(expected));
+
+        let rng_before_clear = sketch.rng_state;
+        sketch.clear();
+        assert_eq!(sketch.rng_state, rng_before_clear);
+        assert_eq!(retained_weight(&sketch), 0);
+        assert_eq!(sketch.count(), 0);
+        assert!(sketch.is_empty());
+        assert_eq!(sketch.quantiles(&[]), Ok(Vec::new()));
+        assert_eq!(
+            sketch.quantile(0.5),
+            Err(SketchError::InvalidParameter(
+                "quantile is undefined for an empty sketch"
+            ))
+        );
+        sketch.add(1.0);
+        sketch.add(2.0);
+        assert_eq!(sketch.count(), 2);
+        assert_eq!(sketch.quantile(0.5), Ok(2.0));
+        assert_eq!(sketch.quantiles(&[0.0, 0.5, 1.0]), Ok(vec![1.0, 2.0, 2.0]));
+    }
+
+    #[test]
+    fn quantile_query_limit_remains_distinct_from_u64_overflow() {
+        let mut sketch = repeated_value_sketch(7.0, u64::MAX, 2, 7);
+        let before = sketch.clone();
+        assert_eq!(
+            sketch.quantile(0.5),
+            Err(SketchError::ObservationLimitExceeded {
+                limit: 4_503_599_627_370_496
+            })
+        );
+        sketch.add(f64::NAN);
+        assert_sketch_unchanged(&sketch, &before);
+
+        let mut singleton = KllSketch::with_seed(2, 8).unwrap();
+        singleton.add(7.0);
+        assert_eq!(
+            sketch.merge(&singleton),
+            Err(SketchError::ObservationCountOverflow)
+        );
+        assert_sketch_unchanged(&sketch, &before);
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sketch.add(7.0)));
+        assert!(overflow.is_err());
+        assert_sketch_unchanged(&sketch, &before);
+    }
+
+    #[test]
+    fn quantile_query_limit_error_reports_its_inclusive_limit() {
+        let sketch = repeated_value_sketch(7.0, 4_503_599_627_370_497, 2, 7);
+        let error = sketch.quantile(0.5).unwrap_err();
+        let SketchError::ObservationLimitExceeded { limit } = error else {
+            panic!("expected a typed query limit, got {error:?}");
+        };
+        assert_eq!(limit, 4_503_599_627_370_496);
+        assert_eq!(
+            error.to_string(),
+            "observation count exceeds supported query limit of 4503599627370496"
+        );
+        assert_ne!(error, SketchError::ObservationCountOverflow);
     }
 
     #[test]
