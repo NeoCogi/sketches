@@ -44,10 +44,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rv = first.rv_coefficient().expect("sufficient variance");
     println!("Standard RV coefficient: {:.6}", rv);
 
-    let adj_rv = first
-        .adjusted_rv_coefficient()
-        .expect("sufficient off-diagonal variance");
-    println!("Adjusted RV coefficient (RV2): {:.6}", adj_rv);
-
     Ok(())
 }

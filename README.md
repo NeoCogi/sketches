@@ -178,9 +178,8 @@ assert!((coeff - 1.0).abs() < 1e-10);
 ```
 
 Results lie in $[0.0, 1.0]$. Returns `None` if fewer than two observations have been added
-or if either vector set has zero total variance. The accumulator also provides
-`adjusted_rv_coefficient()` for high-dimensional regimes ($p \ge 2, q \ge 2$) where diagonal
-variances are excluded ([Smilde et al. 2009]).
+or if either vector set has zero total variance. Modified RV₂ requires additional
+fourth-order row summaries beyond this accumulator's state.
 
 ## Count-Min Sketch Parameters and Seeds
 

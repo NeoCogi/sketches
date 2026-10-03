@@ -653,9 +653,6 @@ fn rv_coefficient_queries_need_no_heap_workspace() {
             rv.add(&x, &y).unwrap();
         }
         assert!(without_allocation(|| rv.rv_coefficient()).is_some());
-        if p >= 2 && q >= 2 {
-            assert!(without_allocation(|| rv.adjusted_rv_coefficient()).is_some());
-        }
     }
 }
 

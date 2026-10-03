@@ -441,57 +441,6 @@ impl RvCoefficient {
         Some((norm_xy_sq / denom).clamp(0.0, 1.0))
     }
 
-    /// Computes the modified/adjusted RV coefficient ($RV_2$) ([Smilde et al. 2009]).
-    ///
-    /// In high-dimensional settings where $p$ or $q$ is large relative to sample size,
-    /// standard RV can be inflated toward 1.0 due to the diagonal auto-variance elements.
-    /// The modified RV coefficient excludes the diagonal elements of $S_{XX}$ and $S_{YY}$:
-    ///
-    /// $$RV_{\text{adj}} = \frac{\|S_{XY}\|_F^2}{\sqrt{\sum_{i \ne j} S_{XX}(i, j)^2 \sum_{k \ne l} S_{YY}(k, l)^2}}$$
-    ///
-    /// Returns `None` if $p < 2$, $q < 2$, `count < 2`, or if off-diagonal variances sum to zero.
-    ///
-    /// [Smilde et al. 2009]: https://doi.org/10.1093/bioinformatics/btp134
-    pub fn adjusted_rv_coefficient(&self) -> Option<f64> {
-        if self.count < 2 || self.p < 2 || self.q < 2 {
-            return None;
-        }
-
-        let p = self.p;
-        let mut norm_xx_off_sq = 0.0;
-        for i in 0..p {
-            for j in 0..p {
-                if i != j {
-                    let v = self.s_xx[i * p + j];
-                    norm_xx_off_sq += v * v;
-                }
-            }
-        }
-
-        let q = self.q;
-        let mut norm_yy_off_sq = 0.0;
-        for i in 0..q {
-            for j in 0..q {
-                if i != j {
-                    let v = self.s_yy[i * q + j];
-                    norm_yy_off_sq += v * v;
-                }
-            }
-        }
-
-        let mut norm_xy_sq = 0.0;
-        for &val in &self.s_xy {
-            norm_xy_sq += val * val;
-        }
-
-        let denom = (norm_xx_off_sq * norm_yy_off_sq).sqrt();
-        if !denom.is_finite() || denom == 0.0 {
-            return None;
-        }
-
-        Some((norm_xy_sq / denom).clamp(0.0, 1.0))
-    }
-
     /// Returns sample covariance matrix of X divided by $n - 1$, or `None` if $n < 2$.
     pub fn covariance_xx(&self) -> Option<Vec<Vec<f64>>> {
         self.matrix_divided_by(&self.s_xx, self.p, self.p, self.count.saturating_sub(1))
@@ -584,7 +533,6 @@ mod tests {
         assert!(rv.is_empty());
         assert_eq!(rv.count(), 0);
         assert_eq!(rv.rv_coefficient(), None);
-        assert_eq!(rv.adjusted_rv_coefficient(), None);
         assert_eq!(rv.mean_x(), None);
         assert_eq!(rv.mean_y(), None);
         assert_eq!(rv.covariance_xx(), None);
@@ -594,7 +542,6 @@ mod tests {
         assert_eq!(rv.count(), 1);
         assert!(!rv.is_empty());
         assert_eq!(rv.rv_coefficient(), None);
-        assert_eq!(rv.adjusted_rv_coefficient(), None);
         assert_eq!(rv.mean_x(), Some(&[1.0, 2.0][..]));
         assert_eq!(rv.mean_y(), Some(&[3.0, 4.0][..]));
     }
@@ -621,8 +568,6 @@ mod tests {
         let computed_rv = rv.rv_coefficient().unwrap();
 
         assert!((computed_rv - expected_r2).abs() < 1e-12);
-        // Adjusted RV is None for p=1, q=1 by definition
-        assert_eq!(rv.adjusted_rv_coefficient(), None);
     }
 
     #[test]
@@ -704,7 +649,6 @@ mod tests {
         rv.add(&[3.0, 4.0], &[5.0, 5.0]).unwrap();
 
         assert_eq!(rv.rv_coefficient(), None);
-        assert_eq!(rv.adjusted_rv_coefficient(), None);
     }
 
     #[test]
@@ -798,30 +742,6 @@ mod tests {
         let other = RvCoefficient::new(3, 2).unwrap();
         assert!(rv.merge(&other).is_err());
         assert_eq!(rv.count(), 1);
-    }
-
-    #[test]
-    fn adjusted_rv_coefficient_behavior() {
-        let mut rv = RvCoefficient::new(2, 2).unwrap();
-        // Collinear 2D vectors: adjusted RV is 1.0
-        let data = [
-            ([1.0, 2.0], [1.0, 2.0]),
-            ([2.0, 4.0], [2.0, 4.0]),
-            ([4.0, 1.0], [4.0, 1.0]),
-            ([3.0, 5.0], [3.0, 5.0]),
-        ];
-        for (x, y) in data {
-            rv.add(&x, &y).unwrap();
-        }
-
-        let adj = rv.adjusted_rv_coefficient().unwrap();
-        assert!((adj - 1.0).abs() < 1e-12, "expected 1.0, got {adj}");
-
-        // For p=1 or q=1, adjusted RV must return None
-        let mut rv_1d = RvCoefficient::new(1, 2).unwrap();
-        rv_1d.add(&[1.0], &[1.0, 2.0]).unwrap();
-        rv_1d.add(&[2.0], &[2.0, 4.0]).unwrap();
-        assert_eq!(rv_1d.adjusted_rv_coefficient(), None);
     }
 
     #[test]

@@ -36,10 +36,13 @@ applications must not assume compatibility with states produced by 0.1.2.
 - MinHash LSH candidate-probability, inverse-model and sizing helpers.
 - RV coefficient streaming multivariate matrix correlation between distinct
   vector-valued streams, with Welford-style cross-product updates, zero-allocation
-  Frobenius queries, pairwise merging and adjusted RV2 estimation.
+  Frobenius queries and pairwise merging.
 
 ### Correctness and resource changes
 
+- Remove the pre-release `RvCoefficient::adjusted_rv_coefficient` method: feature
+  covariance diagonal exclusion does not compute modified RV₂, whose observation
+  Gram diagonal corrections need additional retained moment information.
 - HLL uses Ertl's maximum-likelihood estimator; HLL and ULL document the
   statistical limitations and availability of inclusion-exclusion relations.
 - Scalar HLL/ULL union, intersection and Jaccard queries use fixed stack
