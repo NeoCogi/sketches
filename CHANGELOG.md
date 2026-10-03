@@ -40,6 +40,9 @@ applications must not assume compatibility with states produced by 0.1.2.
 
 ### Correctness and resource changes
 
+- Standard RV queries use scaled Frobenius sums and a square-root ratio to avoid
+  unnecessary overflow/underflow for finite retained moments; numerical state
+  overflow remains subject to ordinary `f64` accumulation limits.
 - Remove the pre-release `RvCoefficient::adjusted_rv_coefficient` method: feature
   covariance diagonal exclusion does not compute modified RV₂, whose observation
   Gram diagonal corrections need additional retained moment information.

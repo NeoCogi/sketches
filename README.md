@@ -177,9 +177,17 @@ assert!((coeff - 1.0).abs() < 1e-10);
 # Ok::<(), sketches::SketchError>(())
 ```
 
-Results lie in $[0.0, 1.0]$. Returns `None` if fewer than two observations have been added
-or if either vector set has zero total variance. Modified RV₂ requires additional
-fourth-order row summaries beyond this accumulator's state.
+Queries use scaled sums of squares, preserving representable coefficients when raw
+moment squares or norm products would overflow or underflow. Results lie in
+$[0.0, 1.0]$. Returns `None` if fewer than two observations have been added, either
+vector set has zero total variance, or accumulated matrix entries or query arithmetic
+are nonfinite. A coefficient below the representable range can round to zero.
+
+Updates follow ordinary `f64` arithmetic. Extreme finite coordinates can overflow
+means or centered sums; tiny updates can underflow or round away. Arbitrary batch
+partitions need not give identical results, and the rounded joint covariance matrix
+need not be positive semidefinite. Modified RV₂ requires additional fourth-order row
+summaries beyond this accumulator's state.
 
 ## Count-Min Sketch Parameters and Seeds
 

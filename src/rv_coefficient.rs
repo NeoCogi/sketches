@@ -58,6 +58,14 @@
 //! This requires $O(p^2 + q^2 + pq)$ time and $O(1)$ stack workspace, with **zero matrix multiplications**
 //! and **zero heap allocations** during queries. Total retained memory is $O(p^2 + q^2 + pq)$ floats.
 //!
+//! Queries use scaled sums of squares, avoiding raw squared moments and norm products
+//! that can overflow or underflow even when the coefficient is representable.
+//! Accumulation still uses ordinary `f64` arithmetic: extreme finite coordinates can
+//! overflow means or centered sums, and tiny updates can underflow or round away.
+//! Rounding does not promise a positive semidefinite joint covariance matrix or
+//! identical results across arbitrary batch partitions. Modified RV₂ requires
+//! additional fourth-order row information beyond the retained second moments.
+//!
 //! [Robert & Escoufier 1976]: https://www.jstor.org/stable/2347233
 //! [SAND2008-6212]: https://digital.library.unt.edu/ark:/67531/metadc837537/m2/1/high_res_d/1028931.pdf#page=13
 
@@ -221,6 +229,8 @@ impl RvCoefficient {
     /// Returns [`SketchError::InvalidParameter`] if slice lengths do not match $p$ and $q$,
     /// or if any coordinate is not finite (NaN or infinite).
     /// Returns [`SketchError::ObservationCountOverflow`] if adding would exceed `u64::MAX`.
+    /// Finite input can still overflow the running means or centered sums;
+    /// intermediate numerical overflow does not reject an observation.
     pub fn add(&mut self, x: &[f64], y: &[f64]) -> Result<(), SketchError> {
         if x.len() != self.p {
             return Err(SketchError::InvalidParameter(
@@ -410,35 +420,49 @@ impl RvCoefficient {
     ///
     /// Returns `None` if fewer than two observations have been added (`count < 2`)
     /// or if either $X$ or $Y$ has zero variance (zero Frobenius norm), making
-    /// the correlation mathematically undefined.
+    /// the correlation mathematically undefined. Also returns `None` if accumulated
+    /// matrix entries or query arithmetic are nonfinite after numerical overflow.
     ///
-    /// The returned value is clamped to $[0.0, 1.0]$.
+    /// Scaled sums of squares and a square-root ratio avoid materializing raw
+    /// squared moments or norm products. The returned value is finite and clamped
+    /// to $[0.0, 1.0]$; a result below the representable range can round to zero.
     pub fn rv_coefficient(&self) -> Option<f64> {
         if self.count < 2 {
             return None;
         }
 
-        let mut norm_xx_sq = 0.0;
-        for &val in &self.s_xx {
-            norm_xx_sq += val * val;
+        let xx = ScaledSquaredNorm::of(&self.s_xx)?;
+        let yy = ScaledSquaredNorm::of(&self.s_yy)?;
+        let xy = ScaledSquaredNorm::of(&self.s_xy)?;
+        if xx.scale == 0.0 || yy.scale == 0.0 {
+            return None;
+        }
+        if xy.scale == 0.0 {
+            return Some(0.0);
         }
 
-        let mut norm_yy_sq = 0.0;
-        for &val in &self.s_yy {
-            norm_yy_sq += val * val;
-        }
+        // For covariance moments, |Sxy[i,j]| <= sqrt(max(Sxx) * max(Syy)).
+        // Divide by the smaller square-root scale first, so this intermediate
+        // is bounded by the larger root scale without multiplying the scales.
+        let root_x = xx.scale.sqrt();
+        let root_y = yy.scale.sqrt();
+        let (small, large) = if root_x <= root_y {
+            (root_x, root_y)
+        } else {
+            (root_y, root_x)
+        };
 
-        let mut norm_xy_sq = 0.0;
-        for &val in &self.s_xy {
-            norm_xy_sq += val * val;
-        }
-
-        let denom = (norm_xx_sq * norm_yy_sq).sqrt();
-        if !denom.is_finite() || denom == 0.0 {
+        // Each normalized sum is bounded by its addressable matrix length,
+        // so their product fits f64. Form sqrt(RV) before squaring once, allowing
+        // many tiny cross entries to contribute to a representable subnormal RV.
+        let normalized_denom = (xx.sum_squares * yy.sum_squares).sqrt();
+        let root_rv = ((xy.scale / small) / large) * (xy.sum_squares / normalized_denom).sqrt();
+        if !root_rv.is_finite() {
             return None;
         }
 
-        Some((norm_xy_sq / denom).clamp(0.0, 1.0))
+        let root_rv = root_rv.clamp(0.0, 1.0);
+        Some(root_rv * root_rv)
     }
 
     /// Returns sample covariance matrix of X divided by $n - 1$, or `None` if $n < 2$.
@@ -497,6 +521,48 @@ impl RvCoefficient {
     }
 }
 
+/// Constant-workspace representation of a squared Frobenius norm.
+///
+/// The mathematical norm squared is `scale² * sum_squares`; that potentially
+/// unrepresentable product is never materialized. A zero matrix has both fields
+/// zero. Nonzero matrices have a positive finite scale and `sum_squares >= 1`.
+struct ScaledSquaredNorm {
+    /// Largest absolute matrix entry observed so far.
+    scale: f64,
+    /// Sum of entry squares normalized by the current scale squared.
+    sum_squares: f64,
+}
+
+impl ScaledSquaredNorm {
+    /// Accumulates a scaled sum in one scan; rejects nonfinite matrix entries.
+    /// Rescaling the previous sum when a larger entry arrives bounds every
+    /// squared ratio by one without allocating or squaring a raw matrix value.
+    fn of(matrix: &[f64]) -> Option<Self> {
+        let mut norm = Self {
+            scale: 0.0,
+            sum_squares: 0.0,
+        };
+        for &value in matrix {
+            if !value.is_finite() {
+                return None;
+            }
+            let magnitude = value.abs();
+            if magnitude == 0.0 {
+                continue;
+            }
+            if magnitude > norm.scale {
+                let ratio = norm.scale / magnitude;
+                norm.sum_squares = 1.0 + norm.sum_squares * ratio * ratio;
+                norm.scale = magnitude;
+            } else {
+                let ratio = magnitude / norm.scale;
+                norm.sum_squares += ratio * ratio;
+            }
+        }
+        Some(norm)
+    }
+}
+
 /// Symmetrically scales a product of deviations by a Welford weighting term.
 ///
 /// Multiplies the larger absolute value by the weight first when weight is below 1,
@@ -517,6 +583,156 @@ fn weighted_cross_product(left: f64, right: f64, weight: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Independent batch scatter from pairwise observation differences.
+    /// Used only on small reference data where raw products stay representable.
+    fn reference_cross_sums<const P: usize, const Q: usize>(
+        x: &[[f64; P]],
+        y: &[[f64; Q]],
+    ) -> Vec<f64> {
+        let mut sums = vec![0.0; P * Q];
+        for a in 0..x.len() {
+            for b in a + 1..x.len() {
+                for i in 0..P {
+                    for j in 0..Q {
+                        sums[i * Q + j] += (x[a][i] - x[b][i]) * (y[a][j] - y[b][j]);
+                    }
+                }
+            }
+        }
+        for value in &mut sums {
+            *value /= x.len() as f64;
+        }
+        sums
+    }
+
+    /// Batch RV oracle independent of the streaming recurrence and scaled query.
+    fn reference_rv<const P: usize, const Q: usize>(x: &[[f64; P]], y: &[[f64; Q]]) -> f64 {
+        let squared_norm = |values: Vec<f64>| values.iter().map(|value| value * value).sum::<f64>();
+        squared_norm(reference_cross_sums(x, y))
+            / (squared_norm(reference_cross_sums(x, x)) * squared_norm(reference_cross_sums(y, y)))
+                .sqrt()
+    }
+
+    #[test]
+    fn queries_remain_defined_for_finite_scaled_moments() {
+        for scale in [1.0, 1e40, 1e-50, 1e100, 1e-100] {
+            let mut rv = RvCoefficient::new(1, 1).unwrap();
+            rv.add(&[0.0], &[0.0]).unwrap();
+            rv.add(&[scale], &[scale]).unwrap();
+            let variance = rv.covariance_xx().unwrap()[0][0];
+            assert!(variance.is_finite() && variance > 0.0);
+            let coefficient = rv
+                .rv_coefficient()
+                .expect("finite nonzero moments define RV");
+            assert!((coefficient - 1.0).abs() < 2e-15, "scale={scale:e}");
+        }
+    }
+
+    #[test]
+    fn independent_block_scales_and_all_batch_splits_match_reference() {
+        let x = [
+            [1.0, 2.0, -1.0],
+            [2.0, -1.0, 0.0],
+            [-1.0, 0.0, 2.0],
+            [0.0, 1.0, 1.0],
+            [3.0, -2.0, -2.0],
+            [-2.0, 3.0, 0.0],
+        ];
+        let y = [
+            [2.0, 1.0],
+            [-1.0, 2.0],
+            [1.0, -2.0],
+            [3.0, 0.0],
+            [-2.0, 3.0],
+            [0.0, -1.0],
+        ];
+        let expected = reference_rv(&x, &y);
+        assert!(expected > 0.0 && expected < 1.0);
+        for exponent_x in [-500, -250, -100, -50, 0, 50, 100, 250, 500] {
+            for exponent_y in [-500, -250, -100, -50, 0, 50, 100, 250, 500] {
+                let x = x.map(|row| row.map(|value| value * 2.0_f64.powi(exponent_x)));
+                // A negative scalar also exercises reflection invariance.
+                let y = y.map(|row| row.map(|value| -value * 2.0_f64.powi(exponent_y)));
+                for split in 0..=x.len() {
+                    let mut left = RvCoefficient::new(3, 2).unwrap();
+                    let mut right = RvCoefficient::new(3, 2).unwrap();
+                    let mut direct = RvCoefficient::new(3, 2).unwrap();
+                    for i in 0..x.len() {
+                        direct.add(&x[i], &y[i]).unwrap();
+                        if i < split {
+                            left.add(&x[i], &y[i]).unwrap();
+                        } else {
+                            right.add(&x[i], &y[i]).unwrap();
+                        }
+                    }
+                    let mut reverse = right.clone();
+                    reverse.merge(&left).unwrap();
+                    left.merge(&right).unwrap();
+                    for rv in [&direct, &left, &reverse] {
+                        let actual = rv.rv_coefficient().unwrap();
+                        assert!(actual.is_finite() && (0.0..=1.0).contains(&actual));
+                        assert!(
+                            (actual - expected).abs() < 2e-14,
+                            "scales=({exponent_x},{exponent_y}), split={split}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finite_moment_range_boundaries_preserve_representable_results() {
+        // Valid rank-one scatter whose Frobenius norm exceeds f64::MAX,
+        // or whose entries are the smallest representable positive floats.
+        for moment in [f64::MAX, f64::from_bits(1)] {
+            let mut rv = RvCoefficient::new(2, 2).unwrap();
+            rv.count = 2;
+            rv.s_xx.fill(moment);
+            rv.s_yy.fill(moment);
+            rv.s_xy.fill(moment);
+            assert!((rv.rv_coefficient().unwrap() - 1.0).abs() < 2e-15);
+        }
+
+        // Exact dyadic rank-one moments with opposing block scales.
+        let mut rv = RvCoefficient::new(1, 1).unwrap();
+        rv.count = 2;
+        rv.s_xx[0] = 2.0_f64.powi(1000);
+        rv.s_yy[0] = f64::from_bits(1);
+        rv.s_xy[0] = 2.0_f64.powi(-37);
+        assert_eq!(rv.rv_coefficient(), Some(1.0));
+
+        // A positive semidefinite joint scatter with a tiny cross block.
+        // Each cross-entry square rounds separately; the combined RV is
+        // exactly 9/8 of the minimum subnormal and rounds to one such unit.
+        let mut rv = RvCoefficient::new(2, 2).unwrap();
+        rv.count = 5;
+        rv.s_xx = vec![1.0, 0.0, 0.0, 1.0];
+        rv.s_yy = rv.s_xx.clone();
+        rv.s_xy.fill(3.0 * 2.0_f64.powi(-539));
+        assert_eq!(rv.rv_coefficient(), Some(f64::from_bits(1)));
+        rv.s_xy.fill(0.0);
+        assert_eq!(rv.rv_coefficient(), Some(0.0));
+    }
+
+    #[test]
+    fn nonfinite_moments_return_none() {
+        for block in 0..3 {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut rv = RvCoefficient::new(1, 1).unwrap();
+                rv.add(&[0.0], &[0.0]).unwrap();
+                rv.add(&[1.0], &[1.0]).unwrap();
+                match block {
+                    0 => rv.s_xx[0] = value,
+                    1 => rv.s_yy[0] = value,
+                    2 => rv.s_xy[0] = value,
+                    _ => unreachable!(),
+                }
+                assert_eq!(rv.rv_coefficient(), None);
+            }
+        }
+    }
 
     #[test]
     fn invalid_dimensions_return_error() {
