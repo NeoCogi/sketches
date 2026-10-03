@@ -156,6 +156,11 @@ $RV$ takes $O(p^2 + q^2 + pq)$ time and $O(1)$ stack workspace with **zero heap 
 
 $$RV(X, Y) = \frac{\|S_{XY}\|_F^2}{\|S_{XX}\|_F \|S_{YY}\|_F}$$
 
+Construction allocates all retained storage, including $p + q$ reusable deviation
+scratch floats. `add()`, every `merge()` branch, `clear()`, and `rv_coefficient()`
+perform **zero heap allocations**. Total retained storage is
+$p^2 + q^2 + pq + 2p + 2q$ floats; cloning and covariance matrix exports allocate.
+
 ```rust
 use sketches::rv_coefficient::RvCoefficient;
 

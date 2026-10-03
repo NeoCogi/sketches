@@ -201,12 +201,12 @@ impl Drop for RequestScope {
     }
 }
 
-/// Measures only the query, ending accounting before result checks can allocate.
-fn without_allocation<T>(query: impl FnOnce() -> T) -> T {
+/// Measures only the operation, ending accounting before result checks can allocate.
+fn without_allocation<T>(operation: impl FnOnce() -> T) -> T {
     let scope = RequestScope::start();
-    let result = query();
+    let result = operation();
     let requests = scope.finish();
-    assert_eq!(requests.requests, 0, "scalar query allocated");
+    assert_eq!(requests.requests, 0, "operation allocated");
     assert_eq!(requests.bytes, 0);
     result
 }
@@ -657,13 +657,74 @@ fn rv_coefficient_queries_need_no_heap_workspace() {
 }
 
 #[test]
+fn rv_coefficient_updates_and_merges_need_no_heap_workspace() {
+    for (p, q) in [(1, 1), (2, 3), (4, 4), (8, 2)] {
+        let mut direct = RvCoefficient::new(p, q).unwrap();
+        let mut left = RvCoefficient::new(p, q).unwrap();
+        let mut right = RvCoefficient::new(p, q).unwrap();
+        let mut x = vec![0.0; p];
+        let mut y = vec![0.0; q];
+        for step in 0..20 {
+            for (i, value) in x.iter_mut().enumerate() {
+                *value = (step * p + i) as f64;
+            }
+            for (i, value) in y.iter_mut().enumerate() {
+                *value = ((step + 1) * q + i) as f64;
+            }
+            without_allocation(|| direct.add(&x, &y)).unwrap();
+            let batch = if step < 7 { &mut left } else { &mut right };
+            without_allocation(|| batch.add(&x, &y)).unwrap();
+        }
+
+        let donor_before = format!("{right:?}");
+        without_allocation(|| left.merge(&right)).unwrap();
+        assert_eq!(format!("{right:?}"), donor_before);
+        assert_eq!(left.count(), direct.count());
+        let expected = direct.rv_coefficient().unwrap();
+        assert!((without_allocation(|| left.rv_coefficient()).unwrap() - expected).abs() < 1e-14);
+
+        let mut empty = RvCoefficient::new(p, q).unwrap();
+        let also_empty = RvCoefficient::new(p, q).unwrap();
+        without_allocation(|| empty.merge(&also_empty)).unwrap();
+        without_allocation(|| left.merge(&empty)).unwrap();
+        without_allocation(|| empty.merge(&left)).unwrap();
+        assert_eq!(empty.count(), left.count());
+        assert_eq!(empty.rv_coefficient(), left.rv_coefficient());
+
+        // Cloning may allocate, but the cloned receiver already owns workspace.
+        let mut cloned = left.clone();
+        without_allocation(|| cloned.add(&x, &y)).unwrap();
+        without_allocation(|| cloned.merge(&right)).unwrap();
+        assert_eq!(left.count(), 20);
+        without_allocation(|| cloned.clear());
+        assert!(cloned.is_empty());
+        without_allocation(|| cloned.add(&x, &y)).unwrap();
+        without_allocation(|| cloned.add(&x, &y)).unwrap();
+        assert_eq!(cloned.rv_coefficient(), None);
+
+        let before = format!("{cloned:?}");
+        assert!(without_allocation(|| cloned.add(&[], &y)).is_err());
+        x[0] = f64::NAN;
+        assert!(without_allocation(|| cloned.add(&x, &y)).is_err());
+        let incompatible = RvCoefficient::new(p + 1, q).unwrap();
+        assert!(without_allocation(|| cloned.merge(&incompatible)).is_err());
+        assert_eq!(format!("{cloned:?}"), before);
+    }
+}
+
+#[test]
 fn rv_coefficient_constructor_reports_failed_reservations() {
-    for allowed in 0..5 {
+    // Five statistical buffers plus the two reusable deviation buffers.
+    for allowed in 0..7 {
         let result = {
             let _scope = FailureScope::after(allowed);
             RvCoefficient::new(4, 4)
         };
         assert!(matches!(result, Err(SketchError::InvalidParameter(_))));
     }
-    assert!(RvCoefficient::new(4, 4).is_ok());
+    let result = {
+        let _scope = FailureScope::after(7);
+        RvCoefficient::new(4, 4)
+    };
+    assert!(result.is_ok());
 }

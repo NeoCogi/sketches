@@ -35,8 +35,9 @@ applications must not assume compatibility with states produced by 0.1.2.
 - Seeded KLL constructors and batched quantile queries.
 - MinHash LSH candidate-probability, inverse-model and sizing helpers.
 - RV coefficient streaming multivariate matrix correlation between distinct
-  vector-valued streams, with Welford-style cross-product updates, zero-allocation
-  Frobenius queries and pairwise merging.
+  vector-valued streams, with Welford-style cross-product updates, reusable owned
+  deviation scratch, and zero-allocation addition, merging, clearing and Frobenius
+  queries after construction.
 
 ### Correctness and resource changes
 

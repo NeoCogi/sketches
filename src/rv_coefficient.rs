@@ -57,6 +57,8 @@
 //!
 //! This requires $O(p^2 + q^2 + pq)$ time and $O(1)$ stack workspace, with **zero matrix multiplications**
 //! and **zero heap allocations** during queries. Total retained memory is $O(p^2 + q^2 + pq)$ floats.
+//! Construction also allocates $p + q$ scratch floats for old-mean deviations.
+//! Addition, merging, and clearing reuse owned storage without heap allocation.
 //!
 //! Queries use scaled sums of squares, avoiding raw squared moments and norm products
 //! that can overflow or underflow even when the coefficient is representable.
@@ -72,6 +74,11 @@
 use crate::SketchError;
 
 /// Online streaming accumulator for the RV coefficient between two vector streams.
+///
+/// Owns fixed-size means, centered sums, and reusable deviation workspace.
+/// After successful construction, [`Self::add`], [`Self::merge`], [`Self::clear`],
+/// and [`Self::rv_coefficient`] never allocate. Cloning and covariance matrix
+/// exports allocate their own returned storage.
 ///
 /// # Example
 ///
@@ -108,10 +115,20 @@ pub struct RvCoefficient {
     s_yy: Vec<f64>,
     /// Centered sum of cross-products between X and Y, row-major p x q.
     s_xy: Vec<f64>,
+    /// Owned p-element workspace, overwritten with X deviations before updates.
+    /// Scratch values do not contribute to the statistical state.
+    delta_x: Vec<f64>,
+    /// Owned q-element workspace, overwritten with Y deviations before updates.
+    /// Scratch values do not contribute to the statistical state.
+    delta_y: Vec<f64>,
 }
 
 impl RvCoefficient {
     /// Creates an empty accumulator for paired vectors with $p$ and $q$ coordinates.
+    ///
+    /// Reserves all means, matrices, and deviation scratch buffers up front.
+    /// Their lengths and capacities remain fixed through addition, merging,
+    /// and clearing; retained storage contains $p^2 + q^2 + pq + 2p + 2q$ floats.
     ///
     /// # Errors
     ///
@@ -166,6 +183,18 @@ impl RvCoefficient {
             .map_err(|_| SketchError::InvalidParameter("s_xy matrix is too large to allocate"))?;
         s_xy.resize(cells_xy, 0.0);
 
+        let mut delta_x = Vec::new();
+        delta_x.try_reserve_exact(p).map_err(|_| {
+            SketchError::InvalidParameter("delta_x workspace is too large to allocate")
+        })?;
+        delta_x.resize(p, 0.0);
+
+        let mut delta_y = Vec::new();
+        delta_y.try_reserve_exact(q).map_err(|_| {
+            SketchError::InvalidParameter("delta_y workspace is too large to allocate")
+        })?;
+        delta_y.resize(q, 0.0);
+
         Ok(Self {
             p,
             q,
@@ -175,6 +204,8 @@ impl RvCoefficient {
             s_xx,
             s_yy,
             s_xy,
+            delta_x,
+            delta_y,
         })
     }
 
@@ -222,7 +253,9 @@ impl RvCoefficient {
 
     /// Adds one finite observation pair $(x, y)$.
     ///
-    /// A rejected observation leaves the accumulator state intact.
+    /// Reuses preallocated deviation buffers without allocating. Validation
+    /// and count checks precede scratch or statistical mutation, so a rejected
+    /// observation leaves the entire accumulator intact.
     ///
     /// # Errors
     ///
@@ -260,25 +293,16 @@ impl RvCoefficient {
             return Ok(());
         }
 
-        let delta_x: Vec<f64> = x
-            .iter()
-            .zip(&self.mean_x)
-            .map(|(&val, &mean)| val - mean)
-            .collect();
-        let delta_y: Vec<f64> = y
-            .iter()
-            .zip(&self.mean_y)
-            .map(|(&val, &mean)| val - mean)
-            .collect();
+        self.store_deviations(x, y);
 
         let n = next_count as f64;
         let correction = self.count as f64 / n;
 
         // Update running means
-        for (mean, diff) in self.mean_x.iter_mut().zip(&delta_x) {
+        for (mean, diff) in self.mean_x.iter_mut().zip(&self.delta_x) {
             *mean += diff / n;
         }
-        for (mean, diff) in self.mean_y.iter_mut().zip(&delta_y) {
+        for (mean, diff) in self.mean_y.iter_mut().zip(&self.delta_y) {
             *mean += diff / n;
         }
 
@@ -286,7 +310,7 @@ impl RvCoefficient {
         let p = self.p;
         for i in 0..p {
             for j in i..p {
-                let cross = weighted_cross_product(delta_x[i], delta_x[j], correction);
+                let cross = weighted_cross_product(self.delta_x[i], self.delta_x[j], correction);
                 self.s_xx[i * p + j] += cross;
                 if i != j {
                     self.s_xx[j * p + i] = self.s_xx[i * p + j];
@@ -298,7 +322,7 @@ impl RvCoefficient {
         let q = self.q;
         for i in 0..q {
             for j in i..q {
-                let cross = weighted_cross_product(delta_y[i], delta_y[j], correction);
+                let cross = weighted_cross_product(self.delta_y[i], self.delta_y[j], correction);
                 self.s_yy[i * q + j] += cross;
                 if i != j {
                     self.s_yy[j * q + i] = self.s_yy[i * q + j];
@@ -307,8 +331,8 @@ impl RvCoefficient {
         }
 
         // Update S_xy (p x q, rectangular)
-        for (i, &dx) in delta_x.iter().enumerate() {
-            for (j, &dy) in delta_y.iter().enumerate() {
+        for (i, &dx) in self.delta_x.iter().enumerate() {
+            for (j, &dy) in self.delta_y.iter().enumerate() {
                 let cross = weighted_cross_product(dx, dy, correction);
                 self.s_xy[i * q + j] += cross;
             }
@@ -320,7 +344,9 @@ impl RvCoefficient {
 
     /// Combines independent batches with the same feature dimensions.
     ///
-    /// A failed merge leaves the receiver unchanged.
+    /// Every branch reuses owned storage without allocating. Compatibility and
+    /// count checks precede scratch or statistical mutation, so a failed merge
+    /// leaves the entire receiver unchanged. The donor's workspace is unused.
     ///
     /// Updates are combined using Pébay's pairwise multivariate formulas ([SAND2008-6212]).
     ///
@@ -344,35 +370,24 @@ impl RvCoefficient {
             return Ok(());
         }
         if self.is_empty() {
-            self.mean_x.clone_from(&other.mean_x);
-            self.mean_y.clone_from(&other.mean_y);
-            self.s_xx.clone_from(&other.s_xx);
-            self.s_yy.clone_from(&other.s_yy);
-            self.s_xy.clone_from(&other.s_xy);
+            self.mean_x.copy_from_slice(&other.mean_x);
+            self.mean_y.copy_from_slice(&other.mean_y);
+            self.s_xx.copy_from_slice(&other.s_xx);
+            self.s_yy.copy_from_slice(&other.s_yy);
+            self.s_xy.copy_from_slice(&other.s_xy);
             self.count = other.count;
             return Ok(());
         }
 
-        let delta_x: Vec<f64> = other
-            .mean_x
-            .iter()
-            .zip(&self.mean_x)
-            .map(|(&b, &a)| b - a)
-            .collect();
-        let delta_y: Vec<f64> = other
-            .mean_y
-            .iter()
-            .zip(&self.mean_y)
-            .map(|(&b, &a)| b - a)
-            .collect();
+        self.store_deviations(&other.mean_x, &other.mean_y);
 
         let weight = other.count as f64 / total as f64;
         let correction = (self.count as f64 * other.count as f64) / total as f64;
 
-        for (mean, diff) in self.mean_x.iter_mut().zip(&delta_x) {
+        for (mean, diff) in self.mean_x.iter_mut().zip(&self.delta_x) {
             *mean += diff * weight;
         }
-        for (mean, diff) in self.mean_y.iter_mut().zip(&delta_y) {
+        for (mean, diff) in self.mean_y.iter_mut().zip(&self.delta_y) {
             *mean += diff * weight;
         }
 
@@ -380,7 +395,7 @@ impl RvCoefficient {
         for i in 0..p {
             for j in i..p {
                 let idx = i * p + j;
-                let cross = weighted_cross_product(delta_x[i], delta_x[j], correction);
+                let cross = weighted_cross_product(self.delta_x[i], self.delta_x[j], correction);
                 self.s_xx[idx] += other.s_xx[idx] + cross;
                 if i != j {
                     self.s_xx[j * p + i] = self.s_xx[idx];
@@ -392,7 +407,7 @@ impl RvCoefficient {
         for i in 0..q {
             for j in i..q {
                 let idx = i * q + j;
-                let cross = weighted_cross_product(delta_y[i], delta_y[j], correction);
+                let cross = weighted_cross_product(self.delta_y[i], self.delta_y[j], correction);
                 self.s_yy[idx] += other.s_yy[idx] + cross;
                 if i != j {
                     self.s_yy[j * q + i] = self.s_yy[idx];
@@ -400,8 +415,8 @@ impl RvCoefficient {
             }
         }
 
-        for (i, &dx) in delta_x.iter().enumerate() {
-            for (j, &dy) in delta_y.iter().enumerate() {
+        for (i, &dx) in self.delta_x.iter().enumerate() {
+            for (j, &dy) in self.delta_y.iter().enumerate() {
                 let idx = i * q + j;
                 let cross = weighted_cross_product(dx, dy, correction);
                 self.s_xy[idx] += other.s_xy[idx] + cross;
@@ -495,7 +510,8 @@ impl RvCoefficient {
         self.matrix_divided_by(&self.s_xy, self.p, self.q, self.count)
     }
 
-    /// Removes all observations while retaining the configured dimensions and allocations.
+    /// Removes all observations and zeros scratch without releasing allocations.
+    /// Configured dimensions and every buffer's capacity are retained for reuse.
     pub fn clear(&mut self) {
         self.count = 0;
         self.mean_x.fill(0.0);
@@ -503,8 +519,26 @@ impl RvCoefficient {
         self.s_xx.fill(0.0);
         self.s_yy.fill(0.0);
         self.s_xy.fill(0.0);
+        self.delta_x.fill(0.0);
+        self.delta_y.fill(0.0);
     }
 
+    /// Stores deviations against the receiver's original means in owned scratch.
+    /// Callers validate dimensions and counts first, then consume these buffers
+    /// while updating means and all three matrices; mean rounding cannot change
+    /// either side of a cross-product correction.
+    fn store_deviations(&mut self, x: &[f64], y: &[f64]) {
+        for ((delta, &value), &mean) in self.delta_x.iter_mut().zip(x).zip(&self.mean_x) {
+            *delta = value - mean;
+        }
+        for ((delta, &value), &mean) in self.delta_y.iter_mut().zip(y).zip(&self.mean_y) {
+            *delta = value - mean;
+        }
+    }
+
+    /// Exports a row-major matrix as owned rows divided by a positive count.
+    /// Zero denominators represent unavailable statistics. Unlike scalar queries,
+    /// this allocates the returned matrix and uses ordinary f64 division.
     fn matrix_divided_by(
         &self,
         matrix: &[f64],
@@ -918,6 +952,20 @@ mod tests {
                 );
             }
         }
+
+        let x = data.map(|(x, _)| x);
+        let y = data.map(|(_, y)| y);
+        for rv in [&direct, &batch1] {
+            for (actual, expected) in [
+                (&rv.s_xx, reference_cross_sums(&x, &x)),
+                (&rv.s_yy, reference_cross_sums(&y, &y)),
+                (&rv.s_xy, reference_cross_sums(&x, &y)),
+            ] {
+                for (&actual, &expected) in actual.iter().zip(&expected) {
+                    assert!((actual - expected).abs() < 2e-13);
+                }
+            }
+        }
     }
 
     #[test]
@@ -931,6 +979,10 @@ mod tests {
         assert_eq!(rv.count(), 0);
         assert!(rv.is_empty());
         assert_eq!(rv.rv_coefficient(), None);
+        assert_eq!(
+            format!("{rv:?}"),
+            format!("{:?}", RvCoefficient::new(2, 2).unwrap())
+        );
 
         // Re-adding works seamlessly
         rv.add(&[1.0, 0.0], &[2.0, 0.0]).unwrap();
@@ -943,21 +995,27 @@ mod tests {
     fn rejected_inputs_preserve_state() {
         let mut rv = RvCoefficient::new(2, 2).unwrap();
         rv.add(&[1.0, 2.0], &[3.0, 4.0]).unwrap();
+        rv.add(&[3.0, -1.0], &[2.0, 6.0]).unwrap();
+        let before = format!("{rv:?}");
 
         // Dimension mismatch
         assert!(rv.add(&[1.0], &[3.0, 4.0]).is_err());
+        assert_eq!(format!("{rv:?}"), before);
         assert!(rv.add(&[1.0, 2.0], &[3.0]).is_err());
-        assert_eq!(rv.count(), 1);
+        assert_eq!(format!("{rv:?}"), before);
 
         // Non-finite coordinates
-        assert!(rv.add(&[f64::NAN, 2.0], &[3.0, 4.0]).is_err());
-        assert!(rv.add(&[1.0, 2.0], &[3.0, f64::INFINITY]).is_err());
-        assert_eq!(rv.count(), 1);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(rv.add(&[invalid, 2.0], &[3.0, 4.0]).is_err());
+            assert_eq!(format!("{rv:?}"), before);
+            assert!(rv.add(&[1.0, 2.0], &[3.0, invalid]).is_err());
+            assert_eq!(format!("{rv:?}"), before);
+        }
 
         // Incompatible merge
         let other = RvCoefficient::new(3, 2).unwrap();
         assert!(rv.merge(&other).is_err());
-        assert_eq!(rv.count(), 1);
+        assert_eq!(format!("{rv:?}"), before);
     }
 
     #[test]
@@ -1001,16 +1059,21 @@ mod tests {
     #[test]
     fn observation_overflow_preserves_state() {
         let mut rv = RvCoefficient::new(1, 1).unwrap();
+        rv.add(&[1.0], &[2.0]).unwrap();
+        rv.add(&[3.0], &[4.0]).unwrap();
         rv.count = u64::MAX;
+        let before = format!("{rv:?}");
         assert_eq!(
             rv.add(&[1.0], &[2.0]),
             Err(SketchError::ObservationCountOverflow)
         );
-        assert_eq!(rv.count, u64::MAX);
+        assert_eq!(format!("{rv:?}"), before);
 
         let mut other = RvCoefficient::new(1, 1).unwrap();
-        other.count = 1;
+        other.add(&[5.0], &[6.0]).unwrap();
+        let donor_before = format!("{other:?}");
         assert_eq!(rv.merge(&other), Err(SketchError::ObservationCountOverflow));
-        assert_eq!(rv.count, u64::MAX);
+        assert_eq!(format!("{rv:?}"), before);
+        assert_eq!(format!("{other:?}"), donor_before);
     }
 }
