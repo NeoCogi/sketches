@@ -1,6 +1,39 @@
 # Changelog
 
-## 0.2.0 — Unreleased
+## 0.3.0 — Unreleased
+
+This release adds streaming multivariate correlation through
+`rv_coefficient::RvCoefficient`.
+
+### Migration from 0.2.0
+
+Update the dependency requirement to `sketches = "0.3"` to use the new module.
+Existing 0.2 module paths and public APIs retain their behavior.
+
+### Added
+
+- RV coefficient between paired vector streams with independent positive X/Y
+  dimensions, running means, sample/population covariance exports, pairwise
+  merging, and clear/reuse without retaining historical observations.
+- Runnable RV example and release benchmark for streaming ingestion and queries.
+
+### Correctness and resource guarantees
+
+- Standard RV uses scaled Frobenius sums and a square-root ratio to preserve
+  representable coefficients when raw moment squares or norm products would
+  overflow or underflow. Nonfinite numerical state returns `None`; ordinary
+  `f64` accumulation still permits overflow and rounding loss.
+- Owned deviation scratch is reserved during construction. Addition, every merge
+  branch, clearing, and coefficient queries perform zero heap allocations.
+  Cloning and covariance exports allocate their returned storage.
+- Dimension/nonfinite-input checks and exact observation-count overflow checks
+  precede scratch and statistical mutation. Rejections preserve the complete
+  receiver; merging preserves the donor.
+- The development-only adjusted query was removed before the RV module's first
+  release. Feature covariance diagonal exclusion does not compute modified RV₂,
+  which requires additional retained fourth-order row information.
+
+## 0.2.0 — 2026-10-02
 
 This release includes incompatible API changes from 0.1.2.
 
@@ -34,19 +67,9 @@ applications must not assume compatibility with states produced by 0.1.2.
   Count-Min, Count Sketch and MinMax.
 - Seeded KLL constructors and batched quantile queries.
 - MinHash LSH candidate-probability, inverse-model and sizing helpers.
-- RV coefficient streaming multivariate matrix correlation between distinct
-  vector-valued streams, with Welford-style cross-product updates, reusable owned
-  deviation scratch, and zero-allocation addition, merging, clearing and Frobenius
-  queries after construction.
 
 ### Correctness and resource changes
 
-- Standard RV queries use scaled Frobenius sums and a square-root ratio to avoid
-  unnecessary overflow/underflow for finite retained moments; numerical state
-  overflow remains subject to ordinary `f64` accumulation limits.
-- Remove the pre-release `RvCoefficient::adjusted_rv_coefficient` method: feature
-  covariance diagonal exclusion does not compute modified RV₂, whose observation
-  Gram diagonal corrections need additional retained moment information.
 - HLL uses Ertl's maximum-likelihood estimator; HLL and ULL document the
   statistical limitations and availability of inclusion-exclusion relations.
 - Scalar HLL/ULL union, intersection and Jaccard queries use fixed stack

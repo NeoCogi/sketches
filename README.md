@@ -22,17 +22,17 @@ This crate was designed by humans, but coded with AI.
 
 ## Add To A Project
 
-Add the 0.2 release to your project with Cargo:
+Add the 0.3 release to your project with Cargo:
 
 ```sh
-cargo add sketches@0.2
+cargo add sketches@0.3
 ```
 
 Or add it directly to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sketches = "0.2"
+sketches = "0.3"
 ```
 
 Import a sketch from its module:
@@ -58,7 +58,7 @@ sketches = { path = "../sketches" }
 ```
 
 This crate uses Rust edition 2024. See [CHANGELOG.md](CHANGELOG.md) for the
-0.2 migration notes and [RELEASING.md](RELEASING.md) for publication steps.
+migration notes and [RELEASING.md](RELEASING.md) for publication steps.
 
 ## What Is Included
 

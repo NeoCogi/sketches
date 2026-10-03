@@ -1,6 +1,6 @@
 # Releasing sketches
 
-The next release is **0.2.0**. Its incompatible API changes and migration notes
+The next release is **0.3.0**. Its new RV module and migration notes
 are recorded in [CHANGELOG.md](CHANGELOG.md). The manifest, lockfile and README
 dependency examples must agree on the release version.
 
@@ -30,6 +30,6 @@ and dry-run checks from the clean tree, then run:
 cargo publish --locked
 ```
 
-After successful publication, tag that commit as `v0.2.0` and push the release
+After successful publication, tag that commit as `v0.3.0` and push the release
 branch and tag to the repository. Local preparation does not publish, tag or
 push anything. Registry credentials should be configured outside the repository.
